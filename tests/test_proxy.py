@@ -1132,9 +1132,11 @@ def test_secrets_chiffres_et_relus(tmp_path):
     ini = tmp_path / "emby_proxy.ini"
     ep.write_example_config(ini)
     ep.write_secret(ini, "emby", "api_key", "MACLEAPI123")
-    ep.write_secret(ini, "status", "password", "MotDePassePage")
+    ep.update_ini(ini, "status", "password", "MotDePassePage")
     txt = ini.read_text(encoding="utf-8")
-    assert "MACLEAPI123" not in txt and "MotDePassePage" not in txt
+    assert "MACLEAPI123" not in txt                     # cle API chiffree
+    assert "password = MotDePassePage" in txt           # mot de passe lisible
+    assert ep.secret_state(ini, "emby", "api_key").startswith("chiffree")
     assert (tmp_path / "emby_proxy_secret.key").exists()
     cfg = ep.Settings(ini)
     assert cfg.api_key == "MACLEAPI123" and cfg.status_password == "MotDePassePage"
@@ -1144,9 +1146,9 @@ def test_anciens_secrets_en_clair_chiffres_au_demarrage(tmp_path):
     ini = tmp_path / "emby_proxy.ini"
     ini.write_text("[emby]\napi_key = CLAIRE\n[status]\npassword = AncienMdp99\n",
                    encoding="utf-8")
-    assert sorted(ep.migrate_plain_secrets(ini)) == ["emby.api_key", "status.password"]
+    assert ep.migrate_plain_secrets(ini) == ["emby.api_key"]
     txt = ini.read_text(encoding="utf-8")
-    assert "CLAIRE" not in txt and "AncienMdp99" not in txt
+    assert "CLAIRE" not in txt and "password = AncienMdp99" in txt
     cfg = ep.Settings(ini)
     assert cfg.api_key == "CLAIRE" and cfg.status_password == "AncienMdp99"
     assert ep.migrate_plain_secrets(ini) == []          # deja fait
@@ -1171,3 +1173,36 @@ async def test_page_enregistre_la_cle_chiffree(env, tmp_path):
     assert ep.Settings(ini).api_key == "CLEPAGE42" and proxy.cfg.api_key == "CLEPAGE42"
     g = await (await c.get("/__proxy/settings.json")).json()
     assert g["values"]["emby.api_key"] == "" and g["values"]["emby.api_key.hint"].endswith("GE42")
+
+
+
+def test_mot_de_passe_de_la_page_remis_lisible(tmp_path):
+    """Version precedente : le mot de passe de la page etait chiffre."""
+    ini = tmp_path / "emby_proxy.ini"
+    ep.update_ini(ini, "status", "password", ep.protect("MonMotDePasse1", tmp_path))
+    assert "MonMotDePasse1" not in ini.read_text(encoding="utf-8")
+    assert ep.reveal_status_password(ini)
+    assert "password = MonMotDePasse1" in ini.read_text(encoding="utf-8")
+    assert ep.Settings(ini).status_password == "MonMotDePasse1"
+
+
+def test_cle_api_saisie_a_la_main_chiffree_au_lancement(tmp_path, monkeypatch, capsys):
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    ep.update_ini(ini, "emby", "api_key", "CLE-TAPEE-A-LA-MAIN")
+    monkeypatch.setattr(ep, "run_with_restarts", lambda cfg, *a, **k: None)
+    ep.main(["--config", str(ini), "--password", "NouveauMdp2026"])
+    txt = ini.read_text(encoding="utf-8")
+    assert "CLE-TAPEE-A-LA-MAIN" not in txt and "api_key = enc:" in txt
+    assert "password = NouveauMdp2026" in txt
+    assert ep.Settings(ini).api_key == "CLE-TAPEE-A-LA-MAIN"
+    assert ep.main(["--config", str(ini), "--password", "court"]) == 2
+
+
+async def test_page_indique_que_la_cle_est_chiffree(env, tmp_path):
+    proxy, c, own, ini = await _admin_with_ini(env, tmp_path)
+    await c.post("/__proxy/settings", headers=own, json={
+        "password": proxy.cfg.status_password, "values": {"emby.api_key": "CLE42"}})
+    g = await (await c.get("/__proxy/settings.json")).json()
+    assert g["secret_state"]["emby.api_key"].startswith("chiffree")
+    assert "status.password" not in g["secret_state"]

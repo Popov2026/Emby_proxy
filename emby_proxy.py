@@ -175,13 +175,14 @@ ENV_OVERRIDES = {
 # =====================================================================
 #  SECRETS CHIFFRES DANS LE FICHIER DE REGLAGES
 # =====================================================================
-# Cle API Emby, mot de passe de la page, mot de passe du compte mail :
-# jamais en clair dans emby_proxy.ini.
+# Cle API Emby et mot de passe du compte mail : jamais en clair dans
+# emby_proxy.ini. (Le mot de passe de la page d'administration, lui, reste
+# lisible dans le fichier : c'est la qu'on le retrouve pour se connecter.)
 #   Windows : DPAPI (chiffre pour le compte Windows qui lance le proxy) ;
 #   ailleurs : Fernet (AES) avec la cle emby_proxy_secret.key, creee a cote
 #   du fichier de reglages (module cryptography).
 # Format ecrit : enc:dpapi:<base64> ou enc:fernet:<jeton>.
-SECRET_KEYS = {("emby", "api_key"), ("status", "password"), ("alerts", "smtp_password")}
+SECRET_KEYS = {("emby", "api_key"), ("alerts", "smtp_password")}
 
 
 def _dpapi(data, encrypt):
@@ -253,6 +254,46 @@ def write_secret(path, section, key, plain):
                     section, key)
         update_ini(path, section, key, plain)
         return False
+
+
+def reveal_status_password(path):
+    """Version precedente : le mot de passe de la page etait chiffre, donc
+    illisible dans le fichier. On le remet en clair. -> True si fait."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    cp = configparser.ConfigParser()
+    try:
+        cp.read_string(read_ini_text(path))
+    except configparser.Error:
+        return False
+    v = cp["status"].get("password", "").strip() if cp.has_section("status") else ""
+    if not v.startswith("enc:"):
+        return False
+    try:
+        update_ini(path, "status", "password", unprotect(v, path.parent))
+        return True
+    except Exception as exc:
+        log.warning("mot de passe de la page illisible (%s) : un nouveau sera cree", exc)
+        update_ini(path, "status", "password", "")
+        return False
+
+
+def secret_state(path, section, key):
+    """Etat d'un secret dans le fichier, pour l'afficher : chiffre ou non."""
+    cp = configparser.ConfigParser()
+    try:
+        cp.read_string(read_ini_text(path))
+        v = cp[section].get(key, "").strip() if cp.has_section(section) else ""
+    except Exception:
+        return "illisible"
+    if not v:
+        return "vide"
+    if v.startswith("enc:dpapi:"):
+        return "chiffree (Windows DPAPI)"
+    if v.startswith("enc:fernet:"):
+        return "chiffree (emby_proxy_secret.key)"
+    return "EN CLAIR"
 
 
 def migrate_plain_secrets(path):
@@ -624,7 +665,7 @@ def ensure_status_password(path, cfg):
     pwd = secrets.token_urlsafe(12)
     cfg.status_password = pwd
     try:
-        write_secret(path, "status", "password", pwd)
+        update_ini(path, "status", "password", pwd)
     except OSError as exc:
         log.warning("mot de passe de la page d'etat non enregistre : %s", exc)
     return True
@@ -3345,6 +3386,8 @@ class EmbyProxy:
             "file_warnings": self.cfg.config_warnings,
             "restart_pending": self._restart_pending(),
             "restart_error": self.restart_error,
+            "secret_state": {"%s.%s" % sk: secret_state(self.cfg.path, *sk)
+                             for sk in SECRET_KEYS},
             "running": {"upstream": self.cfg.upstream,
                         "listen_port": self.cfg.listen_port,
                         "status_port": self.cfg.status_port},
@@ -3503,7 +3546,7 @@ class EmbyProxy:
             return web.json_response({"ok": False, "error": "Pas d'espace, ni ; ni #."},
                                      status=400)
         try:
-            write_secret(self.cfg.path, "status", "password", new)
+            update_ini(self.cfg.path, "status", "password", new)
             if Settings(self.cfg.path).status_password != new:
                 raise OSError("relu different")
         except Exception as exc:
@@ -3980,6 +4023,8 @@ function fieldEl(f,G){
   inp.oninput=inp.onchange=dirty;
   if(lock){inp.disabled=true;w.append(el('div','sub lock','Fixé par une variable d\'environnement (docker-compose).'))}
   if(f.help)w.append(el('div','sub',f.help));
+  if(f.type==='secret'&&G.secret_state&&G.secret_state[k]){const st=G.secret_state[k];
+    w.append(el('div',st.startsWith('chiffr')?'sub':'sub lock','Dans le fichier : '+(st==='vide'?'non renseignée':st.startsWith('chiffr')?'✔ '+st:'⚠ '+st)))}
   if(f.type==='secret'&&G.values[k+'.hint']){const lb=el('label','sub'),c=el('input');c.type='checkbox';c.dataset.clear=k;c.onchange=dirty;lb.append(c,el('span',null,' effacer la clé enregistrée'));w.append(lb)}
   w.append(el('div','err'));
   return w}
@@ -4367,6 +4412,8 @@ def main(argv=None):
                                                        str(DEFAULT_CONFIG)))
     ap.add_argument("--gui", action="store_true",
                     help="petite fenetre de suivi (Windows)")
+    ap.add_argument("--password", metavar="MOT_DE_PASSE",
+                    help="change le mot de passe de la page d'administration")
     ap.add_argument("--emby", metavar="ADRESSE",
                     help="adresse du serveur Emby a enregistrer dans les reglages, "
                          "ex. --emby http://192.168.1.234:8096")
@@ -4397,11 +4444,22 @@ def main(argv=None):
         check = Settings(cfg_path).upstream
         print("Adresse d'Emby enregistree dans %s : upstream = %s%s" % (
             cfg_path, check, "" if check == url else "  /!\\ relue differente"))
+    if args.password:
+        if len(args.password) < 10 or re.search(r"[\s;#]", args.password):
+            print("Mot de passe refuse : 10 caracteres minimum, sans espace, ; ni #.")
+            return 2
+        update_ini(cfg_path, "status", "password", args.password)
+        print("Mot de passe de la page d'administration change dans %s" % cfg_path)
+    revealed = reveal_status_password(cfg_path)
     migrated = migrate_plain_secrets(cfg_path)
     cfg = Settings(cfg_path)
     setup_logging(cfg, to_console=not args.gui)
+    if revealed:
+        log.info("mot de passe de la page d'administration remis lisible dans %s, "
+                 "section [status]", cfg_path)
     if migrated:
         log.info("secrets chiffres dans %s : %s", cfg_path, ", ".join(migrated))
+    log.info("cle API Emby : %s", secret_state(cfg_path, "emby", "api_key"))
     if ensure_status_password(cfg_path, cfg):
         # jamais le mot de passe lui-meme dans le journal (on le partage
         # parfois pour demander de l'aide)

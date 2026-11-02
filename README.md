@@ -154,16 +154,21 @@ par heure au plus). Chaque type d'alerte se coche séparément :
 - Emby ne répond plus, puis répond de nouveau (vérifié chaque minute) ;
 - quota atteint : lecture coupée, compte désactivé.
 
-### Secrets chiffrés
-La clé API Emby, le mot de passe de la page d'administration et celui du
-compte mail sont **chiffrés** dans `emby_proxy.ini` :
+### Clé API chiffrée
+La **clé API Emby** et le mot de passe du **compte mail** sont **chiffrés**
+dans `emby_proxy.ini` :
 - sous Windows, par DPAPI (lisibles seulement par le compte Windows qui
   lance le proxy) ;
 - ailleurs, avec la clé `emby_proxy_secret.key` (à ne jamais partager).
 
-Un secret encore en clair (ancienne version, saisie à la main) est chiffré
-au démarrage. Si le dossier est copié sur une autre machine, la page demande
-de ressaisir les secrets.
+Une clé tapée en clair dans le fichier est chiffrée au lancement suivant.
+La console l'indique (`cle API Emby : chiffree (...)`), et l'onglet
+Configuration aussi, sous le champ.
+
+Le **mot de passe de la page d'administration**, lui, reste **lisible** dans
+la section `[status]` : c'est là qu'on le retrouve pour se connecter. Pour le
+changer : onglet Configuration, ou `python emby_proxy.py --password
+NouveauMotDePasse`.
 
 ### Tout le reste passe tel quel
 API, lecture vidéo (avec avance rapide / reprise), WebSocket des applications
