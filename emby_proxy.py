@@ -193,10 +193,20 @@ def normalize_upstream(url):
     return url
 
 
+def read_ini_text(path):
+    """Texte du fichier de reglages, quel que soit l'enregistrement du Bloc-notes
+    (UTF-8 avec ou sans BOM, ou ANSI Windows)."""
+    raw = Path(path).read_bytes()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
 def update_ini(path, section, key, value):
     """Change une valeur du fichier de reglages en gardant ses commentaires."""
     path = Path(path)
-    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    text = read_ini_text(path) if path.exists() else ""
     lines = text.splitlines()
     start = next((i for i, ln in enumerate(lines)
                   if ln.strip().lower() == "[%s]" % section), None)
@@ -225,11 +235,19 @@ class Settings:
         self.path = Path(path) if path else DEFAULT_CONFIG
         self.config_warnings = []   # reglages mal places, sections inconnues
         if self.path.exists():
-            cp.read(self.path, encoding="utf-8")
+            cp.read_string(read_ini_text(self.path), source=str(self.path))
             self._check_file()
         else:
             self.config_warnings.append(
                 "fichier de reglages %s introuvable : valeurs par defaut" % self.path)
+        for twin in (self.path.with_name(self.path.name + ".txt"),
+                     self.path.with_suffix(".txt")):
+            if twin.exists():           # piege classique du Bloc-notes
+                self.config_warnings.append(
+                    "le fichier %s existe : le Bloc-notes a ajoute .txt en "
+                    "enregistrant. Le proxy lit %s, pas celui-ci : supprime l'ancien "
+                    "et renomme %s en %s" % (twin.name, self.path.name, twin.name,
+                                              self.path.name))
         self.env_locked = set()     # reglages imposes par l'environnement
         for env, (sec, key) in ENV_OVERRIDES.items():
             if os.environ.get(env):
@@ -291,7 +309,7 @@ class Settings:
         section (ex. : l'adresse d'Emby ecrite sous [emby] au lieu de [proxy])."""
         raw = configparser.ConfigParser()
         try:
-            raw.read(self.path, encoding="utf-8")
+            raw.read_string(read_ini_text(self.path))
         except configparser.Error as exc:
             self.config_warnings.append("fichier %s illisible : %s" % (self.path, exc))
             return
@@ -438,7 +456,7 @@ def ensure_status_password(path, cfg):
     cfg.status_password = pwd
     try:
         path = Path(path)
-        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        text = read_ini_text(path) if path.exists() else ""
         if re.search(r"(?m)^\[status\]\s*$", text):
             if re.search(r"(?ms)^\[status\].*?^password\s*=", text):
                 text = re.sub(r"(?ms)(^\[status\].*?^password\s*=)[^\n]*",
@@ -2044,8 +2062,19 @@ class EmbyProxy:
         return web.json_response(self.activity.snapshot())
 
     # -- configuration du serveur Emby (onglet Configuration) -------------
+    def _file_values(self):
+        """Ce que contient reellement le fichier de reglages (relu)."""
+        try:
+            f = Settings(self.cfg.path)
+            return {"upstream": f.upstream, "api_key_set": bool(f.api_key),
+                    "api_key": f.api_key, "warnings": f.config_warnings}
+        except Exception as exc:                 # fichier abime, encodage...
+            return {"upstream": "", "api_key_set": False, "api_key": "",
+                    "warnings": ["fichier illisible : %s" % exc]}
+
     def _config_view(self):
         k = self.cfg.api_key
+        fv = self._file_values()
         return {"upstream": self.cfg.upstream,
                 "api_key_set": bool(k),
                 "api_key_hint": ("\u2022\u2022\u2022\u2022" + k[-4:]) if len(k) > 4 else
@@ -2053,6 +2082,9 @@ class EmbyProxy:
                 "locked": {"upstream": ("proxy", "upstream") in self.cfg.env_locked,
                            "api_key": ("emby", "api_key") in self.cfg.env_locked},
                 "config_file": str(self.cfg.path),
+                "file_upstream": fv["upstream"],
+                "file_api_key_set": fv["api_key_set"],
+                "file_warnings": fv["warnings"],
                 "upstream_errors": self.stats.upstream_errors}
 
     async def config_json(self, request):
@@ -2155,12 +2187,23 @@ class EmbyProxy:
             return web.json_response({"ok": True, "changed": False,
                                       "config": self._config_view()})
         self.guard.login_result(ip, True)
+        saved = False
         try:
             update_ini(self.cfg.path, "proxy", "upstream", self.cfg.upstream)
             update_ini(self.cfg.path, "emby", "api_key", self.cfg.api_key)
-        except OSError as exc:
-            notes.append("ATTENTION : fichier %s non modifie (%s), le changement sera "
-                         "perdu au redemarrage" % (self.cfg.path, exc))
+            fv = self._file_values()            # relecture : vraiment ecrit ?
+            saved = fv["upstream"] == self.cfg.upstream and \
+                fv["api_key"] == self.cfg.api_key
+            if not saved:
+                notes.append("ATTENTION : apres ecriture, le fichier %s contient "
+                             "upstream = %s : le changement sera perdu au "
+                             "redemarrage (%s)" % (self.cfg.path, fv["upstream"] or "?",
+                                                   "; ".join(fv["warnings"]) or
+                                                   "cause inconnue"))
+        except Exception as exc:                 # jamais d'echec silencieux
+            notes.append("ATTENTION : fichier %s non modifie (%s) : le changement "
+                         "est actif mais sera perdu au redemarrage"
+                         % (self.cfg.path, exc))
         for (sec, key), what in ((("proxy", "upstream"), "l'adresse"),
                                  (("emby", "api_key"), "la cle API")):
             if (sec, key) in self.cfg.env_locked:
@@ -2171,7 +2214,7 @@ class EmbyProxy:
         self.warnings.pop("emby", None)
         log.warning("configuration modifiee par %s : %s", ip, "; ".join(changes))
         return web.json_response({"ok": True, "changed": True, "changes": changes,
-                                  "notes": notes, "config": self._config_view(),
+                                  "saved": saved, "notes": notes, "config": self._config_view(),
                                   "probe": await self._probe_emby(self.cfg.upstream,
                                                                   self.cfg.api_key)})
 
@@ -2334,12 +2377,14 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
     <label for="cUrl">Adresse du serveur Emby</label>
     <input id="cUrl" placeholder="http://192.168.1.10:8096" autocomplete="off" spellcheck="false">
     <div class="sub">Adresse vue depuis la machine du proxy. Les utilisateurs ne la voient jamais.</div>
+    <div class="sub" id="cState"></div>
     <div class="sub lock" id="cUrlLock" hidden></div>
     <label for="cKey">Clé API Emby <span class="sub">(facultative)</span></label>
     <input id="cKey" type="password" autocomplete="off" spellcheck="false">
     <div class="sub">Emby : Tableau de bord › Avancé › Clés API. Sert à afficher le nom de tous les films dans l'activité.</div>
     <label class="sub"><input type="checkbox" id="cClear"> effacer la clé enregistrée</label>
     <div class="sub lock" id="cKeyLock" hidden></div>
+    <div class="sub lock" id="cDirty" hidden>● Modification non enregistrée</div>
     <div class="row">
       <button class="small" id="cTest">Tester la connexion</button>
       <button class="red" id="cSave">Enregistrer…</button>
@@ -2447,14 +2492,25 @@ function renderSecFeed(){
 
 // ---- Configuration du serveur Emby
 let conf=null;
+// Jamais d'echec silencieux : toute erreur devient {ok:false, error:"..."}
 function post(u,body){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-  .then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()})}
+  .then(r=>{if(r.status===401){location.href='login';throw 0}
+    return r.text().then(t=>{let j=null;try{j=JSON.parse(t)}catch(e){}
+      if(j&&typeof j==='object')return j;
+      return {ok:false,error:'Erreur '+r.status+' : '+(t||r.statusText).slice(0,200)}})},
+    e=>{if(e===0)throw 0;return {ok:false,error:'Le proxy ne répond pas ('+e+').'}})}
+function unsaved(){if(!conf)return;const d=$('cUrl').value.trim().replace(/\/+$/,'')!==conf.upstream||$('cKey').value!==''||$('cClear').checked;
+  $('cDirty').hidden=!d}
 function loadConf(){fetch('config.json').then(r=>r.json()).then(c=>{conf=c;$('cUrl').value=c.upstream;$('cKey').value='';
   $('cKey').placeholder=c.api_key_set?'clé enregistrée ('+c.api_key_hint+') : laisser vide pour la garder':'aucune clé enregistrée';
   $('cClear').checked=false;$('cClear').parentElement.hidden=!c.api_key_set;
   const lk=(id,on,what)=>{$(id).hidden=!on;$(id).textContent=on?'⚠ '+what+' est aussi fixée par une variable d\'environnement (docker-compose) : elle reprendra le dessus au redémarrage.':''};
   lk('cUrlLock',c.locked.upstream,"L'adresse");lk('cKeyLock',c.locked.api_key,'La clé API');
-  $('cFile').textContent='Fichier de réglages : '+c.config_file})}
+  $('cFile').textContent='Fichier de réglages : '+c.config_file;
+  $('cState').replaceChildren(el('div',null,'Adresse en service : '+c.upstream),
+    el('div',null,'Adresse dans le fichier : '+(c.file_upstream||'?')+(c.file_upstream===c.upstream?'  ✔':'  ✖ différente : elle sera reprise au redémarrage')),
+    ...(c.file_warnings||[]).map(w=>el('div','lock','⚠ '+w)));
+  unsaved()}).catch(e=>$('cOut').replaceChildren(el('div','res bad','✖ Lecture de la configuration impossible : '+e)))}
 function probeBox(p){const d=el('div','res '+(p.ok&&p.key_ok!==false?'ok':'bad'));
   if(!p.ok){d.append(el('div',null,'✖ '+(p.error||'Échec')));return d}
   d.append(el('div',null,'✔ Emby joignable : « '+(p.server_name||'?')+' », version '+(p.version||'?')+(p.latency_ms!=null?' ('+p.latency_ms+' ms)':'')));
@@ -2463,14 +2519,17 @@ function probeBox(p){const d=el('div','res '+(p.ok&&p.key_ok!==false?'ok':'bad')
   return d}
 function form(){return {upstream:$('cUrl').value,api_key:$('cKey').value,clear_key:$('cClear').checked}}
 $('cTest').onclick=()=>{$('cOut').replaceChildren(el('div','sub','Test en cours…'));
-  post('config/test',form()).then(p=>$('cOut').replaceChildren(probeBox(p))).catch(()=>{})};
+  post('config/test',form()).then(p=>{const box=el('div');box.append(probeBox(p));
+    if(!$('cDirty').hidden)box.append(el('div','sub lock','Ce n\'est qu\'un test : rien n\'est encore enregistré. Clique sur « Enregistrer… » puis « Confirmer et appliquer ».'));
+    $('cOut').replaceChildren(box)}).catch(()=>{})};
+['cUrl','cKey'].forEach(i=>$(i).oninput=unsaved);$('cClear').onchange=unsaved;
 $('cSave').onclick=()=>{$('cConfirm').hidden=false;$('cPwd').value='';$('cPwd').focus()};
 $('cCancel').onclick=()=>{$('cConfirm').hidden=true};
 $('cDo').onclick=()=>{const b=form();b.password=$('cPwd').value;
   post('config',b).then(r=>{
     if(!r.ok){$('cOut').replaceChildren(el('div','res bad','✖ '+r.error));return}
     $('cConfirm').hidden=true;const box=el('div');
-    box.append(el('div','res ok',r.changed?'✔ Appliqué immédiatement et enregistré : '+r.changes.join(' ; '):'Rien n\'a changé.'));
+    box.append(el('div','res '+(r.changed&&!r.saved?'bad':'ok'),r.changed?(r.saved?'✔ Appliqué immédiatement et enregistré dans le fichier : ':'⚠ Appliqué, mais PAS enregistré dans le fichier : ')+r.changes.join(' ; '):'Rien n\'a changé.'));
     (r.notes||[]).forEach(n=>box.append(el('div','sub lock','⚠ '+n)));
     if(r.probe)box.append(probeBox(r.probe));
     $('cOut').replaceChildren(box);loadConf();tick()}).catch(()=>{})};

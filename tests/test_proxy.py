@@ -986,3 +986,28 @@ async def test_emby_injoignable_signale_au_demarrage(env):
     proxy2, _ = await make()
     await asyncio.sleep(0.5)
     assert "emby" not in proxy2.warnings
+
+
+
+def test_fichier_du_bloc_notes(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    # enregistre en ANSI avec un accent, et avec BOM : les deux doivent passer
+    ini.write_bytes("# r\xe9glages\n[proxy]\nupstream = http://192.168.1.234:8096\n"
+                    .encode("cp1252"))
+    assert ep.Settings(ini).upstream == "http://192.168.1.234:8096"
+    ini.write_bytes(b"\xef\xbb\xbf[proxy]\nupstream = http://192.168.1.30:8096\n")
+    assert ep.Settings(ini).upstream == "http://192.168.1.30:8096"
+    ep.update_ini(ini, "proxy", "upstream", "http://192.168.1.31:8096")
+    assert ep.Settings(ini).upstream == "http://192.168.1.31:8096"
+    # le Bloc-notes a enregistre "emby_proxy.ini.txt" a cote
+    (tmp_path / "emby_proxy.ini.txt").write_text("[proxy]\nupstream = http://x:1\n")
+    w = " ".join(ep.Settings(ini).config_warnings)
+    assert "emby_proxy.ini.txt" in w and "Bloc-notes" in w
+
+
+async def test_config_lecture_affiche_le_fichier(env, tmp_path):
+    make, _, _ = env
+    proxy, c = await make()
+    await login(c, proxy)
+    d = await (await c.get("/__proxy/config.json")).json()
+    assert "file_upstream" in d and "file_warnings" in d
