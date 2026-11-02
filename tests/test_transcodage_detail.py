@@ -22,18 +22,38 @@ def test_libelles(vdirect, adirect, vc, ac, attendu):
     assert ep.transcode_label(vdirect, adirect, vc, ac) == attendu
 
 
-@pytest.mark.parametrize("raisons,attendu", [
-    ("ContainerNotSupported", "prévu : changement de conteneur (vidéo et son copiés)"),
-    ("AudioCodecNotSupported", "prévu : son transcodé, vidéo copiée"),
-    ("ContainerBitrateExceedsLimit", "prévu : vidéo transcodée, son copié"),
-    ("VideoCodecNotSupported,AudioChannelsNotSupported",
+VID = {"Type": "Video", "Codec": "h264", "Index": 0}
+AC3 = {"Type": "Audio", "Codec": "ac3", "Index": 1}
+AAC = {"Type": "Audio", "Codec": "aac", "Index": 2}
+
+
+@pytest.mark.parametrize("raisons,codecs,flux,attendu", [
+    # cas reel (iPhone, 'R Xmas) : debit trop eleve, mais formats acceptes ->
+    # Emby a copie video et son
+    ("ContainerBitrateExceedsLimit", "VideoCodec=h264,hevc&AudioCodec=aac,ac3",
+     [VID, AC3], "prévu : changement de conteneur (vidéo et son copiés)"),
+    ("ContainerNotSupported", "VideoCodec=h264&AudioCodec=aac,ac3", [VID, AC3],
+     "prévu : changement de conteneur (vidéo et son copiés)"),
+    # son refuse par l'appareil (ac3 absent de la liste)
+    ("ContainerNotSupported", "VideoCodec=h264&AudioCodec=aac,mp3", [VID, AC3],
+     "prévu : son transcodé, vidéo copiée"),
+    # piste son choisie : la 2e (aac) est acceptee
+    ("ContainerNotSupported",
+     "VideoCodec=h264&AudioCodec=aac&AudioStreamIndex=2", [VID, AC3, AAC],
+     "prévu : changement de conteneur (vidéo et son copiés)"),
+    ("AudioCodecNotSupported", "", [VID, AC3], "prévu : son transcodé, vidéo copiée"),
+    ("VideoCodecNotSupported", "VideoCodec=h264", [{"Type": "Video", "Codec": "hevc"}],
+     "prévu : vidéo transcodée, son copié"),
+    ("VideoBitrateNotSupported,AudioChannelsNotSupported", "", [VID, AC3],
      "prévu : vidéo et son transcodés"),
 ])
-def test_demande_de_lecture_prevision(raisons, attendu):
+def test_demande_de_lecture_prevision(raisons, codecs, flux, attendu):
+    url = "/videos/1/master.m3u8?TranscodeReasons=" + raisons + \
+        ("&" + codecs if codecs else "")
     bad, txt = ep.Activity._pb_summary({"MediaSources": [{
-        "TranscodingUrl": "/videos/1/master.m3u8?VideoCodec=h264&TranscodeReasons="
-                          + raisons, "Container": "mkv"}]})
-    assert not bad and txt.startswith(attendu + " — raisons : " + raisons)
+        "TranscodingUrl": url, "Container": "mkv", "MediaStreams": flux,
+        "DefaultAudioStreamIndex": 1}]})
+    assert not bad and txt.startswith(attendu + " — raisons : " + raisons), txt
 
 
 @pytest.mark.parametrize("info,methode,attendu", [
@@ -67,6 +87,11 @@ async def test_lecture_reelle_demandee_a_emby(aiohttp_server, tmp_path, info,
     app.router.add_get("/emby/Sessions", sessions)
     app.router.add_get("/emby/videos/{id}/master.m3u8", stream)
     app.router.add_get("/emby/Items", items)
+
+    async def progress(request):
+        await request.read()
+        return web.Response(status=204)
+    app.router.add_post("/emby/Sessions/Playing/Progress", progress)
     srv = await aiohttp_server(app)
     cfg = ep.Settings(tmp_path / "absent.ini", overrides={
         ("proxy", "upstream"): str(srv.make_url("")).rstrip("/"),
@@ -94,6 +119,12 @@ async def test_lecture_reelle_demandee_a_emby(aiohttp_server, tmp_path, info,
         assert attendu in txt
         assert "Lecture : Le film (2020) (flux Emby HLS)" in txt
         mode = attendu.split(" → ", 1)[1].split(" — ")[0]
+        assert card["playing"]["mode"] == mode
+        # les comptes rendus de l'appli (PlayMethod=Transcode) ne l'ecrasent plus
+        await c.post("/emby/Sessions/Playing/Progress", json={
+            "ItemId": "77", "PlayMethod": "Transcode", "PositionTicks": 160_000_000},
+            headers={"X-Emby-Authorization": AUTH})
+        card = proxy.activity.snapshot()["clients"][0]
         assert card["playing"]["mode"] == mode
     finally:
         await c.close()

@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1399,8 +1399,10 @@ X = "\x00"            # remplace par le nom de l'element a l'affichage
 
 
 # Raisons de transcodage d'Emby : ce qu'elles obligent a convertir
+# (ContainerBitrateExceedsLimit n'en fait pas partie : Emby copie souvent la
+# video telle quelle dans ce cas, seul le conteneur change)
 _VIDEO_REASONS = re.compile(r"^(?:Video|RefFrames|Anamorphic|Interlaced|UnknownVideo|"
-                            r"Subtitle|ContainerBitrate|DirectPlayError)", re.I)
+                            r"Subtitle)", re.I)
 _AUDIO_REASONS = re.compile(r"^(?:Audio|SecondaryAudio|UnknownAudio)", re.I)
 
 
@@ -1811,6 +1813,8 @@ class Activity:
                 "Transcode": "flux Emby HLS"}.get(body.get("PlayMethod"), "")
         if what == "start" and c.playing and c.playing["item"] == item:
             # flux deja vu : on complete seulement (mode exact, position)
+            if c.playing.get("real"):           # detail donne par Emby : garde
+                mode = c.playing["mode"]
             c.playing.update(mode=mode or c.playing["mode"], pos=pos,
                              paused=bool(body.get("IsPaused")), updated=time.time())
             return
@@ -1822,7 +1826,7 @@ class Activity:
             self._start_play(c, item, mode or "?", pos, bool(body.get("IsPaused")))
             return
         pl = c.playing
-        if mode:
+        if mode and not pl.get("real"):        # detail donne par Emby : garde
             pl["mode"] = mode
         if what == "stopped":
             dur = self.info.runtime(item)
@@ -1872,8 +1876,23 @@ class Activity:
                  parse_qsl(urlsplit(s["TranscodingUrl"]).query)}
             why = q.get("transcodereasons", "")
             reasons = [r for r in why.split(",") if r]
-            video = any(_VIDEO_REASONS.match(r) for r in reasons)
-            audio = any(_AUDIO_REASONS.match(r) for r in reasons)
+            # formats du film compares a ceux que l'appareil accepte (donnes
+            # par Emby dans l'adresse du flux) : copie possible ou conversion
+            streams = s.get("MediaStreams") or []
+            vs = next((m for m in streams if m.get("Type") == "Video"), None)
+            aidx = q.get("audiostreamindex", s.get("DefaultAudioStreamIndex"))
+            auds = [m for m in streams if m.get("Type") == "Audio"]
+            au = next((m for m in auds if str(m.get("Index")) == str(aidx)),
+                      auds[0] if auds else None)
+
+            def refused(stream, key):
+                ok = [x.strip().lower() for x in q.get(key, "").split(",") if x.strip()]
+                codec = str((stream or {}).get("Codec") or "").lower()
+                return bool(ok and codec and codec not in ok)
+            video = any(_VIDEO_REASONS.match(r) for r in reasons) or \
+                refused(vs, "videocodec")
+            audio = any(_AUDIO_REASONS.match(r) for r in reasons) or \
+                refused(au, "audiocodec")
             label = "pr\u00e9vu : " + transcode_label(not video, not audio)
             return False, label + (" \u2014 raisons : %s" % why if why else "") + info
         return True, "REFUSEE par Emby : ni lecture directe ni transcodage possible" + info
@@ -2881,6 +2900,7 @@ class EmbyProxy:
                                             ti.get("AudioCodec") or "")
                 if c.playing and c.playing.get("item") == item:
                     c.playing["mode"] = label
+                    c.playing["real"] = True
                 self.activity.event(c, "play", "Emby : %s \u2192 %s%s" % (
                     X, label, " \u2014 raisons : %s" % why if why else ""),
                     item, merge=600)

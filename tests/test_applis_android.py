@@ -230,8 +230,8 @@ async def test_demande_de_lecture_envoyee_entiere(aiohttp_server, tmp_path):
     ({"MediaSources": [{"SupportsDirectPlay": False, "SupportsDirectStream": False,
                         "TranscodingUrl": "/videos/9/master.m3u8?TranscodeReasons="
                                           "ContainerBitrateExceedsLimit"}]}, 200,
-     "Demande de lecture : Argylle (2024) \u2192 pr\u00e9vu : vid\u00e9o transcod\u00e9e, "
-     "son copi\u00e9 \u2014 raisons : ContainerBitrateExceedsLimit"),
+     "Demande de lecture : Argylle (2024) \u2192 pr\u00e9vu : changement de conteneur "
+     "(vid\u00e9o et son copi\u00e9s) \u2014 raisons : ContainerBitrateExceedsLimit"),
     ({"ErrorCode": "NoCompatibleStream", "MediaSources": []}, 200,
      "Demande de lecture : Argylle (2024) → REFUSEE par Emby : NoCompatibleStream"),
     ({"x": 1}, 500, "Demande de lecture : Argylle (2024) → erreur Emby HTTP 500"),
