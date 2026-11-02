@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2486,7 +2486,9 @@ def _decode(raw, encoding):
 
 
 class Stats:
-    def __init__(self):
+    KEPT = ("hits", "misses", "stale", "bytes_saved")    # gardes au redemarrage
+
+    def __init__(self, path=None):
         self.started = time.time()
         self.requests = 0
         self.hits = 0
@@ -2495,6 +2497,58 @@ class Stats:
         self.bytes_saved = 0
         self.upstream_errors = 0
         self.ws_open = 0
+        self.path = Path(path) if path else None
+        self._saved = None
+        if self.path and self.path.exists():
+            try:
+                d = json.loads(self.path.read_text(encoding="utf-8"))
+                for k in self.KEPT:
+                    setattr(self, k, int(d.get(k, 0)))
+            except (OSError, ValueError, TypeError):
+                pass
+        self._saved = self._state()
+
+    def _state(self):
+        return tuple(getattr(self, k) for k in self.KEPT)
+
+    def save(self):
+        if not self.path or self._state() == self._saved:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({k: getattr(self, k) for k in self.KEPT}),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+            self._saved = self._state()
+        except OSError:
+            pass
+
+    def reset(self):
+        for k in self.KEPT:
+            setattr(self, k, 0)
+        self.save()
+
+
+# Tailles d'images demandees : arrondies au palier superieur, pour que des
+# ecrans differents (telephone, TV, PC) partagent les memes vignettes en cache
+# au lieu d'en demander chacun une version a quelques pixels pres.
+SIZE_PARAMS = {"maxwidth", "maxheight", "width", "height", "fillwidth", "fillheight"}
+SIZE_STEPS = (60, 80, 100, 120, 160, 200, 240, 300, 360, 400, 480, 560, 640, 720,
+              800, 960, 1080, 1280, 1440, 1600, 1920, 2560, 3840)
+
+
+def bucket_sizes(query_string):
+    """-> chaine de requete avec les tailles arrondies au palier superieur."""
+    out, changed = [], False
+    for k, v in parse_qsl(query_string, keep_blank_values=True):
+        if k.lower() in SIZE_PARAMS and v.isdigit():
+            n = int(v)
+            b = next((x for x in SIZE_STEPS if x >= n), n)
+            if b != n:
+                v, changed = str(b), True
+        out.append((k, v))
+    return urlencode(out) if changed else query_string
 
 
 class EmbyProxy:
@@ -2502,7 +2556,7 @@ class EmbyProxy:
         self.cfg = cfg
         self.cache = DiskCache(cfg.cache_dir, cfg.cache_max)
         self.guard = Guard(cfg)
-        self.stats = Stats()
+        self.stats = Stats(Path(cfg.cache_dir) / "stats.json")
         self.session = None
         self._locks = {}
         self._tasks = []
@@ -2555,6 +2609,7 @@ class EmbyProxy:
         if self.activity:
             self._tasks.append(asyncio.create_task(self._resolve_loop()))
         self._tasks.append(asyncio.create_task(self._prune_loop()))
+        self._tasks.append(asyncio.create_task(self._stats_loop()))
         log.info("reglages lus dans %s", self.cfg.path)
         for i, w in enumerate(self.cfg.config_warnings):
             self.warnings["config%d" % i] = "Reglages : " + w
@@ -2641,9 +2696,17 @@ class EmbyProxy:
                     log.info("journal %s : %d lignes anciennes effacees", path, n)
             await asyncio.sleep(6 * 3600)
 
+    async def _stats_loop(self):
+        """Compteurs du cache sur disque : un service arrete brutalement ne
+        les remet pas a zero."""
+        while True:
+            await asyncio.sleep(60)
+            await asyncio.get_running_loop().run_in_executor(None, self.stats.save)
+
     async def cleanup(self, app):
         for t in self._tasks:
             t.cancel()
+        self.stats.save()
         if self.alerts.pending:
             await self.alerts.flush()          # ne pas perdre les dernieres alertes
         await asyncio.get_running_loop().run_in_executor(None, self.quota.close)
@@ -3155,7 +3218,7 @@ class EmbyProxy:
 
     async def proxy_image(self, request):
         loop = asyncio.get_running_loop()
-        qs = request.query_string
+        qs = bucket_sizes(request.query_string)
         key = cache_key(npath(request), qs)
         got = await loop.run_in_executor(None, self.cache.get, key)
         now = time.time()
@@ -3183,6 +3246,8 @@ class EmbyProxy:
 
     async def _fetch_image(self, request, key, qs, stale):
         url = self.cfg.upstream + request.raw_path
+        if qs != request.query_string:          # tailles arrondies
+            url = self.cfg.upstream + request.raw_path.split("?", 1)[0] + "?" + qs
         headers = self._up_headers(request, drop={"if-none-match",
                                                   "if-modified-since", "range"})
         try:
@@ -4225,6 +4290,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
 </section>
 
 <section id="cache" hidden>
+  <div class="sub" style="margin-bottom:10px;max-width:760px">Chaque appareil garde lui-même les vignettes qu'il a déjà affichées et ne les redemande pas. Le cache du proxy sert quand un autre appareil (ou un autre utilisateur) affiche les mêmes vignettes, ou quand Emby est en panne. Avec un seul appareil, « Vignettes servies du cache » reste donc à 0 : c'est normal.</div>
   <div class="g" id="g"></div>
   <button class="red" id="purge">Vider le cache</button>
 </section>

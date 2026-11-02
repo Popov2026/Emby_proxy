@@ -167,6 +167,14 @@ EN = {
 
     # ---- onglet Cache
     "Vider le cache": "Empty the cache",
+    "Chaque appareil garde lui-même les vignettes qu'il a déjà affichées et ne les "
+    "redemande pas. Le cache du proxy sert quand un autre appareil (ou un autre "
+    "utilisateur) affiche les mêmes vignettes, ou quand Emby est en panne. Avec un "
+    "seul appareil, « Vignettes servies du cache » reste donc à 0 : c'est normal.":
+        "Each device keeps the thumbnails it already displayed and does not ask for "
+        "them again. The proxy cache helps when another device (or another user) "
+        "displays the same thumbnails, or when Emby is down. With a single device, "
+        "“Thumbnails served from cache” therefore stays at 0: that is normal.",
     "Vider le cache des vignettes ?": "Empty the thumbnail cache?",
     "Vignettes servies du cache": "Thumbnails served from cache",
     "Demandées à Emby": "Requested from Emby",
@@ -703,6 +711,7 @@ PATTERNS = [
     (r"^Alertes : dernier envoi de mail impossible : (.*)$",
      "Alerts: last mail could not be sent: {1}"),
     (r"^Quotas : (.*)$", "Quotas: {1}"),
+    (r"^Reglages : (.*)$", "Settings: {1}"),
     (r"^reglages des quotas illisibles : (.*)$", "quota settings unreadable: {1}"),
     (r"^reglages illisibles : (.*)$", "settings unreadable: {1}"),
     (r"^Reglages refuses par le moteur de quotas : (.*)$",
