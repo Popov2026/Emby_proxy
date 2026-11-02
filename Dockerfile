@@ -7,7 +7,7 @@ COPY emby_proxy.py emby_proxy_lang.py emby_quota.py emby_quota_i18n.py emby_quot
 
 # Reglages, cache et journal dans un volume : ils survivent aux mises a jour.
 ENV EMBY_PROXY_CONFIG=/data/emby_proxy.ini \
-    EMBY_PROXY_CACHE_DIR=/data/cache_images \
+    EMBY_PROXY_CACHE_DIR=/data/image_cache \
     EMBY_PROXY_LOG_FILE=/data/emby_proxy.log \
     EMBY_PROXY_ACTIVITY_LOG=/data/emby_activity.log \
     EMBY_PROXY_SECURITY_LOG=/data/emby_security.log \

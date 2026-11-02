@@ -1,6 +1,7 @@
 <!--
   Service Windows d'Emby Proxy (WinSW : https://github.com/winsw/winsw).
-  Installe par installer_service.bat ; ne pas lancer ce fichier directement.
+  Installe par install_service.bat ; ne pas lancer ce fichier directement.
+  Installed by install_service.bat; do not run this file directly.
 -->
 <service>
   <id>EmbyProxy</id>

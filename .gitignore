@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 emby_proxy.ini
 emby_proxy.log
+image_cache/
 cache_images/
 data/
 *.pem
@@ -15,6 +16,7 @@ emby_quota.ini.*
 *.db-wal
 *.db-shm
 emby_proxy_secret.key
+*.before-import
 *.avant-import
 
 # compilation

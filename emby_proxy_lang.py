@@ -460,10 +460,10 @@ EN = {
     "Reprendre un emby_quota.ini existant": "Import an existing emby_quota.ini",
     "Quotas, utilisateurs et messages sont repris ; la clé API qu'il contient est "
     "ignorée (le proxy utilise la sienne, chiffrée). L'ancien réglage est sauvegardé "
-    "en .avant-import.":
+    "en .before-import.":
         "Quotas, users and messages are imported; the API key it contains is ignored "
         "(the proxy uses its own, encrypted). The previous settings are backed up as "
-        ".avant-import.",
+        ".before-import.",
     "Les quotas sont désactivés : active-les dans l'onglet Configuration, section « "
     "Quotas de lecture ». Tu peux déjà préparer les réglages ci-dessous.":
         "Quotas are disabled: enable them in the Settings tab, “Viewing quotas” "

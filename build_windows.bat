@@ -12,7 +12,7 @@ copy /y emby_quota.ini.example dist\EmbyProxy\ >nul
 copy /y emby_proxy.example.ini dist\EmbyProxy\ >nul
 if not exist dist\EmbyProxy\EmbyProxy-service.exe powershell -NoProfile -Command "Invoke-WebRequest https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe -OutFile dist\EmbyProxy\EmbyProxy-service.exe" || goto :err
 echo.
-echo Pret : dist\EmbyProxy  (copie-le dans C:\EmbyProxy puis lance installer_service.bat)
+echo Pret : dist\EmbyProxy  (copie-le dans C:\EmbyProxy puis lance install_service.bat / copy it to C:\EmbyProxy then run install_service.bat)
 pause
 exit /b 0
 :err

@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -89,7 +89,7 @@ DEFAULTS = {
         "forward_client_ip": "true",
     },
     "cache": {
-        "dir": "cache_images",
+        "dir": "image_cache",
         "max_size_mb": "2048",
         "max_item_mb": "20",
         "ttl_tagged_days": "365",
@@ -380,6 +380,35 @@ def read_ini_text(path):
         return raw.decode("cp1252", errors="replace")
 
 
+def migrate_file_names(path):
+    """Noms de fichiers passes en anglais (2.2.2) : l'ancien dossier du cache
+    des vignettes (cache_images) devient image_cache, sans rien perdre.
+    -> liste des changements faits."""
+    path = Path(path)
+    done = []
+    if os.environ.get("EMBY_PROXY_CACHE_DIR"):
+        return done                      # dossier impose (Docker) : on n'y touche pas
+    cp = configparser.ConfigParser()
+    try:
+        if path.exists():
+            cp.read_string(read_ini_text(path))
+    except (configparser.Error, OSError, UnicodeError):
+        return done
+    current = cp.get("cache", "dir", fallback="").strip()
+    if current not in ("", "cache_images"):
+        return done                      # dossier choisi par l'utilisateur
+    old, new = path.parent / "cache_images", path.parent / "image_cache"
+    try:
+        if old.is_dir() and not new.exists():
+            os.replace(old, new)
+            done.append("cache_images -> image_cache")
+        if current == "cache_images" and (new.exists() or not old.exists()):
+            update_ini(path, "cache", "dir", "image_cache")
+    except OSError:
+        pass
+    return done
+
+
 def update_ini(path, section, key, value):
     """Change une valeur du fichier de reglages en gardant ses commentaires."""
     path = Path(path)
@@ -442,7 +471,7 @@ class Settings:
         self.tls_cert = self._path(base, p.get("tls_cert"))
         self.tls_key = self._path(base, p.get("tls_key"))
 
-        self.cache_dir = self._path(base, c.get("dir")) or base / "cache_images"
+        self.cache_dir = self._path(base, c.get("dir")) or base / "image_cache"
         self.cache_max = int(c.getfloat("max_size_mb") * 1024 * 1024)
         self.item_max = int(c.getfloat("max_item_mb") * 1024 * 1024)
         self.ttl_tagged = c.getfloat("ttl_tagged_days") * 86400
@@ -559,7 +588,7 @@ tls_key =
 
 [cache]
 # Dossier des vignettes gardees sur disque.
-dir = cache_images
+dir = image_cache
 # Taille maximale du cache ; les vignettes les moins vues partent d'abord.
 max_size_mb = 2048
 # Une image plus grosse que ceci n'est pas gardee.
@@ -2484,7 +2513,7 @@ class QuotaService:
         """Reprend un emby_quota.ini existant (quotas, utilisateurs, messages).
         La cle API qu'il contient est retiree : le proxy utilise la sienne."""
         if os.path.exists(self.path):
-            shutil.copyfile(self.path, self.path + ".avant-import")
+            shutil.copyfile(self.path, self.path + ".before-import")
         tmp = self.path + ".import"
         Path(tmp).write_text(text, encoding="utf-8")
         try:
@@ -4523,7 +4552,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   </div>
   <h2>Reprendre un emby_quota.ini existant</h2>
   <div class="c form">
-    <div class="sub">Quotas, utilisateurs et messages sont repris ; la clé API qu'il contient est ignorée (le proxy utilise la sienne, chiffrée). L'ancien réglage est sauvegardé en .avant-import.</div>
+    <div class="sub">Quotas, utilisateurs et messages sont repris ; la clé API qu'il contient est ignorée (le proxy utilise la sienne, chiffrée). L'ancien réglage est sauvegardé en .before-import.</div>
     <input type="file" id="qFile" accept=".ini,.txt">
     <input id="qImpPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
     <div class="row"><button class="red" id="qImp">Importer</button></div>
@@ -5157,6 +5186,7 @@ def main(argv=None):
             return 2
         update_ini(cfg_path, "status", "password", args.password)
         print("Mot de passe de la page d'administration change dans %s" % cfg_path)
+    renamed = migrate_file_names(cfg_path)
     revealed = reveal_status_password(cfg_path)
     migrated = migrate_plain_secrets(cfg_path)
     cfg = Settings(cfg_path)
@@ -5166,6 +5196,8 @@ def main(argv=None):
                  "section [status]", cfg_path)
     if migrated:
         log.info("secrets chiffres dans %s : %s", cfg_path, ", ".join(migrated))
+    if renamed:
+        log.info("fichiers renommes : %s", ", ".join(renamed))
     log.info("cle API Emby : %s", secret_state(cfg_path, "emby", "api_key"))
     if ensure_status_password(cfg_path, cfg):
         # jamais le mot de passe lui-meme dans le journal (on le partage

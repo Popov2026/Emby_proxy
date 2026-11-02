@@ -151,13 +151,22 @@ jobs:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           files: ${{ env.ZIP }}
-          name: Emby Proxy ${{ env.TAG }} pour Windows
+          name: Emby Proxy ${{ env.TAG }} for Windows / pour Windows
           body: |
-            Version compilee pour Windows, avec installation en service.
+            **English** - compiled version for Windows, installed as a service.
+
+            1. Download EmbyProxy-${{ env.TAG }}-windows.zip below.
+            2. Unzip it to C:\EmbyProxy.
+            3. Double-click install_service.bat.
+            4. Admin page: http://localhost:8098/
+
+            Details: README.txt in the archive.
+
+            **Français** - version compilee pour Windows, avec installation en service.
 
             1. Telecharge EmbyProxy-${{ env.TAG }}-windows.zip ci-dessous.
             2. Decompresse-le dans C:\EmbyProxy.
-            3. Double-clic sur installer_service.bat.
+            3. Double-clic sur install_service.bat.
             4. Page d'administration : http://localhost:8098/
 
-            Detail : LISEZMOI.txt dans l'archive.
+            Detail : README.txt dans l'archive.
