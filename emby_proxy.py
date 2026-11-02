@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.7"
+__version__ = "2.1.8"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1108,7 +1108,9 @@ ADMIN_RE = re.compile(
     r"Devices(?!/CameraUploads)|"
     r"Library/(?:VirtualFolders|Refresh|Media/Updated)|Notifications/Admin|"
     r"LiveTv/(?:TunerHosts|ListingProviders)|Users/New|Users/[^/]+/Policy|"
-    r"Encoding|Branding/Configuration|Backup"
+    # (Branding/Configuration n'y est pas : texte de la page de connexion,
+    # public, demande par les applis iPhone / Android avant meme le login)
+    r"Encoding|Backup"
     r")(?![A-Za-z0-9])", re.I)
 LOGIN_RE = re.compile(r"^/Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$", re.I)
 
@@ -1372,7 +1374,7 @@ RE_USER = re.compile(_P + r"Users/(?P<uid>%s)/?$" % _HEX, re.I)
 RE_SEASONS = re.compile(_P + r"Shows/(?P<item>%s)/(?P<what>Seasons|Episodes)/?$" % _HEX, re.I)
 RE_HINTS = re.compile(_P + r"Search/Hints/?$", re.I)
 RE_PLAYING = re.compile(_P + r"Sessions/Playing(?:/(?P<what>Progress|Stopped|Ping))?/?$", re.I)
-RE_STREAM = re.compile(_P + r"(?:Videos|Audio)/(?P<item>%s)/(?:stream|master|main|live|universal)" % _HEX, re.I)
+RE_STREAM = re.compile(_P + r"(?:Videos|Audio)/(?P<item>%s)/(?:stream|master|main|live|universal|original)" % _HEX, re.I)
 RE_PBINFO = re.compile(_P + r"Items/(?P<item>%s)/PlaybackInfo/?$" % _HEX, re.I)
 RE_DOWNLOAD = re.compile(_P + r"Items/(?P<item>%s)/(?:Download|File)/?$" % _HEX, re.I)
 RE_FAV = re.compile(_P + r"Users/(?P<uid>%s)/FavoriteItems/(?P<item>%s)/?$" % (_HEX, _HEX), re.I)
@@ -2931,7 +2933,14 @@ class EmbyProxy:
             refus = (403, "Connexion directe refusee : passe par l'adresse HTTPS.")
         if refus:
             self.guard.blocked += 1
-            if refus[0] != 429:
+            if refus[0] == 429:
+                # debit depasse : note aussi (une ligne par minute et par adresse,
+                # les suivantes sont comptees), sinon invisible dans la page
+                f = Activity._auth_fields(request)
+                self.seclog.add("refused", ip, self.guard.is_local(ip),
+                                client=f.get("client", ""), device=f.get("device", ""),
+                                detail=refus[1])
+            else:
                 log.info("refuse %s %s %s : %s", ip, _safe(request.method, 10),
                          _safe(request.path), refus[1])
                 f = Activity._auth_fields(request)

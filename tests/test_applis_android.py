@@ -284,6 +284,8 @@ async def test_demande_de_lecture_visible_dans_l_activite(aiohttp_server, tmp_pa
 @pytest.mark.parametrize("path,bloque", [
     ("/emby/System/WakeOnLanInfo", False),        # Android TV, utilisateur simple
     ("/emby/Devices/CameraUploads", False),       # appli du telephone
+    ("/emby/Branding/Configuration", False),      # page de connexion (iPhone)
+    ("/emby/Branding/Css", False),
     ("/emby/System/Configuration", True),
     ("/emby/System/Logs", True),
     ("/emby/Devices", True),
@@ -296,3 +298,14 @@ def test_administration_depuis_internet(tmp_path, path, bloque):
     g = ep.Guard(cfg)
     r = g.check("83.204.193.128", ep.norm_path(path))
     assert (r is not None and r[0] == 403) == bloque
+
+
+async def test_debit_depasse_visible_dans_securite(env):
+    """Les refus pour debit trop eleve apparaissent (une ligne, comptee)."""
+    proxy, c, _ = env
+    proxy.cfg.rate, proxy.cfg.burst = 1, 2
+    codes = [(await c.get("/emby/System/Info/Public")).status for _ in range(6)]
+    assert 429 in codes
+    ev = [e for e in proxy.seclog.events if e["type"] == "refused"]
+    assert len(ev) == 1 and ev[0]["count"] == codes.count(429)
+    assert "Trop de requetes" in ev[0]["detail"]
