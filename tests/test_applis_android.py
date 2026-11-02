@@ -279,3 +279,20 @@ async def test_demande_de_lecture_visible_dans_l_activite(aiohttp_server, tmp_pa
         assert card["events"][0]["text"] == attendu
     finally:
         await c.close()
+
+
+@pytest.mark.parametrize("path,bloque", [
+    ("/emby/System/WakeOnLanInfo", False),        # Android TV, utilisateur simple
+    ("/emby/Devices/CameraUploads", False),       # appli du telephone
+    ("/emby/System/Configuration", True),
+    ("/emby/System/Logs", True),
+    ("/emby/Devices", True),
+    ("/emby/Devices/Options", True),
+    ("/emby/Users/abc/Policy", True),
+    ("/emby/Plugins", True),
+])
+def test_administration_depuis_internet(tmp_path, path, bloque):
+    cfg = ep.Settings(tmp_path / "absent.ini")
+    g = ep.Guard(cfg)
+    r = g.check("83.204.193.128", ep.norm_path(path))
+    assert (r is not None and r[0] == 403) == bloque

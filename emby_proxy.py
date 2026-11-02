@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.6"
+__version__ = "2.1.7"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1101,8 +1101,11 @@ class DiskCache:
 # Administration d'Emby : refusee hors du reseau local.
 ADMIN_RE = re.compile(
     r"^/(?:"
-    r"System/(?:Configuration|Restart|Shutdown|Logs|ActivityLog|WakeOnLanInfo)|"
-    r"Startup|Plugins|Packages|ScheduledTasks|Environment|Auth/Keys|Devices|"
+    r"System/(?:Configuration|Restart|Shutdown|Logs|ActivityLog)|"
+    # WakeOnLanInfo : demande par les applis Android TV (reveil du serveur)
+    # Devices/CameraUploads : envoi des photos depuis l'appli du telephone
+    r"Startup|Plugins|Packages|ScheduledTasks|Environment|Auth/Keys|"
+    r"Devices(?!/CameraUploads)|"
     r"Library/(?:VirtualFolders|Refresh|Media/Updated)|Notifications/Admin|"
     r"LiveTv/(?:TunerHosts|ListingProviders)|Users/New|Users/[^/]+/Policy|"
     r"Encoding|Branding/Configuration|Backup"
