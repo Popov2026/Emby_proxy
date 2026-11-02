@@ -35,6 +35,7 @@ UNINSTALL
 FILES
   emby_proxy.exe              the proxy
   EmbyProxy-service.exe/.xml  the "Windows service" wrapper (WinSW, MIT licence)
+  wait_admin_page.ps1         used by install_service.bat (waits for the page)
   emby_proxy.ini              your settings (created at first start)
   emby_quota.ini / .db        quota settings and counters
   emby_proxy.log              proxy log
@@ -79,6 +80,7 @@ DESINSTALLATION
 FICHIERS
   emby_proxy.exe              le proxy
   EmbyProxy-service.exe/.xml  l'enveloppe "service Windows" (WinSW, licence MIT)
+  wait_admin_page.ps1         utilise par install_service.bat (attend la page)
   emby_proxy.ini              tes reglages (cree au premier demarrage)
   emby_quota.ini / .db        reglages et compteurs des quotas
   emby_proxy.log              journal du proxy
