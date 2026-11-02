@@ -10,6 +10,7 @@
   <arguments>--config "%BASE%\emby_proxy.ini"</arguments>
   <workingdirectory>%BASE%</workingdirectory>
   <env name="EMBY_PROXY_NO_PROMPT" value="1"/>
+  <env name="EMBY_PROXY_SERVICE" value="1"/>
   <startmode>Automatic</startmode>
   <delayedAutoStart>true</delayedAutoStart>
   <onfailure action="restart" delay="10 sec"/>

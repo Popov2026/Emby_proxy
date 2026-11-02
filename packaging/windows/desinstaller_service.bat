@@ -10,6 +10,8 @@ if errorlevel 1 (
 )
 cd /d "%~dp0"
 EmbyProxy-service.exe stop
+rem attendre l'arret complet avant de retirer le service
+powershell -NoProfile -Command "for ($i=0; $i -lt 30 -and (Get-Service EmbyProxy -ErrorAction SilentlyContinue).Status -eq 'Running'; $i++) { Start-Sleep 1 }"
 EmbyProxy-service.exe uninstall
 netsh advfirewall firewall delete rule name="Emby Proxy - utilisateurs" >nul 2>&1
 netsh advfirewall firewall delete rule name="Emby Proxy - administration" >nul 2>&1

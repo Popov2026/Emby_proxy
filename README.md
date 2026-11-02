@@ -170,6 +170,21 @@ la section `[status]` : c'est là qu'on le retrouve pour se connecter. Pour le
 changer : onglet Configuration, ou `python emby_proxy.py --password
 NouveauMotDePasse`.
 
+### Langue, administration d'Emby depuis Internet, journaux
+
+- **English / Français** : bouton en haut à droite de la page. Toute la page
+  passe dans l'autre langue (page de connexion et mails d'alerte compris) ; le
+  choix est gardé dans `emby_proxy.ini` (`[status] language`).
+- **Administration d'Emby depuis Internet : INTERDITE / AUTORISÉE** : bouton en
+  haut de la page. Il autorise ou interdit le tableau de bord d'Emby (réglages,
+  utilisateurs, bibliothèques, extensions…) pour les connexions venant
+  d'Internet, tout de suite et sans redémarrer. Depuis le réseau local,
+  l'administration reste toujours possible. Interdit par défaut.
+- **Onglet Journaux** : coche les journaux à effacer (activité, sécurité,
+  événements des quotas, journal technique), puis confirme avec le mot de passe
+  de la page. Les bannissements en cours sont conservés, et l'effacement est
+  lui-même noté dans le journal de sécurité.
+
 ### Tout le reste passe tel quel
 API, lecture vidéo (avec avance rapide / reprise), WebSocket des applications
 Emby, envoi de fichiers.

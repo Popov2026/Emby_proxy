@@ -44,7 +44,7 @@ jobs:
       - name: Compilation de emby_proxy.exe
         run: >
           pyinstaller --onefile --console --name emby_proxy
-          --hidden-import emby_quota --hidden-import emby_quota_i18n
+          --hidden-import emby_quota --hidden-import emby_quota_i18n --hidden-import emby_proxy_lang
           emby_proxy.py
 
       - name: Assemblage du dossier
@@ -133,7 +133,10 @@ jobs:
           Start-Sleep 8
           if ((Get-Service EmbyProxy).Status -ne "Running") { throw "redemarrage du service" }
           .\EmbyProxy-service.exe stop
+          for ($i = 0; $i -lt 30 -and (Get-Service EmbyProxy).Status -ne "Stopped"; $i++) { Start-Sleep 1 }
           .\EmbyProxy-service.exe uninstall
+          # Windows retire le service quelques secondes plus tard
+          for ($i = 0; $i -lt 30 -and (Get-Service EmbyProxy -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
           if (Get-Service EmbyProxy -ErrorAction SilentlyContinue) { throw "desinstallation" }
 
       - uses: actions/upload-artifact@v4

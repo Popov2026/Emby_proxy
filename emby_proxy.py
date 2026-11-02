@@ -62,7 +62,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
 from aiohttp import ClientError
 
-__version__ = "2.0.1"
+from emby_proxy_lang import js_table, tr
+from emby_proxy_lang import normalize as lang_normalize
+
+__version__ = "2.1.0"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -118,6 +121,7 @@ DEFAULTS = {
         "session_hours": "12",
         "port": "8098",
         "host": "",
+        "language": "fr",
     },
     "alerts": {
         "enabled": "false",
@@ -482,6 +486,7 @@ class Settings:
         self.status_password = self._secret(cp, "status", "password")
         self.status_internet = st.getboolean("allow_internet")
         self.session_hours = st.getfloat("session_hours")
+        self.language = lang_normalize(st.get("language"))
         self.status_port = st.getint("port")
         self.status_host = st.get("host", "").strip() or self.listen_host
 
@@ -614,6 +619,9 @@ session_hours = 12
 # Ne jamais rediriger ce port vers Internet. 0 = meme port que le proxy
 # (deconseille).
 port = 8098
+# Langue de la page d'administration et des mails : fr ou en (bouton FR / EN
+# de la page).
+language = fr
 # Adresse d'ecoute de la page d'etat (vide = la meme que le proxy ;
 # 127.0.0.1 = accessible seulement depuis cette machine).
 host =
@@ -846,7 +854,8 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "block_admin", "login_max", "login_window", "ban_seconds", "rate",
               "burst", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
-              "status_internet", "session_hours", "alerts", "quotas_enabled")
+              "status_internet", "session_hours", "alerts", "quotas_enabled",
+              "language")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -1250,7 +1259,8 @@ class SecurityLog:
               "refused": "Acces refuse", "status_ok": "Connexion a la page d'etat",
               "status_fail": "Mot de passe faux (page d'etat)",
               "config": "Configuration modifiee",
-              "config_fail": "Configuration refusee"}
+              "config_fail": "Configuration refusee",
+              "logs": "Journaux effaces"}
 
     def __init__(self, path, max_mb=20):
         self.path = path
@@ -1936,6 +1946,8 @@ class Alerts:
         if not self.pending:
             return
         items, self.pending = self.pending, []
+        lang = getattr(self.cfg, "language", "fr")
+        items = [(t, tr(title, lang), tr(detail, lang)) for t, title, detail in items]
         now = time.time()
         while self.sent and now - self.sent[0] > 3600:
             self.sent.popleft()
@@ -1950,14 +1962,18 @@ class Alerts:
         subject = "[Emby Proxy] %s" % (titles[0] if len(titles) == 1 else
                                        "%d alertes : %s" % (len(items),
                                                             ", ".join(titles[:3])))
-        lines = ["Emby Proxy - %d alerte(s)" % len(items), ""]
+        if lang == "en":
+            subject = "[Emby Proxy] %s" % (titles[0] if len(titles) == 1 else
+                                           "%d alerts: %s" % (len(items),
+                                                              ", ".join(titles[:3])))
+        lines = [tr("Emby Proxy - %d alerte(s)" % len(items), lang), ""]
         for t, title, detail in items:
             lines.append("%s  %s" % (time.strftime("%d/%m %H:%M:%S", time.localtime(t)),
                                      title))
             if detail:
                 lines.append("    " + detail)
-        lines += ["", "Page d'administration : http://%s:%d/" % (
-            lan_address(), self.cfg.status_port or self.cfg.listen_port)]
+        lines += ["", tr("Page d'administration : http://%s:%d/" % (
+            lan_address(), self.cfg.status_port or self.cfg.listen_port), lang)]
         try:
             await asyncio.get_running_loop().run_in_executor(
                 None, send_mail, dict(self.cfg.alerts), subject[:200], "\n".join(lines))
@@ -2723,6 +2739,10 @@ class EmbyProxy:
         app.router.add_post("/__proxy/quotas/preview", self.quotas_preview)
         app.router.add_post("/__proxy/quotas/import", self.quotas_import)
         app.router.add_post("/__proxy/quotas/action", self.quotas_action)
+        app.router.add_post("/__proxy/lang", self.lang_post)
+        app.router.add_post("/__proxy/emby_admin", self.emby_admin_post)
+        app.router.add_get("/__proxy/logs.json", self.logs_json)
+        app.router.add_post("/__proxy/logs/clear", self.logs_clear)
 
     # -- securite ------------------------------------------------------
     @web.middleware
@@ -3186,6 +3206,8 @@ class EmbyProxy:
                 ["Quotas : %s" % self.quota.error] if self.cfg.quotas_enabled and
                 self.quota.error else []),
             "emby_down": "emby" in self.warnings,
+            "emby_admin_internet": not self.cfg.block_admin,
+            "lang": self.cfg.language,
             "active_users": sum(
                 1 for x in list(self.activity.clients.values())
                 if time.time() - x.last_seen < self.cfg.activity_idle_minutes * 60
@@ -3574,17 +3596,20 @@ class EmbyProxy:
         si le champ est laisse vide)."""
         data = await request.json()
         v = data.get("values") or {}
+        L = self.cfg.language
         a = dict(self.cfg.alerts)
         for k in list(a):
             if "alerts." + k in v and (k != "smtp_password" or v["alerts." + k]):
                 a[k] = str(v["alerts." + k]).strip()
         try:
             await asyncio.get_running_loop().run_in_executor(
-                None, send_mail, a, "[Emby Proxy] Mail de test",
-                "Ceci est un mail de test d'Emby Proxy.\n\nSi tu le recois, les "
-                "alertes par mail fonctionnent.\n\nPage d'administration : "
-                "http://%s:%d/" % (lan_address(), self.cfg.status_port or
-                                   self.cfg.listen_port))
+                None, send_mail, a, "[Emby Proxy] " + tr("Mail de test", L),
+                "%s\n\n%s\n\n%s" % (
+                    tr("Ceci est un mail de test d'Emby Proxy.", L),
+                    tr("Si tu le recois, les alertes par mail fonctionnent.", L),
+                    tr("Page d'administration : http://%s:%d/" % (
+                        lan_address(), self.cfg.status_port or self.cfg.listen_port),
+                       L)))
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)})
         return web.json_response({"ok": True, "to": a.get("to_addrs", "")})
@@ -3671,6 +3696,211 @@ class EmbyProxy:
                         detail="quotas : %s (%s)" % (msg, data.get("user") or uid))
         return web.json_response({"ok": True, "message": msg})
 
+    # -- langue de la page (bouton FR / EN) --------------------------------
+    async def lang_post(self, request):
+        data = await request.json()
+        lang = lang_normalize(data.get("lang"))
+        try:
+            update_ini(self.cfg.path, "status", "language", lang)
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": "Fichier %s non modifie : %s"
+                                      % (self.cfg.path, exc)}, status=500)
+        self.cfg.language = lang
+        return web.json_response({"ok": True, "lang": lang})
+
+    # -- administration d'Emby depuis Internet (bouton de l'en-tete) -------
+    async def emby_admin_post(self, request):
+        ip = request[CLIENT_IP]
+        if not self.guard.is_local(ip):
+            return web.json_response({"ok": False, "error": "Modification possible "
+                                      "uniquement depuis le reseau local."}, status=403)
+        if ("security", "block_admin_from_internet") in self.cfg.env_locked:
+            return web.json_response({"ok": False, "error": "Fixé par une variable "
+                                      "d'environnement (docker-compose)."}, status=403)
+        data = await request.json()
+        allow = data.get("allow") is True
+        try:
+            update_ini(self.cfg.path, "security", "block_admin_from_internet",
+                       "false" if allow else "true")
+            if Settings(self.cfg.path).block_admin == allow:
+                raise OSError("relu different")
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": "Fichier %s non modifie : %s"
+                                      % (self.cfg.path, exc)}, status=500)
+        self.cfg.block_admin = not allow
+        msg = ("administration d'Emby depuis Internet autorisee" if allow else
+               "administration d'Emby depuis Internet interdite")
+        self.seclog.add("config", ip, True, detail=msg)
+        log.warning("%s par %s", msg, ip)
+        return web.json_response({"ok": True, "allow": allow})
+
+    # -- effacement des journaux (onglet Journaux) -------------------------
+    LOG_KINDS = ("activity", "security", "quotas", "technical")
+
+    def _tech_files(self):
+        files = []
+        if self.cfg.log_file:
+            files.append(Path(self.cfg.log_file))
+        for h in log.handlers:
+            fn = getattr(h, "baseFilename", None)
+            if fn and Path(fn) not in files:
+                files.append(Path(fn))
+        return files
+
+    @staticmethod
+    def _fsize(*paths):
+        total = 0
+        for p in paths:
+            for q in (Path(p), Path(str(p) + ".1")):
+                try:
+                    total += q.stat().st_size
+                except OSError:
+                    pass
+        return total
+
+    def _quota_event_count(self):
+        db = Path(self.cfg.quotas_db)
+        if not db.exists():
+            return 0
+        import sqlite3
+        try:
+            con = sqlite3.connect(str(db), timeout=5)
+            try:
+                return con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return 0
+
+    def _logs_info(self):
+        act = self.activity
+        return {
+            "activity": {"lines": len(act.feed) if act else 0,
+                         "bytes": self._fsize(self.cfg.activity_log)
+                         if self.cfg.activity_log else 0},
+            "security": {"lines": len(self.seclog.events),
+                         "bytes": self._fsize(self.cfg.security_log)
+                         if self.cfg.security_log else 0},
+            "quotas": {"lines": self._quota_event_count(), "bytes": 0},
+            "technical": {"lines": None, "bytes": self._fsize(*self._tech_files())},
+        }
+
+    async def logs_json(self, request):
+        loop = asyncio.get_running_loop()
+        return web.json_response(await loop.run_in_executor(None, self._logs_info))
+
+    @staticmethod
+    def _truncate(path):
+        """Vide un fichier de journal (et sa copie .1)."""
+        p = Path(path)
+        if p.exists():
+            with open(p, "r+", encoding="utf-8") as fh:
+                fh.truncate(0)
+        old = Path(str(p) + ".1")
+        if old.exists():
+            old.unlink()
+
+    def _clear_logs(self, kinds):
+        done, errors = [], []
+        if "activity" in kinds:
+            try:
+                if self.activity is not None:
+                    self.activity.feed.clear()
+                    for c in list(self.activity.clients.values()):
+                        c.events.clear()
+                    with self.activity._log_lock:
+                        if self.cfg.activity_log:
+                            self._truncate(self.cfg.activity_log)
+                elif self.cfg.activity_log:
+                    self._truncate(self.cfg.activity_log)
+                done.append("activité")
+            except OSError as exc:
+                errors.append("activité : %s" % exc)
+        if "security" in kinds:
+            try:
+                # les bannissements en cours restent (et survivent au redemarrage)
+                active = set(self.guard.active_bans())
+                keep = [e for e in list(self.seclog.events) if e.get("type") == "ban"
+                        and (e.get("ban_key") or self.guard.key(e["ip"])) in active]
+                with self.seclog._lock:
+                    self.seclog.events.clear()
+                    self.seclog.events.extend(keep)
+                    if self.seclog.path:
+                        p = Path(self.seclog.path)
+                        p.write_text("".join(json.dumps(
+                            {k: v for k, v in e.items() if k != "t"},
+                            ensure_ascii=False) + "\n" for e in keep), encoding="utf-8")
+                        old = Path(str(p) + ".1")
+                        if old.exists():
+                            old.unlink()
+                done.append("sécurité")
+            except OSError as exc:
+                errors.append("sécurité : %s" % exc)
+        if "quotas" in kinds:
+            import sqlite3
+            try:
+                store = self.quota.store
+                if store is not None:
+                    inner = getattr(store, "_s", store)
+                    with inner._lock:
+                        inner.conn.execute("DELETE FROM events")
+                        inner.conn.commit()
+                elif Path(self.cfg.quotas_db).exists():
+                    con = sqlite3.connect(str(self.cfg.quotas_db), timeout=10)
+                    try:
+                        con.execute("DELETE FROM events")
+                        con.commit()
+                    finally:
+                        con.close()
+                done.append("quotas")
+            except (sqlite3.Error, OSError) as exc:
+                errors.append("quotas : %s" % exc)
+        if "technical" in kinds:
+            try:
+                handled = set()
+                for h in log.handlers:
+                    fn = getattr(h, "baseFilename", None)
+                    if fn and getattr(h, "stream", None) is not None:
+                        h.acquire()
+                        try:
+                            h.stream.flush()
+                            h.stream.seek(0)
+                            h.stream.truncate(0)
+                        finally:
+                            h.release()
+                        handled.add(Path(fn))
+                for p in self._tech_files():
+                    if p not in handled:
+                        self._truncate(p)
+                done.append("technique")
+            except OSError as exc:
+                errors.append("technique : %s" % exc)
+        return done, errors
+
+    async def logs_clear(self, request):
+        ip = request[CLIENT_IP]
+        if not self.guard.is_local(ip):
+            return web.json_response({"ok": False, "error": "Modification possible "
+                                      "uniquement depuis le reseau local."}, status=403)
+        data = await request.json()
+        bad = self._confirm(request, data.get("password"))
+        if bad:
+            return bad
+        kinds = [k for k in (data.get("logs") or []) if k in self.LOG_KINDS]
+        if not kinds:
+            return web.json_response({"ok": False, "error": "Aucune case cochée."},
+                                     status=400)
+        loop = asyncio.get_running_loop()
+        done, errors = await loop.run_in_executor(None, self._clear_logs, kinds)
+        if done:
+            self.seclog.add("logs", ip, True, detail="journaux effaces : %s"
+                            % ", ".join(done))
+            log.warning("journaux effaces par %s : %s", ip, ", ".join(done))
+        if errors:
+            return web.json_response({"ok": False, "done": done,
+                                      "error": " ; ".join(errors)}, status=500)
+        return web.json_response({"ok": True, "done": done})
+
     async def restart_post(self, request):
         if not self.guard.is_local(request[CLIENT_IP]):
             return web.json_response({"ok": False, "error": "reseau local seulement"},
@@ -3696,7 +3926,20 @@ class EmbyProxy:
         return web.json_response({"ok": ok})
 
     async def login_page(self, request, error=""):
-        html = LOGIN_HTML.replace("@@ERR@@", error)
+        lang = self.cfg.language
+        if request.query.get("lang") in ("fr", "en"):
+            lang = request.query["lang"]          # affichage seulement
+        t = lambda x: _html_escape(tr(x, lang))      # noqa: E731
+        other = "fr" if lang == "en" else "en"
+        html = (LOGIN_HTML.replace("@@LANG@@", lang)
+                .replace("@@PH@@", t("Mot de passe"))
+                .replace("@@BTN@@", t("Se connecter"))
+                .replace("@@SUB@@", t("Mot de passe : section [status] du fichier "
+                                      "emby_proxy.ini, ou bouton « Copier le mot "
+                                      "de passe » de la fenetre du proxy."))
+                .replace("@@OTHER@@", other)
+                .replace("@@OTHERLBL@@", "Français" if other == "fr" else "English")
+                .replace("@@ERR@@", t(error) if error else ""))
         return web.Response(text=html, content_type="text/html",
                             status=401 if error else 200,
                             headers={"Cache-Control": "no-store"})
@@ -3742,10 +3985,17 @@ class EmbyProxy:
         return web.json_response({"ok": True})
 
     async def status_page(self, request):
-        return web.Response(text=STATUS_HTML, content_type="text/html")
+        html = STATUS_HTML.replace("@@LANG@@", self.cfg.language) \
+            .replace("@@I18N@@", js_table())
+        return web.Response(text=html, content_type="text/html")
 
 
-LOGIN_HTML = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
+def _html_escape(txt):
+    return (str(txt).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+LOGIN_HTML = """<!doctype html><html lang="@@LANG@@"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy</title>
 <style>body{font:15px system-ui,Segoe UI,sans-serif;background:#16181f;color:#e4e6ec;
 display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px}
@@ -3753,14 +4003,14 @@ form{background:#1f222b;border:1px solid #2e323d;border-radius:10px;padding:24px
 h1{font-size:19px;margin:0 0 14px}input{width:100%;box-sizing:border-box;padding:9px;border-radius:6px;
 border:1px solid #2e323d;background:#16181f;color:#e4e6ec;font:inherit}button{margin-top:12px;width:100%;
 padding:9px;border:0;border-radius:6px;background:#e94560;color:#fff;font:inherit;cursor:pointer}
-.err{color:#e05555;margin-top:10px;min-height:1em}.sub{color:#9aa0aa;font-size:12px;margin-top:12px}</style>
-</head><body><form method="post" action="/__proxy/login"><h1>Emby Proxy</h1>
-<input type="password" name="password" placeholder="Mot de passe" autofocus autocomplete="current-password">
-<button type="submit">Se connecter</button><div class="err">@@ERR@@</div>
-<div class="sub">Mot de passe : section [status] du fichier emby_proxy.ini, ou bouton
-\u00ab Copier le mot de passe \u00bb de la fenetre du proxy.</div></form></body></html>"""
+.err{color:#e05555;margin-top:10px;min-height:1em}.sub{color:#9aa0aa;font-size:12px;margin-top:12px}
+.lg{float:right;color:#9aa0aa;font-size:12px;text-decoration:none;border:1px solid #2e323d;border-radius:5px;padding:2px 7px}</style>
+</head><body><form method="post" action="/__proxy/login"><a class="lg" href="?lang=@@OTHER@@">@@OTHERLBL@@</a><h1>Emby Proxy</h1>
+<input type="password" name="password" placeholder="@@PH@@" autofocus autocomplete="current-password">
+<button type="submit">@@BTN@@</button><div class="err">@@ERR@@</div>
+<div class="sub">@@SUB@@</div></form></body></html>"""
 
-STATUS_HTML = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+STATUS_HTML = r"""<!doctype html><html lang="@@LANG@@"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Emby Proxy</title><style>
 :root{--bg:#16181f;--card:#1f222b;--line:#2e323d;--fg:#e4e6ec;--mut:#9aa0aa;--acc:#e94560;--ok:#2ecc71;--warn:#eb8c14;--bad:#e05555;--info:#5aaaeb}
@@ -3796,11 +4046,15 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
 .qbar{height:6px;background:#3a3f4d;border-radius:3px;margin-top:3px;min-width:90px}.qbar>i{display:block;height:100%;border-radius:3px}
 .qact button{margin:2px}textarea{width:100%;min-height:58px;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}.fld{margin-top:6px}.fld .err{color:var(--bad);font-size:12px}
 .fld label{display:block}.fld input:not([type=checkbox]),.fld select{width:100%;margin-top:3px}
+.hdr{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.hdr .row{margin:0;align-items:center}
+button.adm{border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;background:var(--card)}
+button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{border:1px solid var(--ok);color:var(--ok)}
+.tabs{flex-wrap:wrap}.lgk{display:flex;gap:8px;align-items:baseline;margin-top:6px}
 </style></head><body>
-<div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
-<h1>Emby Proxy</h1><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div>
+<div class="hdr">
+<h1>Emby Proxy</h1><div class="row"><button class="adm" id="embyAdm" hidden></button><button class="ghost" id="langBtn" title="Langue / Language"></button><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div></div>
 <div id="warn"></div>
-<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="quota">Quotas</button><button data-t="cache">Cache</button><button data-t="conf">Configuration</button></div>
+<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="quota">Quotas</button><button data-t="cache">Cache</button><button data-t="conf">Configuration</button><button data-t="logs">Journaux</button></div>
 
 <section id="act">
   <div class="sub" id="summary"></div>
@@ -3906,22 +4160,59 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
   </div>
 </section>
 
+<section id="logs" hidden>
+  <h2>Effacer des journaux</h2>
+  <div class="c form">
+    <div class="sub">Coche les journaux à effacer. Les bannissements en cours sont conservés.</div>
+    <label class="lgk"><input type="checkbox" class="lgc" value="activity"><span>Journal d'activité (navigation, lectures, recherches…)</span><span class="sub" data-n="activity"></span></label>
+    <label class="lgk"><input type="checkbox" class="lgc" value="security"><span>Journal de sécurité (connexions, mots de passe faux, refus…)</span><span class="sub" data-n="security"></span></label>
+    <label class="lgk"><input type="checkbox" class="lgc" value="quotas"><span>Événements des quotas</span><span class="sub" data-n="quotas"></span></label>
+    <label class="lgk"><input type="checkbox" class="lgc" value="technical"><span>Journal technique (emby_proxy.log)</span><span class="sub" data-n="technical"></span></label>
+    <div class="row"><button class="red" id="lSave">Effacer la sélection…</button></div>
+    <div id="lConfirm" hidden class="confirm">
+      <div>Pour confirmer, retape le mot de passe de cette page.</div>
+      <input id="lPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
+      <div class="row"><button class="red" id="lDo">Confirmer et effacer</button><button class="small" id="lCancel">Annuler</button></div>
+    </div>
+    <div id="lOut"></div>
+  </div>
+</section>
+
 <section id="cache" hidden>
   <div class="g" id="g"></div>
   <button class="red" id="purge">Vider le cache</button>
 </section>
 
 <script>
+// ---- langue : la page est ecrite en francais, T() traduit ce qui s'affiche
+const LANG='@@LANG@@',I18N=@@I18N@@,LOC=LANG==='en'?'en-GB':'fr-FR';
+const RX=I18N.rx.map(([p,r])=>[new RegExp(p),r]),has=k=>Object.prototype.hasOwnProperty.call(I18N.en,k);
+function T(s){if(LANG!=='en'||s==null)return s;s=String(s);const k=s.trim();if(!k)return s;
+  if(has(k))return s.replace(k,()=>I18N.en[k]);
+  for(const [re,rep] of RX){const m=k.match(re);if(m)return s.replace(k,()=>rep.replace(/\{(\d)\}|\$(\d)/g,(x,a,b)=>a?T(m[+a]||''):(m[+b]||'')))}
+  const parts=k.split(', ');if(parts.length>1&&parts.every(has))return s.replace(k,()=>parts.map(x=>I18N.en[x]).join(', '));
+  return s}
+function TF(k,...a){return (LANG==='en'&&has(k)?I18N.en[k]:k).replace(/\{(\d)\}/g,(x,i)=>a[+i]==null?'':String(a[+i]))}
+function trDom(root){if(LANG!=='en')return;const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT),ns=[];
+  while(w.nextNode())ns.push(w.currentNode);
+  ns.forEach(n=>{const t=n.parentNode&&n.parentNode.tagName;if(t!=='SCRIPT'&&t!=='STYLE')n.nodeValue=T(n.nodeValue)});
+  root.querySelectorAll('[placeholder]').forEach(e=>e.placeholder=T(e.placeholder))}
 const $=id=>document.getElementById(id);
-function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
-const mo=b=>b>=1073741824?(b/1073741824).toFixed(2)+' Go':(b/1048576).toFixed(1)+' Mo';
-const ago=s=>s==null?'':s<60?'il y a '+s+' s':s<3600?'il y a '+Math.floor(s/60)+' min':'il y a '+Math.floor(s/3600)+' h '+Math.floor(s%3600/60)+' min';
-const hm=t=>new Date(t*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-const day=t=>new Date(t*1000).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=T(text);return e}
+trDom(document.body);
+$('langBtn').textContent=LANG==='en'?'Français':'English';
+$('langBtn').onclick=()=>post('lang',{lang:LANG==='en'?'fr':'en'}).then(r=>{if(r.ok)location.reload();else alert('✖ '+T(r.error))});
+const mo=b=>b>=1073741824?(b/1073741824).toFixed(2)+(LANG==='en'?' GB':' Go'):b>=1048576||!b?(b/1048576).toFixed(1)+(LANG==='en'?' MB':' Mo'):Math.max(1,Math.round(b/1024))+(LANG==='en'?' KB':' Ko');
+const dur=s=>s<60?s+' s':s<3600?Math.floor(s/60)+' min':Math.floor(s/3600)+' h '+Math.floor(s%3600/60)+' min';
+const ago=s=>s==null?'':TF('il y a {0}',dur(s));
+const hm=t=>new Date(t*1000).toLocaleTimeString(LOC,{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const day=t=>new Date(t*1000).toLocaleString(LOC,{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+const ok=m=>'✔ '+T(m),ko=m=>'✖ '+T(m);
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
-  ['act','sec','quota','cache','conf'].forEach(t=>$(t).hidden=b.dataset.t!==t);
+  ['act','sec','quota','cache','conf','logs'].forEach(t=>$(t).hidden=b.dataset.t!==t);
   if(b.dataset.t==='quota')loadQuota(true);
+  if(b.dataset.t==='logs')loadLogs();
   if(b.dataset.t==='conf')loadConf();});
 
 function userCard(u){
@@ -3930,15 +4221,15 @@ function userCard(u){
   top.append(dot,el('span','name',u.user));
   const t=el('span','tag',u.local?'réseau local':'Internet');t.style.color=u.local?'var(--mut)':'var(--warn)';top.append(t);
   c.append(top);
-  c.append(el('div','sub',[u.client,u.device,u.version&&('v'+u.version)].filter(Boolean).join(' · ')||u.user_agent||'application inconnue'));
-  c.append(el('div','sub','IP '+u.ip+' · connecté depuis '+day(u.first_seen)+' · dernière action '+ago(u.idle_s)));
-  c.append(el('div','sub',u.requests+' requêtes · '+mo(u.bytes_out)+' reçus'));
+  c.append(el('div','sub',[u.client,u.device,u.version&&('v'+u.version)].filter(Boolean).join(' · ')||u.user_agent||T('application inconnue')));
+  c.append(el('div','sub','IP '+u.ip+' · '+T('connecté depuis')+' '+day(u.first_seen)+' · '+T('dernière action')+' '+ago(u.idle_s)));
+  c.append(el('div','sub',TF('{0} requêtes · {1} reçus',u.requests,mo(u.bytes_out))));
   if(u.playing){const p=u.playing,b=el('div','play');
-    b.append(el('div',null,(p.paused?'⏸ En pause : ':'▶ Regarde : ')+p.title));
-    b.append(el('div','sub',p.pos+(p.duration?' / '+p.duration:'')+(p.percent!=null?' ('+p.percent+' %)':'')+' · '+p.mode+' · depuis '+ago(p.since).replace('il y a ','')));
+    b.append(el('div',null,TF(p.paused?'⏸ En pause : {0}':'▶ Regarde : {0}',p.title)));
+    b.append(el('div','sub',p.pos+(p.duration?' / '+p.duration:'')+(p.percent!=null?' ('+p.percent+' %)':'')+' · '+T(p.mode)+' · '+TF('depuis {0}',dur(p.since))));
     if(p.percent!=null){const bar=el('div','bar'),i=el('i');i.style.width=Math.min(100,p.percent)+'%';bar.append(i);b.append(bar)}
     c.append(b)}
-  if(u.location){const l=el('div','loc');l.append(el('span','l','Où : '),el('span',null,u.location),el('span','sub','  '+ago(u.location_s)));c.append(l)}
+  if(u.location){const l=el('div','loc');l.append(el('span','l',T('Où :')+' '),el('span',null,u.location),el('span','sub','  '+ago(u.location_s)));c.append(l)}
   if(u.events.length){const ev=el('div','ev');
     u.events.forEach(e=>{const r=el('div','e k-'+e.kind);r.append(el('time',null,hm(e.t)),el('span',null,e.text));ev.append(r)});c.append(ev)}
   return c}
@@ -3948,7 +4239,7 @@ function renderAct(d){
   last=d;const showIdle=$('showIdle').checked;
   const list=d.clients.filter(u=>showIdle||u.active||u.playing);
   const playing=d.clients.filter(u=>u.playing).length,active=d.clients.filter(u=>u.active).length;
-  $('summary').textContent=active+' connecté(s) · '+playing+' en lecture · '+d.clients.length+' vu(s) ces dernières heures';
+  $('summary').textContent=TF('{0} connecté(s) · {1} en lecture · {2} vu(s) ces dernières heures',active,playing,d.clients.length);
   const box=$('users');box.replaceChildren(...(list.length?list.map(userCard):[el('div','empty',"Personne n'est connecté en ce moment.")]));
   const sel=$('fUser'),cur=sel.value,names=[...new Set(d.feed.map(f=>f.user))].sort();
   sel.replaceChildren(el('option',null,'Tous les utilisateurs'),...names.map(n=>{const o=el('option',null,n);o.value=n;return o}));
@@ -3973,8 +4264,13 @@ let autoConf=true;
 function renderStats(d){
   if(autoConf){autoConf=false;if(d.emby_down)document.querySelector('button[data-t=conf]').click()}
   $('g').replaceChildren(...F.map(([l,k,f])=>{const c=el('div','c');c.append(el('div','l',l),el('div','v',f?f(d[k]):String(d[k])));return c}));
-  $('warn').replaceChildren(...(d.warnings||[]).map(w=>el('div','w','⚠ '+w)))}
-$('purge').onclick=()=>{if(confirm('Vider le cache des vignettes ?'))fetch('purge',{method:'POST'}).then(tick)};
+  $('warn').replaceChildren(...(d.warnings||[]).map(w=>el('div','w','⚠ '+T(w))));
+  const a=$('embyAdm');a.hidden=false;a.dataset.allow=d.emby_admin_internet?'1':'';a.className='adm '+(d.emby_admin_internet?'on':'off');
+  a.textContent=T(d.emby_admin_internet?"Administration d'Emby depuis Internet : AUTORISÉE":"Administration d'Emby depuis Internet : INTERDITE")}
+$('embyAdm').onclick=()=>{const allow=!$('embyAdm').dataset.allow;
+  if(!confirm(T(allow?"Autoriser l'administration d'Emby (tableau de bord, réglages, utilisateurs, bibliothèques) depuis Internet ? Elle restera toujours possible depuis le réseau local.":"Interdire l'administration d'Emby depuis Internet ? Elle restera possible depuis le réseau local.")))return;
+  post('emby_admin',{allow}).then(r=>{if(!r.ok)alert(ko(r.error));tick()})};
+$('purge').onclick=()=>{if(confirm(T('Vider le cache des vignettes ?')))fetch('purge',{method:'POST'}).then(tick)};
 
 let lastSec=null;
 function card(l,v,col){const c=el('div','c'),x=el('div','v',String(v));if(col)x.style.color=col;c.append(el('div','l',l),x);return c}
@@ -3984,10 +4280,10 @@ function renderSec(d){
     card('Connexions réussies (24 h)',n.login_ok),card('Bannissements (24 h)',n.ban,n.ban?'var(--bad)':''),
     card('Accès refusés (24 h)',n.refused),card('Adresses bannies en ce moment',d.bans.length,d.bans.length?'var(--bad)':''));
   $('bans').replaceChildren(...(d.bans.length?d.bans.map(b=>{const tr=el('tr'),bt=el('button','small','Débannir');
-    bt.onclick=()=>{if(confirm('Débannir '+b.ip+' ?'))fetch('unban',{method:'POST',body:new URLSearchParams({ip:b.ip})}).then(tick)};
+    bt.onclick=()=>{if(confirm(TF('Débannir {0} ?',b.ip)))fetch('unban',{method:'POST',body:new URLSearchParams({ip:b.ip})}).then(tick)};
     const td=el('td');td.append(bt);tr.append(el('td',null,b.ip),el('td',null,Math.ceil(b.remaining_s/60)+' min'),td);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune adresse bannie.');td.colSpan=3;tr.append(td);return tr})()]));
-  $('topfail').textContent=d.top_fail_ips.length?d.top_fail_ips.map(([ip,c])=>ip+' : '+c).join('   ·   '):'aucune';
+  $('topfail').textContent=d.top_fail_ips.length?d.top_fail_ips.map(([ip,c])=>ip+' : '+c).join('   ·   '):T('aucune');
   renderSecFeed()}
 function renderSecFeed(){
   if(!lastSec)return;const k=$('sKind').value.split(',').filter(Boolean),nt=$('sNet').value,q=$('sText').value.toLowerCase();
@@ -3995,9 +4291,12 @@ function renderSecFeed(){
     (!q||[e.user,e.ip,e.client,e.device,e.detail].join(' ').toLowerCase().includes(q)));
   $('sfeed').replaceChildren(...(rows.length?rows.slice(0,500).map(e=>{const tr=el('tr','t-'+e.type);
     const ip=el('td',null,e.ip);ip.append(el('span','tag',e.local?'local':'Internet'));
-    tr.append(el('td',null,day(e.t)),el('td',null,e.label+(e.count>1?' ×'+e.count:'')),el('td',null,e.user||'-'),ip,
-      el('td','sub',[e.client,e.device].filter(Boolean).join(' · ')||'-'),el('td','sub',e.detail||''));return tr})
+    tr.append(el('td',null,T(e.label)+(e.count>1?' ×'+e.count:'')),el('td',null,e.user||'-'),ip,
+      el('td','sub',[e.client,e.device].filter(Boolean).join(' · ')||'-'),el('td','sub',e.type==='config'?TD(e.detail):e.detail||''));tr.prepend(el('td',null,day(e.t)));return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun événement.');td.colSpan=6;tr.append(td);return tr})()]))}
+// "Libelle : valeur ; ..." (reglages modifies) : libelles traduits, valeurs telles quelles
+function TD(d){if(LANG!=='en'||!d)return d||'';const t=T(d);if(t!==d)return t;
+  return d.split('; ').map(x=>{const i=x.indexOf(' : ');return i<0?T(x):T(x.slice(0,i))+': '+T(x.slice(i+3))}).join('; ')}
 ['sKind','sNet'].forEach(i=>$(i).onchange=renderSecFeed);$('sText').oninput=renderSecFeed;
 
 // ---- Configuration : tous les reglages
@@ -4006,14 +4305,14 @@ function post(u,body){return fetch(u,{method:'POST',headers:{'Content-Type':'app
   .then(r=>{if(r.status===401){location.href='login';throw 0}
     return r.text().then(t=>{let j=null;try{j=JSON.parse(t)}catch(e){}
       if(j&&typeof j==='object')return j;
-      return {ok:false,error:'Erreur '+r.status+' : '+(t||r.statusText).slice(0,200)}})},
-    e=>{if(e===0)throw 0;return {ok:false,error:'Le proxy ne répond pas ('+e+').'}})}
+      return {ok:false,error:TF('Erreur {0} : {1}',r.status,T((t||r.statusText).slice(0,200)))}})},
+    e=>{if(e===0)throw 0;return {ok:false,error:TF('Le proxy ne répond pas ({0}).',e)}})}
 let G=null;
 function probeBox(p){const d=el('div','res '+(p.ok&&p.key_ok!==false?'ok':'bad'));
-  if(!p.ok){d.append(el('div',null,'✖ '+(p.error||'Échec')));return d}
-  d.append(el('div',null,'✔ Emby joignable : « '+(p.server_name||'?')+' », version '+(p.version||'?')+(p.latency_ms!=null?' ('+p.latency_ms+' ms)':'')));
+  if(!p.ok){d.append(el('div',null,ko(p.error||'Échec')));return d}
+  d.append(el('div',null,TF('✔ Emby joignable : « {0} », version {1}',p.server_name||'?',p.version||'?')+(p.latency_ms!=null?' ('+p.latency_ms+' ms)':'')));
   if(p.key_ok===true)d.append(el('div',null,'✔ Clé API acceptée'));
-  if(p.key_ok===false)d.append(el('div',null,'✖ '+(p.key_error||'Clé API refusée')));
+  if(p.key_ok===false)d.append(el('div',null,ko(p.key_error||'Clé API refusée')));
   return d}
 function fieldEl(f,G){
   const k=f.sec+'.'+f.key,v=G.values[k],lock=G.locked.includes(k),w=el('div','fld');w.dataset.k=k;
@@ -4023,9 +4322,9 @@ function fieldEl(f,G){
     if(!f.live)w.lastChild.append(el('span','tag','au redémarrage'));
     if(f.type==='choice'){inp=el('select');f.choices.forEach(c=>{const o=el('option',null,c);o.value=c;inp.append(o)});inp.value=v}
     else{inp=el('input');inp.value=v;inp.spellcheck=false;inp.autocomplete='off';
-      if(f.type==='secret'){inp.type='password';inp.placeholder=G.values[k+'.hint']?'enregistrée ('+G.values[k+'.hint']+') : laisser vide pour la garder':'aucune'}
+      if(f.type==='secret'){inp.type='password';inp.placeholder=G.values[k+'.hint']?TF('enregistrée ({0}) : laisser vide pour la garder',G.values[k+'.hint']):T('aucune')}
       if(f.type==='int'||f.type==='float'){inp.inputMode='decimal'}
-      if(f.type==='nets')inp.placeholder='ex. 192.168.1.0/24, 127.0.0.1/32';
+      if(f.type==='nets')inp.placeholder=T('ex. 192.168.1.0/24, 127.0.0.1/32');
       if(f.type==='url')inp.placeholder='http://192.168.1.234:8096'}
     w.append(inp)}
   inp.dataset.k=k;inp.dataset.orig=f.type==='bool'?String(v==='true'):(f.type==='secret'?'':v);
@@ -4033,7 +4332,7 @@ function fieldEl(f,G){
   if(lock){inp.disabled=true;w.append(el('div','sub lock','Fixé par une variable d\'environnement (docker-compose).'))}
   if(f.help)w.append(el('div','sub',f.help));
   if(f.type==='secret'&&G.secret_state&&G.secret_state[k]){const st=G.secret_state[k];
-    w.append(el('div',st.startsWith('chiffr')?'sub':'sub lock','Dans le fichier : '+(st==='vide'?'non renseignée':st.startsWith('chiffr')?'✔ '+st:'⚠ '+st)))}
+    w.append(el('div',st.startsWith('chiffr')?'sub':'sub lock',T('Dans le fichier :')+' '+(st==='vide'?T('non renseignée'):st.startsWith('chiffr')?'✔ '+T(st):'⚠ '+T(st))))}
   if(f.type==='secret'&&G.values[k+'.hint']){const lb=el('label','sub'),c=el('input');c.type='checkbox';c.dataset.clear=k;c.onchange=dirty;lb.append(c,el('span',null,' effacer la clé enregistrée'));w.append(lb)}
   w.append(el('div','err'));
   return w}
@@ -4041,10 +4340,10 @@ function inputs(){return [...document.querySelectorAll('#gForm [data-k]')].filte
 function val(i){return i.type==='checkbox'?String(i.checked):i.value}
 function dirty(){const d=inputs().some(i=>val(i)!==i.dataset.orig)||[...document.querySelectorAll('#gForm [data-clear]')].some(c=>c.checked);$('gDirty').hidden=!d;return d}
 function loadConf(){return fetch('settings.json').then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()}).then(g=>{G=g;
-  $('gFile').textContent='Fichier de réglages : '+g.config_file+'  ·  ton adresse : '+g.your_ip;
+  $('gFile').textContent=TF('Fichier de réglages : {0}  ·  ton adresse : {1}',g.config_file,g.your_ip);
   const top=[];
-  if(g.restart_error)top.push(el('div','res bad','✖ '+g.restart_error));
-  (g.file_warnings||[]).forEach(w=>top.push(el('div','w','⚠ '+w)));
+  if(g.restart_error)top.push(el('div','res bad',ko(g.restart_error)));
+  (g.file_warnings||[]).forEach(w=>top.push(el('div','w','⚠ '+T(w))));
   if(g.restart_pending.length){const d=el('div','res bad');d.append(el('div',null,'Réglages enregistrés mais pas encore en service : un redémarrage du proxy est nécessaire.'));
     const b=el('button','red','Redémarrer le proxy maintenant');b.onclick=restart;d.append(b);top.push(d)}
   $('gTop').replaceChildren(...top);
@@ -4052,10 +4351,10 @@ function loadConf(){return fetch('settings.json').then(r=>{if(r.status===401){lo
     grp.fields.forEach(f=>c.append(fieldEl(f,g)));
     if(grp.action){const out=el('div'),b=el('button','small',grp.action.label),r=el('div','row');
       b.onclick=()=>{out.replaceChildren(el('div','sub','En cours…'));post(grp.action.endpoint,{values:collect()}).then(x=>
-        out.replaceChildren(el('div','res '+(x.ok?'ok':'bad'),x.ok?'✔ Mail envoyé à '+(x.to||'?')+'. Vérifie la boîte de réception (et les indésirables).':'✖ '+x.error)))};
+        out.replaceChildren(el('div','res '+(x.ok?'ok':'bad'),x.ok?TF('✔ Mail envoyé à {0}. Vérifie la boîte de réception (et les indésirables).',x.to||'?'):ko(x.error))))};
       r.append(b);c.append(r,out)}
     box.append(c);return box}));
-  dirty()}).catch(e=>{if(e!==0)$('gOut').replaceChildren(el('div','res bad','✖ Lecture des réglages impossible : '+e))})}
+  dirty()}).catch(e=>{if(e!==0)$('gOut').replaceChildren(el('div','res bad','✖ '+TF('Lecture des réglages impossible : {0}',e)))})}
 function collect(){const v={};inputs().forEach(i=>v[i.dataset.k]=val(i));return v}
 $('gTest').onclick=()=>{const v=collect();$('gOut').replaceChildren(el('div','sub','Test en cours…'));
   post('config/test',{upstream:v['proxy.upstream'],api_key:v['emby.api_key']}).then(p=>{const b=el('div');b.append(probeBox(p));
@@ -4068,28 +4367,28 @@ $('gDo').onclick=()=>{const body={values:collect(),password:$('gPwd').value};
   document.querySelectorAll('#gForm [data-clear]').forEach(c=>{if(c.checked)body['clear_'+c.dataset.clear]=true});
   document.querySelectorAll('#gForm .err').forEach(e=>e.textContent='');
   post('settings',body).then(r=>{
-    if(!r.ok){$('gOut').replaceChildren(el('div','res bad','✖ '+r.error));
-      Object.entries(r.errors||{}).forEach(([k,m])=>{const f=document.querySelector('#gForm div.fld[data-k="'+k+'"] .err');if(f)f.textContent='✖ '+m});
+    if(!r.ok){$('gOut').replaceChildren(el('div','res bad',ko(r.error)));
+      Object.entries(r.errors||{}).forEach(([k,m])=>{const f=document.querySelector('#gForm div.fld[data-k="'+k+'"] .err');if(f)f.textContent=ko(m)});
       if(r.errors)$('gConfirm').hidden=true;return}
     $('gConfirm').hidden=true;const box=el('div');
-    box.append(el('div','res '+(r.saved?'ok':'bad'),(r.saved?'✔ Enregistré dans le fichier':'⚠ PAS enregistré dans le fichier')+(r.changed.length?' : '+r.changed.join(' ; '):'')));
-    (r.notes||[]).forEach(n=>box.append(el('div','sub lock','⚠ '+n)));
+    box.append(el('div','res '+(r.saved?'ok':'bad'),T(r.saved?'✔ Enregistré dans le fichier':'⚠ PAS enregistré dans le fichier')+(r.changed.length?(LANG==='en'?': ':' : ')+r.changed.map(TD).join(' ; '):'')));
+    (r.notes||[]).forEach(n=>box.append(el('div','sub lock','⚠ '+T(n))));
     if(r.probe)box.append(probeBox(r.probe));
     $('gOut').replaceChildren(box);loadConf();tick()})};
-function restart(){if(!confirm('Redémarrer le proxy ? Les lectures en cours seront coupées quelques secondes.'))return;
-  post('restart',{}).then(r=>{if(!r.ok){$('gTop').prepend(el('div','res bad','✖ '+r.error));return}
+function restart(){if(!confirm(T('Redémarrer le proxy ? Les lectures en cours seront coupées quelques secondes.')))return;
+  post('restart',{}).then(r=>{if(!r.ok){$('gTop').prepend(el('div','res bad',ko(r.error)));return}
     const url=location.protocol+'//'+location.hostname+':'+r.status_port+'/__proxy/';
     $('gTop').replaceChildren(el('div','res ok','Redémarrage en cours…'));let n=0;
     const t=setInterval(()=>{n++;fetch(url.replace(/\/__proxy\/$/,'')+'/__proxy/settings.json',{credentials:'include'}).then(x=>{if(x.ok||x.status===401){clearInterval(t);location.href=url}}).catch(()=>{});
-      if(n>40){clearInterval(t);$('gTop').replaceChildren(el('div','res bad','Le proxy ne revient pas : regarde la console. Adresse attendue : '+url))}},1000)})}
+      if(n>40){clearInterval(t);$('gTop').replaceChildren(el('div','res bad',TF('Le proxy ne revient pas : regarde la console. Adresse attendue : {0}',url)))}},1000)})}
 $('pDo').onclick=()=>{post('password',{old:$('pOld').value,new:$('pNew').value,new2:$('pNew2').value}).then(r=>{
-  $('pOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?'✔ Mot de passe changé. Les autres connexions à cette page ont été fermées.':'✖ '+r.error));
+  $('pOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?'✔ Mot de passe changé. Les autres connexions à cette page ont été fermées.':ko(r.error)));
   if(r.ok)['pOld','pNew','pNew2'].forEach(i=>$(i).value='')})};
 
 // ---- Quotas de lecture
 let Q=null;
 const hms=s=>{s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.round(s%3600/60);return h?h+' h '+String(m).padStart(2,'0'):m+' min'};
-function qPost(body){return post('quotas/action',body).then(r=>{$('qOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),(r.ok?'✔ ':'✖ ')+(r.message||r.error)));loadQuota(false)})}
+function qPost(body){return post('quotas/action',body).then(r=>{$('qOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),(r.ok?'✔ ':'✖ ')+T(r.message||r.error)));loadQuota(false)})}
 function qFieldEl(f,vals){
   const k=f.sec+'.'+f.key,v=vals[k]==null?'':vals[k],w=el('div','fld');w.dataset.k=k;let inp;
   if(f.type==='bool'){const lb=el('label');inp=el('input');inp.type='checkbox';inp.checked=(v==='true');lb.append(inp,el('span',null,' '+f.label));w.append(lb)}
@@ -4114,34 +4413,35 @@ function loadQuota(full){return fetch('quotas.json').then(r=>{if(r.status===401)
     $('qUq').replaceChildren(...d.user_quotas.map(qUqRow));qDirty()}
   const st=[];
   if(!d.enabled)st.push(el('div','w','Les quotas sont désactivés : active-les dans l\'onglet Configuration, section « Quotas de lecture ». Tu peux déjà préparer les réglages ci-dessous.'));
-  else if(d.running)st.push(el('div','res ok','✔ Surveillance des quotas en marche'+(d.dry_run?' — MODE À BLANC : rien n\'est envoyé ni coupé':'')));
-  if(d.error)st.push(el('div','res bad','✖ '+d.error));
+  else if(d.running)st.push(el('div','res ok',T('✔ Surveillance des quotas en marche')+(d.dry_run?T(' — MODE À BLANC : rien n\'est envoyé ni coupé'):'')));
+  if(d.error)st.push(el('div','res bad',ko(d.error)));
   if(!d.api_key_set)st.push(el('div','w','La clé API Emby est nécessaire aux quotas : renseigne-la dans l\'onglet Configuration.'));
   $('qStatus').replaceChildren(...st);
   const sc=d.scopes||[];
-  $('qHead').replaceChildren(el('th',null,'Utilisateur'),...sc.map(s=>el('th',null,s.label+(s.end?' (jusqu\'au '+s.end+')':''))),el('th',null,'État'),el('th',null,'Actions'));
+  $('qHead').replaceChildren(el('th',null,'Utilisateur'),...sc.map(s=>el('th',null,T(s.label)+(s.end?' '+TF('(jusqu\'au {0})',s.end):''))),el('th',null,'État'),el('th',null,'Actions'));
   $('qUsers').replaceChildren(...(d.users.length?d.users.map(u=>{const tr=el('tr');tr.append(el('td',null,u.name));
     sc.forEach(s=>{const v=u.scopes[s.id],td=el('td');
       if(u.exempt)td.append(el('span','sub','exempté'));
-      else if(!v||!v.limited)td.append(el('span','sub',v?hms(v.used)+' (illimité)':'-'));
-      else{td.append(el('div',null,hms(v.used)+' / '+hms(v.allowed)),el('div','sub','reste '+hms(v.remaining)+(v.bonus?' · bonus '+hms(v.bonus):'')));
+      else if(!v||!v.limited)td.append(el('span','sub',v?TF('{0} (illimité)',hms(v.used)):'-'));
+      else{td.append(el('div',null,hms(v.used)+' / '+hms(v.allowed)),el('div','sub',TF('reste {0}',hms(v.remaining))+(v.bonus?' · bonus '+hms(v.bonus):'')));
         const b=el('div','qbar'),i=el('i');i.style.width=v.percent+'%';i.style.background=v.percent>=100?'var(--bad)':v.percent>=80?'var(--warn)':'var(--ok)';b.append(i);td.append(b)}
       tr.append(td)});
-    tr.append(el('td',null,(u.exempt?'exempté : '+u.exempt:u.state)+(u.disabled_until?' · compte désactivé':'')));
+    tr.append(el('td',null,(u.exempt?TF('exempté : {0}',T(u.exempt)):T(u.state))+(u.disabled_until?T(' · compte désactivé'):'')));
     const a=el('td','qact');
     [15,30,60].forEach(m=>{const b=el('button','small','+'+m+' min');b.onclick=()=>qPost({action:'grant',user_id:u.id,user:u.name,minutes:m});a.append(b)});
-    const r=el('button','small','Remise à zéro');r.onclick=()=>{if(confirm('Remettre à zéro les compteurs de '+u.name+' ?'))qPost({action:'reset',user_id:u.id,user:u.name})};
+    const r=el('button','small','Remise à zéro');r.onclick=()=>{if(confirm(TF('Remettre à zéro les compteurs de {0} ?',u.name)))qPost({action:'reset',user_id:u.id,user:u.name})};
     const g=el('button','small','Message maintenant');g.onclick=()=>qPost({action:'greet',user:u.name,user_id:u.id});
     a.append(r,g);tr.append(a);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty',d.running?'Aucun utilisateur compté pour l\'instant.':'Surveillance arrêtée.');td.colSpan=sc.length+3;tr.append(td);return tr})()]));
   $('qSessions').replaceChildren(...(d.sessions.length?d.sessions.map(x=>{const tr=el('tr');
-    tr.append(el('td',null,x.user),el('td','sub',[x.client,x.device].filter(Boolean).join(' · ')),el('td',null,x.state+(x.detail?' ('+x.detail+')':'')),el('td',null,x.item||'-'),el('td',null,x.can_message===false?'non':x.can_message?'oui':'?'));return tr})
+    tr.append(el('td',null,x.user),el('td','sub',[x.client,x.device].filter(Boolean).join(' · ')),el('td',null,T(x.state)+(x.detail?' ('+T(x.detail)+')':'')),el('td',null,x.item||'-'),el('td',null,x.can_message===false?'non':x.can_message?'oui':'?'));return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune session ouverte.');td.colSpan=5;tr.append(td);return tr})()]));
-  $('qEvents').replaceChildren(...d.events.slice(0,50).map(e=>{const tr=el('tr');tr.append(el('td',null,day(e.t)),el('td',null,e.user),el('td',null,e.kind),el('td','sub',e.detail));return tr}));
-}).catch(e=>{if(e!==0)$('qStatus').replaceChildren(el('div','res bad','✖ Lecture des quotas impossible : '+e))})}
+  $('qEvents').replaceChildren(...d.events.slice(0,50).map(e=>{const tr=el('tr');tr.append(el('td',null,day(e.t)),el('td',null,e.user),el('td',null,QK[e.kind]||e.kind),el('td','sub',e.detail));return tr}));
+}).catch(e=>{if(e!==0)$('qStatus').replaceChildren(el('div','res bad','✖ '+TF('Lecture des quotas impossible : {0}',e)))})}
+const QK={login:'Connexion',start:'Début de lecture',tooshort:'Titre trop long',warn:'Avertissement',stop:'Coupure',stopped:'Coupure',disable:'Compte désactivé',enable:'Compte réactivé',grant:'Bonus',reset:'Remise à zéro',message:'Message'};
 function qCollect(){const v={};qInputs().forEach(i=>v[i.dataset.k]=val(i));return v}
 $('qPrev').onclick=()=>post('quotas/preview',{values:qCollect()}).then(r=>{
-  if(!r.ok){$('qOut').replaceChildren(el('div','res bad','✖ '+r.error));return}
+  if(!r.ok){$('qOut').replaceChildren(el('div','res bad',ko(r.error)));return}
   $('qOut').replaceChildren(...r.messages.map(m=>{const d=el('div','res');d.append(el('div','sub',m.label),el('b',null,m.header));
     m.text.split('\n').forEach(l=>d.append(el('div',null,l)));return d}))});
 $('qSave').onclick=()=>{$('qConfirm').hidden=false;$('qPwd').value='';$('qPwd').focus()};
@@ -4150,16 +4450,30 @@ $('qReset').onclick=()=>{loadQuota(true);$('qOut').replaceChildren()};
 $('qPwd').onkeydown=e=>{if(e.key==='Enter')$('qDo').click()};
 $('qDo').onclick=()=>{document.querySelectorAll('#quota .err').forEach(e=>e.textContent='');
   post('quotas/settings',{values:qCollect(),users:qUqRows(),password:$('qPwd').value}).then(r=>{
-    if(!r.ok){$('qOut').replaceChildren(el('div','res bad','✖ '+r.error));
+    if(!r.ok){$('qOut').replaceChildren(el('div','res bad',ko(r.error)));
       Object.entries(r.errors||{}).forEach(([k,m])=>{let f;
         if(k.startsWith('users.'))f=document.querySelectorAll('#qUq tr')[+k.slice(6)].querySelector('.err');
-        else f=document.querySelector('#qForm div.fld[data-k="'+k+'"] .err');if(f)f.textContent='✖ '+m});
+        else f=document.querySelector('#qForm div.fld[data-k="'+k+'"] .err');if(f)f.textContent=ko(m)});
       if(r.errors)$('qConfirm').hidden=true;return}
     $('qConfirm').hidden=true;$('qOut').replaceChildren(el('div','res ok','✔ Réglages des quotas enregistrés et appliqués.'));loadQuota(true)})};
 $('qImp').onclick=()=>{const f=$('qFile').files[0];if(!f){$('qImpOut').replaceChildren(el('div','res bad','✖ Choisis d\'abord ton fichier emby_quota.ini'));return}
   const rd=new FileReader();rd.onload=()=>post('quotas/import',{text:rd.result,password:$('qImpPwd').value}).then(r=>{
-    $('qImpOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?'✔ Importé : '+r.users+' quota(s) individuel(s), '+r.exempt+' compte(s) exempté(s).':'✖ '+r.error));if(r.ok){$('qImpPwd').value='';loadQuota(true)}});rd.readAsText(f)};
+    $('qImpOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?TF('✔ Importé : {0} quota(s) individuel(s), {1} compte(s) exempté(s).',r.users,r.exempt):ko(r.error)));if(r.ok){$('qImpPwd').value='';loadQuota(true)}});rd.readAsText(f)};
 setInterval(()=>{if(!$('quota').hidden&&!qDirty())loadQuota(false)},5000);
+
+// ---- Journaux : effacement au choix
+function loadLogs(){fetch('logs.json').then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()}).then(d=>{
+  document.querySelectorAll('[data-n]').forEach(s=>{const x=d[s.dataset.n];if(!x)return;
+    s.textContent='('+[x.lines!=null?TF('{0} ligne(s)',x.lines):'',x.bytes?mo(x.bytes):''].filter(Boolean).join(' · ')+')'})}).catch(()=>{})}
+$('lSave').onclick=()=>{if(!document.querySelectorAll('.lgc:checked').length){$('lOut').replaceChildren(el('div','res bad',ko('Aucune case cochée.')));return}
+  $('lConfirm').hidden=false;$('lPwd').value='';$('lPwd').focus()};
+$('lCancel').onclick=()=>{$('lConfirm').hidden=true};
+$('lPwd').onkeydown=e=>{if(e.key==='Enter')$('lDo').click()};
+$('lDo').onclick=()=>{const logs=[...document.querySelectorAll('.lgc:checked')].map(c=>c.value);
+  post('logs/clear',{logs,password:$('lPwd').value}).then(r=>{$('lConfirm').hidden=true;
+    const box=el('div');if(r.done&&r.done.length)box.append(el('div','res ok',TF('✔ Effacé : {0}',r.done.map(T).join(', '))));
+    if(!r.ok)box.append(el('div','res bad',ko(r.error)));$('lOut').replaceChildren(box);
+    if(r.ok)document.querySelectorAll('.lgc').forEach(c=>c.checked=false);loadLogs();tick()})};
 
 function tick(){
   const j=u=>fetch(u).then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()});
@@ -4175,6 +4489,10 @@ tick();setInterval(tick,3000);
 #  LANCEMENT
 # =====================================================================
 def setup_logging(cfg, to_console=True):
+    # service Windows : le journal va dans son fichier, pas en double dans les
+    # journaux du service (que le bouton "effacer" ne peut pas vider)
+    if os.environ.get("EMBY_PROXY_SERVICE") and cfg.log_file:
+        to_console = False
     log.setLevel(getattr(logging, cfg.log_level, logging.INFO))
     log.handlers.clear()
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s",
@@ -4296,6 +4614,7 @@ def run_gui(cfg):
 
     holder = {"proxy": None}
     stop = threading.Event()
+    _t = lambda x: tr(x, cfg.language)          # noqa: E731
     errors = []
 
     def worker():
@@ -4337,12 +4656,12 @@ def run_gui(cfg):
                                                  sticky="w", padx=14, pady=(12, 2))
     head = tk.Label(root, text="", fg=mut, bg=bg)
     head.grid(row=1, column=0, columnspan=2, sticky="w", padx=14)
-    rows = [("Etat", "state"), ("Utilisateurs actifs", "users"),
-            ("Mots de passe faux (24 h)", "fails"), ("Adresses bannies", "bans"),
-            ("Vignettes servies du cache", "hits"),
-            ("Demandees a Emby", "misses"), ("Taux de cache", "ratio"),
-            ("Economise sur Emby", "saved"), ("Cache sur disque", "cache"),
-            ("Requetes bloquees", "blocked")]
+    rows = [(_t("Etat"), "state"), (_t("Utilisateurs actifs"), "users"),
+            (_t("Mots de passe faux (24 h)"), "fails"), (_t("Adresses bannies"), "bans"),
+            (_t("Vignettes servies du cache"), "hits"),
+            (_t("Demandees a Emby"), "misses"), (_t("Taux de cache"), "ratio"),
+            (_t("Economise sur Emby"), "saved"), (_t("Cache sur disque"), "cache"),
+            (_t("Requetes bloquees"), "blocked")]
     vals = {}
     for i, (lbl, k) in enumerate(rows):
         tk.Label(root, text=lbl, fg=mut, bg=bg).grid(row=2 + i, column=0,
@@ -4369,12 +4688,12 @@ def run_gui(cfg):
         stop.set()
         root.after(600, root.destroy)
 
-    tk.Button(bar, text="Activite / page d'etat",
+    tk.Button(bar, text=_t("Activite / page d'etat"),
               command=lambda: webbrowser.open(status_url())).pack(side="left")
-    tk.Button(bar, text="Copier le mot de passe", command=copy_pwd).pack(side="left",
+    tk.Button(bar, text=_t("Copier le mot de passe"), command=copy_pwd).pack(side="left",
                                                                          padx=(8, 0))
-    tk.Button(bar, text="Vider le cache", command=purge).pack(side="left", padx=8)
-    tk.Button(bar, text="Arreter", command=quit_).pack(side="left")
+    tk.Button(bar, text=_t("Vider le cache"), command=purge).pack(side="left", padx=8)
+    tk.Button(bar, text=_t("Arreter"), command=quit_).pack(side="left")
     root.protocol("WM_DELETE_WINDOW", quit_)
 
     def refresh():
@@ -4387,9 +4706,9 @@ def run_gui(cfg):
     def _refresh():
         d = proxy.snapshot()
         if errors:
-            vals["state"].config(text="ARRETE : %s" % errors[0], fg="#e05555")
+            vals["state"].config(text=_t("ARRETE : %s" % errors[0]), fg="#e05555")
         else:
-            vals["state"].config(text="en service", fg="#2ecc71")
+            vals["state"].config(text=_t("en service"), fg="#2ecc71")
         c = holder["proxy"].cfg
         head.config(text="%s://%s:%d  ->  %s" % (scheme, c.listen_host,
                                                   c.listen_port, c.upstream))
@@ -4397,7 +4716,7 @@ def run_gui(cfg):
         fails = sum(1 for e in list(proxy.seclog.events)
                     if e["type"] == "login_fail" and time.time() - e["t"] < 86400)
         vals["fails"].config(text=str(fails), fg="#e05555" if fails else fg)
-        warn.config(text="\n".join("Attention : " + w for w in d["warnings"]))
+        warn.config(text="\n".join(_t("Attention : " + w) for w in d["warnings"]))
         vals["hits"].config(text=str(d["cache_hits"]))
         vals["misses"].config(text=str(d["cache_misses"]))
         vals["ratio"].config(text="%s %%" % d["hit_ratio"])
@@ -4406,7 +4725,7 @@ def run_gui(cfg):
             d["cache_entries"], d["cache_bytes"] / 1048576,
             d["cache_max_bytes"] / 1048576))
         vals["blocked"].config(text=str(d["blocked"]))
-        vals["bans"].config(text=", ".join(d["bans"]) or "aucune",
+        vals["bans"].config(text=", ".join(d["bans"]) or _t("aucune"),
                             fg="#e05555" if d["bans"] else fg)
 
     refresh()
