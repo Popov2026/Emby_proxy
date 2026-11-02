@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.4"
+__version__ = "2.1.5"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3227,17 +3227,35 @@ class EmbyProxy:
                 if k.lower() not in HOP and k.lower() != "content-length":
                     resp.headers.add(k, v)
             return resp
+        # Adresse LOCALE = celle du proxy sur le reseau de la maison (comme Emby
+        # annonce la sienne) ; adresse DISTANTE = celle du relais HTTPS. L'appli
+        # compare l'adresse qu'elle utilise a l'adresse locale pour savoir si
+        # elle est a la maison : si les deux etaient https://..., une TV sur
+        # Internet se croirait a la maison et demanderait le film a pleine
+        # qualite, au-dela de la limite de debit distante d'Emby (refus).
+        local = "%s://%s:%d" % ("https" if self.cfg.tls_cert else "http",
+                                lan_address(), self.cfg.listen_port)
         proto, host, sure = self._public_origin(request, certain=True)
         origin = "%s://%s" % (proto, host)
-        for k in ("LocalAddress", "WanAddress", "LocalAddresses", "RemoteAddresses"):
+        hostname = host.rsplit(":", 1)[0].strip("[]") if host.count(":") <= 1 or \
+            host.startswith("[") else host
+        try:
+            direct_lan = ipaddress.ip_address(hostname).is_private or hostname == "localhost"
+        except ValueError:
+            direct_lan = hostname == "localhost"
+        wan = origin if sure and not direct_lan else None
+        for k in ("LocalAddress", "LocalAddresses"):
+            if k in data:
+                data[k] = [local] if k.endswith("es") else local
+        for k in ("WanAddress", "RemoteAddresses"):
             if k not in data:
                 continue
-            if not sure:
-                # relais qui ne dit pas s'il est en HTTPS : aucune adresse plutot
-                # qu'une fausse (l'appli garde celle qu'on lui a donnee)
+            if wan is None:
+                # pas d'adresse publique sure : aucune plutot qu'une fausse (ni
+                # celle d'Emby, qui contournerait le proxy)
                 del data[k]
             else:
-                data[k] = [origin] if k.endswith("es") else origin
+                data[k] = [wan] if k.endswith("es") else wan
         return web.json_response(data, headers={"Cache-Control": "no-cache"})
 
     def _record_login(self, request, body, ok):

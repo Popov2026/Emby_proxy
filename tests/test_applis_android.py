@@ -111,16 +111,36 @@ async def test_mot_de_passe_faux_en_formulaire(env):
 
 @pytest.mark.parametrize("path", ["/emby/System/Info/Public", "/System/Info/Public"])
 async def test_adresses_d_emby_remplacees_par_le_proxy(env, path):
-    """Sinon l'appli Android TV se reconnecte directement a Emby."""
+    """Jamais l'adresse d'Emby (les applis se reconnecteraient sans le proxy) :
+    l'adresse locale est celle du proxy sur le reseau de la maison."""
     proxy, c, _ = env
     r = await c.get(path, headers={"Accept-Encoding": "gzip"})
     assert r.status == 200
     d = json.loads(await r.read())
-    me = str(c.make_url("")).rstrip("/")
-    assert d["LocalAddress"] == me and d["WanAddress"] == me
-    assert d["LocalAddresses"] == [me] and d["RemoteAddresses"] == [me]
+    local = "http://%s:%d" % (ep.lan_address(), proxy.cfg.listen_port)
+    assert d["LocalAddress"] == local and d["LocalAddresses"] == [local]
+    # acces direct sur le reseau local : pas d'adresse publique connue
+    assert "WanAddress" not in d and "RemoteAddresses" not in d
     assert d["Id"] == "srv1" and d["ServerName"] == "NAS"
     assert "192.168.1.10" not in json.dumps(d) and "90.1.2.3" not in json.dumps(d)
+
+
+async def test_tv_sur_internet_ne_se_croit_pas_a_la_maison(env):
+    """Derriere le relais HTTPS : adresse distante = le relais, adresse locale
+    = le proxy a la maison. Si les deux etaient https://emby..., la TV sur
+    Internet se croirait a la maison, demanderait le film a pleine qualite et
+    Emby refuserait (limite de debit distante) : Play ne faisait rien."""
+    proxy, c, _ = env
+    proxy.cfg.trusted = ep._nets("127.0.0.1/32")
+    r = await c.get("/emby/System/Info/Public", headers={
+        "X-Forwarded-For": "83.204.193.128", "X-Forwarded-Proto": "https",
+        "Host": "emby.example.com"})
+    d = json.loads(await r.read())
+    assert d["WanAddress"] == "https://emby.example.com"
+    assert d["RemoteAddresses"] == ["https://emby.example.com"]
+    assert d["LocalAddress"] != d["WanAddress"]
+    assert d["LocalAddress"] == "http://%s:%d" % (ep.lan_address(),
+                                                   proxy.cfg.listen_port)
 
 
 async def test_adresse_publique_du_relais_https(env):
@@ -156,7 +176,7 @@ async def test_relais_local_non_declare_annonce_https(env):
         "Host": "emby.example.com"})
     d = json.loads(await r.read())
     assert d["WanAddress"] == "https://emby.example.com"
-    assert d["LocalAddress"] == "https://emby.example.com"
+    assert d["LocalAddress"] != d["WanAddress"]
     assert seen["info_headers"]["X-Forwarded-Proto"] == "https"
     # l'adresse du visiteur, elle, n'est reprise que d'un relais declare
     assert seen["info_headers"]["X-Forwarded-For"] == "127.0.0.1"
@@ -169,8 +189,9 @@ async def test_relais_sans_schema_aucune_fausse_adresse(env):
     r = await c.get("/emby/System/Info/Public", headers={
         "X-Forwarded-For": "8.8.8.8", "Host": "emby.example.com"})
     d = json.loads(await r.read())
-    for k in ("LocalAddress", "WanAddress", "LocalAddresses", "RemoteAddresses"):
+    for k in ("WanAddress", "RemoteAddresses"):
         assert k not in d
+    assert not d["LocalAddress"].startswith("http://emby.example.com")
     assert d["Id"] == "srv1"
 
 
