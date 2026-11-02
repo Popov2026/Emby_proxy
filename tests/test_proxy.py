@@ -712,7 +712,8 @@ async def test_config_enregistrer_applique_tout_de_suite(env, aiohttp_server, tm
         assert (await (await c.get("/emby/Hello")).json())["serveur"] == "autre"
         # fichier de reglages mis a jour, commentaires conserves
         txt = ini.read_text(encoding="utf-8")
-        assert "upstream = %s" % url2 in txt and "api_key = NOUVELLECLE" in txt
+        assert "upstream = %s" % url2 in txt
+        assert "NOUVELLECLE" not in txt and "api_key = enc:" in txt   # chiffree
         assert "# Adresse du vrai serveur Emby" in txt
         again = ep.Settings(ini)
         assert again.upstream == url2 and again.api_key == "NOUVELLECLE"
@@ -1121,3 +1122,52 @@ def test_redemarrage_garde_connexions_et_bannissements(tmp_path):
     p1.guard.banned["203.0.113.7"] = time.time() + 600
     p2 = ep.EmbyProxy(ep.Settings(ini), previous=p1)
     assert "tok" in p2.sessions and "203.0.113.7" in p2.guard.active_bans()
+
+
+
+# ---------------------------------------------------------------------
+#  Secrets chiffres dans le fichier de reglages
+# ---------------------------------------------------------------------
+def test_secrets_chiffres_et_relus(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    ep.write_secret(ini, "emby", "api_key", "MACLEAPI123")
+    ep.write_secret(ini, "status", "password", "MotDePassePage")
+    txt = ini.read_text(encoding="utf-8")
+    assert "MACLEAPI123" not in txt and "MotDePassePage" not in txt
+    assert (tmp_path / "emby_proxy_secret.key").exists()
+    cfg = ep.Settings(ini)
+    assert cfg.api_key == "MACLEAPI123" and cfg.status_password == "MotDePassePage"
+
+
+def test_anciens_secrets_en_clair_chiffres_au_demarrage(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    ini.write_text("[emby]\napi_key = CLAIRE\n[status]\npassword = AncienMdp99\n",
+                   encoding="utf-8")
+    assert sorted(ep.migrate_plain_secrets(ini)) == ["emby.api_key", "status.password"]
+    txt = ini.read_text(encoding="utf-8")
+    assert "CLAIRE" not in txt and "AncienMdp99" not in txt
+    cfg = ep.Settings(ini)
+    assert cfg.api_key == "CLAIRE" and cfg.status_password == "AncienMdp99"
+    assert ep.migrate_plain_secrets(ini) == []          # deja fait
+
+
+def test_secret_illisible_signale(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_secret(ini, "emby", "api_key", "X1")
+    (tmp_path / "emby_proxy_secret.key").unlink()      # fichier copie ailleurs
+    cfg = ep.Settings(ini)
+    assert cfg.api_key == "" and "emby.api_key" in cfg.secret_errors
+    assert any("ressaisis" in w for w in cfg.config_warnings)
+
+
+async def test_page_enregistre_la_cle_chiffree(env, tmp_path):
+    proxy, c, own, ini = await _admin_with_ini(env, tmp_path)
+    r = await c.post("/__proxy/settings", headers=own, json={
+        "password": proxy.cfg.status_password, "values": {"emby.api_key": "CLEPAGE42"}})
+    d = await r.json()
+    assert d["ok"] and d["saved"]
+    assert "CLEPAGE42" not in ini.read_text(encoding="utf-8")
+    assert ep.Settings(ini).api_key == "CLEPAGE42" and proxy.cfg.api_key == "CLEPAGE42"
+    g = await (await c.get("/__proxy/settings.json")).json()
+    assert g["values"]["emby.api_key"] == "" and g["values"]["emby.api_key.hint"].endswith("GE42")

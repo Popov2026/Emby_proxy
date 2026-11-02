@@ -8,3 +8,11 @@ data/
 *.pem
 emby_activity.log*
 emby_security.log*
+emby_quota.ini
+emby_quota.ini.*
+!emby_quota.ini.example
+*.db
+*.db-wal
+*.db-shm
+emby_proxy_secret.key
+*.avant-import

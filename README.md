@@ -113,6 +113,58 @@ l'utilisateur.
   autres connexions à la page sont fermées.
 - Si Emby ne répond pas, la page s'ouvre directement sur cet onglet.
 
+### Onglet Quotas : temps de lecture par utilisateur
+Le moteur **emby_quota** (quotas jour / semaine / mois cumulables,
+avertissements à l'écran, coupure, bonus) tourne **dans le proxy**. Il
+utilise l'adresse et la clé API d'Emby du proxy : rien à régler deux fois.
+
+- Activer : onglet **Configuration**, section « Quotas de lecture ». La clé
+  API Emby est nécessaire.
+- Onglet **Quotas** :
+  - chaque utilisateur, avec ce qu'il a consommé et ce qui lui reste, par
+    période, avec une barre de progression ;
+  - boutons **+15 / +30 / +60 min** (bonus), **Remise à zéro** et **Message
+    maintenant** ;
+  - lectures en cours, et si l'appareil sait afficher un message ;
+  - derniers événements : connexion, avertissement, coupure, bonus…
+  - **quotas individuels** (`60/300/1200`, `-/120/-`…) ;
+  - tous les réglages : quotas par défaut, remises à zéro, comptes et
+    réseaux exemptés, quand prévenir (connexion, début de lecture, titre
+    trop long, paliers en % et en minutes), coupure, désactivation du
+    compte, mode à blanc, affichage et textes des messages, avec
+    **Aperçu des messages** ;
+  - **Reprendre un emby_quota.ini existant** : quotas, utilisateurs et
+    messages repris ; sa clé API est ignorée et retirée.
+- Réglages des quotas : `emby_quota.ini`, compteurs : `emby_quota.db`, à côté
+  du proxy. Pour garder l'historique d'une installation précédente, copie
+  son `emby_quota.db` à cet endroit.
+- Le moteur peut toujours s'utiliser seul en ligne de commande
+  (`python emby_quota.py --help`).
+
+### Alertes par mail
+Onglet **Configuration**, section « Alertes par mail » : serveur d'envoi
+(Gmail, Outlook, Free, Orange…), destinataires, bouton **Envoyer un mail de
+test**. Les alertes sont regroupées (un mail par lot de 2 minutes, 30 mails
+par heure au plus). Chaque type d'alerte se coche séparément :
+- adresse bannie après des mots de passe faux ;
+- connexion réussie depuis Internet ;
+- mot de passe faux sur la page d'administration ;
+- configuration modifiée ;
+- film ou épisode supprimé ;
+- Emby ne répond plus, puis répond de nouveau (vérifié chaque minute) ;
+- quota atteint : lecture coupée, compte désactivé.
+
+### Secrets chiffrés
+La clé API Emby, le mot de passe de la page d'administration et celui du
+compte mail sont **chiffrés** dans `emby_proxy.ini` :
+- sous Windows, par DPAPI (lisibles seulement par le compte Windows qui
+  lance le proxy) ;
+- ailleurs, avec la clé `emby_proxy_secret.key` (à ne jamais partager).
+
+Un secret encore en clair (ancienne version, saisie à la main) est chiffré
+au démarrage. Si le dossier est copié sur une autre machine, la page demande
+de ressaisir les secrets.
+
 ### Tout le reste passe tel quel
 API, lecture vidéo (avec avance rapide / reprise), WebSocket des applications
 Emby, envoi de fichiers.
@@ -304,6 +356,11 @@ Les tests font tourner le proxy contre un faux serveur Emby. Ils vérifient :
 - la configuration : lecture sans dévoiler la clé, test de connexion, prise
   en compte immédiate, fichier mis à jour, mot de passe de confirmation,
   refus depuis Internet et depuis un site piégé, adresses invalides ;
+- les alertes par mail (faux serveur SMTP : envoi réel, regroupement,
+  filtres, mail de test, mot de passe chiffré) ;
+- les quotas intégrés (comptage, bonus, remise à zéro, réglages, aperçu,
+  import d'un emby_quota.ini, alerte de coupure, absence de clé API), plus
+  les tests du moteur emby_quota lui-même (`tests/test_emby_quota.py`) ;
 - le 2e audit : page d'administration absente du port des utilisateurs,
   en-têtes de protection, envois géants refusés, fausse activité impossible
   sans compte, une seule fiche après connexion, bannissement IPv6 par bloc,

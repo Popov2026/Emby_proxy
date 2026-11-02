@@ -1,1 +1,3 @@
 aiohttp>=3.9
+# chiffrement des secrets du fichier de reglages hors Windows (Windows : DPAPI)
+cryptography>=41; sys_platform != "win32"

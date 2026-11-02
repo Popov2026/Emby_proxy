@@ -36,6 +36,7 @@ Page d'etat (port a part, reseau local + mot de passe) : http://<proxy>:8098/
 
 import argparse
 import asyncio
+import base64
 import configparser
 import gzip
 import hashlib
@@ -47,6 +48,7 @@ import os
 import posixpath
 import re
 import secrets
+import shutil
 import ssl
 import sys
 import threading
@@ -117,6 +119,29 @@ DEFAULTS = {
         "port": "8098",
         "host": "",
     },
+    "alerts": {
+        "enabled": "false",
+        "smtp_host": "",
+        "smtp_port": "587",
+        "smtp_security": "STARTTLS",
+        "smtp_user": "",
+        "smtp_password": "",
+        "from_addr": "",
+        "to_addrs": "",
+        "batch_minutes": "2",
+        "on_ban": "true",
+        "on_login_internet": "false",
+        "on_status_fail": "true",
+        "on_config": "true",
+        "on_delete": "true",
+        "on_emby_down": "true",
+        "on_quota": "true",
+    },
+    "quotas": {
+        "enabled": "false",
+        "file": "emby_quota.ini",
+        "db_file": "emby_quota.db",
+    },
     "activity": {
         "enabled": "true",
         "idle_minutes": "15",
@@ -145,6 +170,109 @@ ENV_OVERRIDES = {
     "EMBY_PROXY_STATUS_PASSWORD": ("status", "password"),
     "EMBY_PROXY_STATUS_PORT": ("status", "port"),
 }
+
+
+# =====================================================================
+#  SECRETS CHIFFRES DANS LE FICHIER DE REGLAGES
+# =====================================================================
+# Cle API Emby, mot de passe de la page, mot de passe du compte mail :
+# jamais en clair dans emby_proxy.ini.
+#   Windows : DPAPI (chiffre pour le compte Windows qui lance le proxy) ;
+#   ailleurs : Fernet (AES) avec la cle emby_proxy_secret.key, creee a cote
+#   du fichier de reglages (module cryptography).
+# Format ecrit : enc:dpapi:<base64> ou enc:fernet:<jeton>.
+SECRET_KEYS = {("emby", "api_key"), ("status", "password"), ("alerts", "smtp_password")}
+
+
+def _dpapi(data, encrypt):
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, dst = BLOB(len(data), buf), BLOB()
+    fn = ctypes.windll.crypt32.CryptProtectData if encrypt \
+        else ctypes.windll.crypt32.CryptUnprotectData
+    ok = fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(dst))
+    if not ok:
+        raise OSError("DPAPI : %s" % ctypes.FormatError())
+    try:
+        return ctypes.string_at(dst.pbData, dst.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(dst.pbData)
+
+
+def _fernet(cfg_dir):
+    from cryptography.fernet import Fernet     # pip install cryptography
+    kf = Path(cfg_dir) / "emby_proxy_secret.key"
+    if not kf.exists():
+        kf.write_bytes(Fernet.generate_key())
+        try:
+            os.chmod(kf, 0o600)
+        except OSError:
+            pass
+    return Fernet(kf.read_bytes().strip())
+
+
+def protect(plain, cfg_dir):
+    """Texte clair -> valeur chiffree a ecrire dans le fichier."""
+    if not plain:
+        return ""
+    if os.name == "nt":
+        return "enc:dpapi:" + base64.b64encode(_dpapi(plain.encode("utf-8"), True)).decode()
+    return "enc:fernet:" + _fernet(cfg_dir).encrypt(plain.encode("utf-8")).decode()
+
+
+def unprotect(stored, cfg_dir):
+    """Valeur du fichier -> texte clair. Une valeur non chiffree (ancienne
+    version, variable d'environnement) est rendue telle quelle."""
+    stored = (stored or "").strip()
+    if not stored.startswith("enc:"):
+        return stored
+    kind, _, data = stored[4:].partition(":")
+    if kind == "dpapi":
+        if os.name != "nt":
+            raise ValueError("chiffre sous Windows (DPAPI) : illisible sur ce systeme")
+        return _dpapi(base64.b64decode(data), False).decode("utf-8")
+    if kind == "fernet":
+        kf = Path(cfg_dir) / "emby_proxy_secret.key"
+        if not kf.exists():
+            raise ValueError("cle emby_proxy_secret.key absente")
+        return _fernet(cfg_dir).decrypt(data.encode()).decode("utf-8")
+    raise ValueError("format de chiffrement inconnu")
+
+
+def write_secret(path, section, key, plain):
+    """Ecrit un secret chiffre (repli en clair, signale, si impossible)."""
+    try:
+        update_ini(path, section, key, protect(plain, Path(path).parent))
+        return True
+    except Exception as exc:
+        log.warning("chiffrement impossible (%s) : %s.%s ecrit en clair", exc,
+                    section, key)
+        update_ini(path, section, key, plain)
+        return False
+
+
+def migrate_plain_secrets(path):
+    """Chiffre les secrets encore en clair dans le fichier (anciennes versions,
+    ou saisis a la main). -> liste des cles chiffrees."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    cp = configparser.ConfigParser()
+    try:
+        cp.read_string(read_ini_text(path))
+    except configparser.Error:
+        return []
+    done = []
+    for sec, key in sorted(SECRET_KEYS):
+        if cp.has_section(sec):
+            v = cp[sec].get(key, "").strip()
+            if v and not v.startswith("enc:") and write_secret(path, sec, key, v):
+                done.append("%s.%s" % (sec, key))
+    return done
 
 
 def _nets(txt):
@@ -286,7 +414,8 @@ class Settings:
         self.log_file = self._path(base, cp["log"].get("file"))
         self.log_level = cp["log"].get("level", "INFO").upper()
 
-        self.api_key = cp["emby"].get("api_key", "").strip()
+        self.secret_errors = []
+        self.api_key = self._secret(cp, "emby", "api_key")
         a = cp["activity"]
         self.activity_enabled = a.getboolean("enabled")
         self.activity_idle_minutes = a.getfloat("idle_minutes")
@@ -297,12 +426,30 @@ class Settings:
         self.record_searches = a.getboolean("record_searches")
         self.security_log = self._path(base, a.get("security_log_file"))
 
+        al = cp["alerts"]
+        self.alerts = {k: al.get(k, "").strip() for k in DEFAULTS["alerts"]}
+        self.alerts["smtp_password"] = self._secret(cp, "alerts", "smtp_password")
+        qs = cp["quotas"]
+        self.quotas_enabled = qs.getboolean("enabled")
+        self.quotas_file = self._path(base, qs.get("file")) or base / "emby_quota.ini"
+        self.quotas_db = self._path(base, qs.get("db_file")) or base / "emby_quota.db"
+
         st = cp["status"]
-        self.status_password = st.get("password", "").strip()
+        self.status_password = self._secret(cp, "status", "password")
         self.status_internet = st.getboolean("allow_internet")
         self.session_hours = st.getfloat("session_hours")
         self.status_port = st.getint("port")
         self.status_host = st.get("host", "").strip() or self.listen_host
+
+    def _secret(self, cp, sec, key):
+        try:
+            return unprotect(cp[sec].get(key, ""), self.path.parent)
+        except Exception as exc:
+            self.secret_errors.append("%s.%s" % (sec, key))
+            self.config_warnings.append(
+                "%s.%s illisible (%s) : ressaisis-le dans la page d'administration, "
+                "onglet Configuration" % (sec, key, exc))
+            return ""
 
     def _check_file(self):
         """Signale les lignes ignorees : cle inconnue ou dans la mauvaise
@@ -427,6 +574,26 @@ port = 8098
 # 127.0.0.1 = accessible seulement depuis cette machine).
 host =
 
+[alerts]
+# Alertes par mail (reglables dans la page d'administration, onglet
+# Configuration). Le mot de passe du compte mail y est chiffre.
+enabled = false
+smtp_host =
+smtp_port = 587
+smtp_security = STARTTLS
+smtp_user =
+smtp_password =
+from_addr =
+to_addrs =
+batch_minutes = 2
+
+[quotas]
+# Quotas de lecture par utilisateur (onglet Quotas de la page
+# d'administration). Leurs reglages sont dans le fichier ci-dessous.
+enabled = false
+file = emby_quota.ini
+db_file = emby_quota.db
+
 [activity]
 # Suivi de ce que font les utilisateurs (page d'etat, onglet Activite).
 enabled = true
@@ -452,21 +619,12 @@ def ensure_status_password(path, cfg):
     dans le fichier de reglages (section [status])."""
     if cfg.status_password:
         return False
+    if getattr(cfg, "secret_errors", None) and "status.password" in cfg.secret_errors:
+        pass                    # illisible : on en cree un nouveau, signale
     pwd = secrets.token_urlsafe(12)
     cfg.status_password = pwd
     try:
-        path = Path(path)
-        text = read_ini_text(path) if path.exists() else ""
-        if re.search(r"(?m)^\[status\]\s*$", text):
-            if re.search(r"(?ms)^\[status\].*?^password\s*=", text):
-                text = re.sub(r"(?ms)(^\[status\].*?^password\s*=)[^\n]*",
-                              lambda m: m.group(1) + " " + pwd, text, count=1)
-            else:
-                text = re.sub(r"(?m)^\[status\]\s*$", "[status]\npassword = " + pwd,
-                              text, count=1)
-        else:
-            text += "\n[status]\npassword = %s\n" % pwd
-        path.write_text(text, encoding="utf-8")
+        write_secret(path, "status", "password", pwd)
     except OSError as exc:
         log.warning("mot de passe de la page d'etat non enregistre : %s", exc)
     return True
@@ -477,6 +635,15 @@ def ensure_status_password(path, cfg):
 # =====================================================================
 # type : url, secret, text, int, float, bool, nets, choice
 # live : True = applique tout de suite ; False = au redemarrage du proxy
+ALERT_KINDS_LIST = (
+    ("on_ban", "adresse bannie (mots de passe faux)"),
+    ("on_login_internet", "connexion réussie depuis Internet"),
+    ("on_status_fail", "mot de passe faux sur la page d'administration"),
+    ("on_config", "configuration du proxy modifiée"),
+    ("on_delete", "film ou épisode supprimé depuis Emby"),
+    ("on_emby_down", "Emby ne répond plus / répond de nouveau"),
+    ("on_quota", "quota atteint (lecture coupée, compte désactivé)"),
+)
 CONFIG_SCHEMA = [
     {"id": "emby", "title": "Serveur Emby", "fields": [
         {"sec": "proxy", "key": "upstream", "type": "url", "live": True,
@@ -582,6 +749,43 @@ CONFIG_SCHEMA = [
         {"sec": "status", "key": "allow_internet", "type": "bool", "live": True,
          "label": "Accessible depuis Internet (déconseillé)", "help": ""},
     ]},
+    {"id": "alerts", "title": "Alertes par mail",
+     "action": {"label": "Envoyer un mail de test", "endpoint": "alerts/test"},
+     "fields": [
+        {"sec": "alerts", "key": "enabled", "type": "bool", "live": True,
+         "label": "Envoyer des alertes par mail", "help": ""},
+        {"sec": "alerts", "key": "smtp_host", "type": "text", "live": True,
+         "label": "Serveur d'envoi (SMTP)",
+         "help": "ex. smtp.gmail.com, smtp-mail.outlook.com, smtp.free.fr, smtp.orange.fr"},
+        {"sec": "alerts", "key": "smtp_port", "type": "int", "min": 1, "max": 65535,
+         "live": True, "label": "Port", "help": "587 (STARTTLS) ou 465 (SSL)"},
+        {"sec": "alerts", "key": "smtp_security", "type": "choice",
+         "choices": ["STARTTLS", "SSL", "AUCUNE"], "live": True,
+         "label": "Chiffrement", "help": ""},
+        {"sec": "alerts", "key": "smtp_user", "type": "text", "live": True,
+         "label": "Identifiant du compte mail", "help": ""},
+        {"sec": "alerts", "key": "smtp_password", "type": "secret", "live": True,
+         "label": "Mot de passe du compte mail",
+         "help": "Chiffré dans le fichier. Gmail / Outlook : mot de passe d'application."},
+        {"sec": "alerts", "key": "from_addr", "type": "email", "live": True,
+         "label": "Expéditeur", "help": "Vide = l'identifiant du compte"},
+        {"sec": "alerts", "key": "to_addrs", "type": "emails", "live": True,
+         "label": "Destinataires", "help": "Séparés par des virgules"},
+        {"sec": "alerts", "key": "batch_minutes", "type": "float", "min": 0.1,
+         "max": 1440, "live": True, "label": "Regrouper les alertes sur (minutes)",
+         "help": "Un seul mail pour toutes les alertes de cette durée ; 30 mails par "
+                 "heure au plus."},
+     ] + [{"sec": "alerts", "key": k, "type": "bool", "live": True,
+           "label": "Alerte : " + lbl, "help": ""} for k, lbl in ALERT_KINDS_LIST]},
+    {"id": "quotas", "title": "Quotas de lecture", "fields": [
+        {"sec": "quotas", "key": "enabled", "type": "bool", "live": True,
+         "label": "Activer les quotas de lecture par utilisateur",
+         "help": "Réglages et suivi : onglet Quotas. Nécessite la clé API Emby."},
+        {"sec": "quotas", "key": "file", "type": "text", "live": False,
+         "label": "Fichier des réglages de quotas", "help": ""},
+        {"sec": "quotas", "key": "db_file", "type": "text", "live": False,
+         "label": "Base des compteurs", "help": ""},
+    ]},
     {"id": "log", "title": "Journal technique", "fields": [
         {"sec": "log", "key": "file", "type": "text", "live": False,
          "label": "Fichier", "help": ""},
@@ -598,10 +802,10 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "block_admin", "login_max", "login_window", "ban_seconds", "rate",
               "burst", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
-              "status_internet", "session_hours")
+              "status_internet", "session_hours", "alerts", "quotas_enabled")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
-                 "status_host", "log_file", "log_level")
+                 "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
 
 
 def raw_values(path):
@@ -641,6 +845,12 @@ def validate_field(f, value):
         return ", ".join(str(n) for n in nets), ""
     if t == "choice":
         return (v.upper(), "") if v.upper() in f["choices"] else (None, "choix invalide")
+    if t == "email":
+        return (v, "") if (not v or _EMAIL_RE.match(v)) else (None, "adresse mail invalide")
+    if t == "emails":
+        lst = [x.strip() for x in re.split(r"[,;]", v) if x.strip()]
+        bad = [x for x in lst if not _EMAIL_RE.match(x)]
+        return (", ".join(lst), "") if not bad else (None, "adresse invalide : " + bad[0])
     if t == "secret":
         return (v, "") if not re.search(r"[\s;#]", v) else (None, "caracteres interdits")
     if re.search(r"[;#]", v):
@@ -1003,6 +1213,7 @@ class SecurityLog:
         self.max_bytes = int(max_mb * 1024 * 1024)
         self.events = deque(maxlen=3000)
         self._lock = threading.Lock()
+        self.on_event = None
         if path and Path(path).exists():
             try:
                 for ln in Path(path).read_text(encoding="utf-8").splitlines()[-3000:]:
@@ -1034,6 +1245,11 @@ class SecurityLog:
         line = json.dumps(e, ensure_ascii=False)
         e["t"] = now
         self.events.append(e)
+        if self.on_event:
+            try:
+                self.on_event(e)
+            except Exception:
+                log.exception("alerte")
         if self.path:
             try:
                 with self._lock:
@@ -1197,6 +1413,7 @@ class Activity:
         self.token_user = {}        # jeton -> uid
         self.log_path = cfg.activity_log
         self._log_lock = threading.Lock()
+        self.on_delete = None
 
     # -- identification ------------------------------------------------
     @staticmethod
@@ -1461,6 +1678,8 @@ class Activity:
             elif kind == "delete":
                 self.event(c, "delete", ("SUPPRESSION : " if ok else
                                          "Suppression refusee : ") + X, arg)
+                if ok and self.on_delete:
+                    self.on_delete(c, arg)
             elif kind == "login":
                 if ok:
                     self.event(c, "login", "Connexion reussie (%s)" % (arg or c.user_name))
@@ -1591,6 +1810,559 @@ class Activity:
 
 
 # =====================================================================
+#  ALERTES PAR MAIL
+# =====================================================================
+# Les evenements choisis dans l'onglet Configuration sont regroupes et
+# envoyes par mail (un seul mail par lot, pour ne pas inonder la boite).
+_EMAIL_RE = re.compile(r"^[^@\s,;<>\"']+@[^@\s,;<>\"']+\.[A-Za-z]{2,}$")
+
+
+def send_mail(a, subject, text):
+    """Envoie un mail avec les reglages a (dict). Leve une exception lisible."""
+    import smtplib
+    import ssl as _ssl
+    from email.message import EmailMessage
+    from email.utils import formatdate, make_msgid
+    tos = [x.strip() for x in re.split(r"[,;]", a.get("to_addrs", "")) if x.strip()]
+    if not a.get("smtp_host") or not tos:
+        raise ValueError("serveur SMTP ou destinataire manquant")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = a.get("from_addr") or a.get("smtp_user") or "emby-proxy@localhost"
+    msg["To"] = ", ".join(tos)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="emby-proxy")
+    msg.set_content(text)
+    ctx = _ssl.create_default_context()
+    port = int(a.get("smtp_port") or 587)
+    sec = (a.get("smtp_security") or "STARTTLS").upper()
+    try:
+        if sec == "SSL":
+            s = smtplib.SMTP_SSL(a["smtp_host"], port, context=ctx, timeout=20)
+        else:
+            s = smtplib.SMTP(a["smtp_host"], port, timeout=20)
+            s.ehlo()
+            if sec == "STARTTLS":
+                s.starttls(context=ctx)
+                s.ehlo()
+        with s:
+            if a.get("smtp_user"):
+                s.login(a["smtp_user"], a.get("smtp_password", ""))
+            s.send_message(msg)
+    except smtplib.SMTPAuthenticationError:
+        raise ValueError("identifiant ou mot de passe du compte mail refuse (Gmail, "
+                         "Outlook : il faut un mot de passe d'application)")
+    except smtplib.SMTPNotSupportedError:
+        raise ValueError("le serveur ne propose pas STARTTLS : essaie SSL (port 465)")
+    except (OSError, smtplib.SMTPException) as exc:
+        raise ValueError("envoi impossible : %s" % (exc or exc.__class__.__name__))
+
+
+class Alerts:
+    """File d'alertes : regroupees, puis envoyees par mail en tache de fond."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.pending = []
+        self.sent = deque(maxlen=200)     # horodatages des envois (limite/heure)
+        self.last = {"ok": None, "t": 0, "error": ""}
+        self._timer = None
+
+    def enabled_for(self, kind):
+        a = self.cfg.alerts
+        return a.get("enabled") == "true" and a.get(kind) == "true"
+
+    def add(self, kind, title, detail=""):
+        if not self.enabled_for(kind):
+            return
+        self.pending.append((time.time(), title, str(detail)[:500]))
+        if len(self.pending) > 500:
+            self.pending = self.pending[-500:]
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return                          # pas dans la boucle : envoye au prochain lot
+        if self._timer is None:
+            delay = max(5.0, float(self.cfg.alerts.get("batch_minutes") or 2) * 60)
+            self._timer = loop.call_later(delay, lambda: asyncio.ensure_future(
+                self.flush()))
+
+    async def flush(self):
+        self._timer = None
+        if not self.pending:
+            return
+        items, self.pending = self.pending, []
+        now = time.time()
+        while self.sent and now - self.sent[0] > 3600:
+            self.sent.popleft()
+        if len(self.sent) >= 30:            # garde-fou : 30 mails par heure
+            log.warning("alertes : limite de 30 mails par heure atteinte, %d alerte(s) "
+                        "non envoyee(s)", len(items))
+            return
+        titles = []
+        for _, t, _ in items:
+            if t not in titles:
+                titles.append(t)
+        subject = "[Emby Proxy] %s" % (titles[0] if len(titles) == 1 else
+                                       "%d alertes : %s" % (len(items),
+                                                            ", ".join(titles[:3])))
+        lines = ["Emby Proxy - %d alerte(s)" % len(items), ""]
+        for t, title, detail in items:
+            lines.append("%s  %s" % (time.strftime("%d/%m %H:%M:%S", time.localtime(t)),
+                                     title))
+            if detail:
+                lines.append("    " + detail)
+        lines += ["", "Page d'administration : http://%s:%d/" % (
+            lan_address(), self.cfg.status_port or self.cfg.listen_port)]
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, send_mail, dict(self.cfg.alerts), subject[:200], "\n".join(lines))
+            self.sent.append(now)
+            self.last = {"ok": True, "t": int(now), "error": ""}
+            log.info("alertes : mail envoye (%d alerte(s))", len(items))
+        except Exception as exc:
+            self.last = {"ok": False, "t": int(now), "error": str(exc)}
+            log.warning("alertes : %s", exc)
+
+
+# =====================================================================
+#  QUOTAS DE LECTURE PAR UTILISATEUR (moteur emby_quota integre)
+# =====================================================================
+# Le moteur emby_quota.py (comptage jour / semaine / mois, avertissements a
+# l'ecran, coupure, bonus...) tourne dans un thread du proxy. Il utilise
+# l'adresse d'Emby et la cle API du proxy (chiffree) : rien a regler deux
+# fois. Ses reglages propres sont dans emby_quota.ini, edite depuis l'onglet
+# Quotas de la page d'administration.
+QUOTA_WEEKDAYS = ["0", "1", "2", "3", "4", "5", "6"]
+QUOTA_WEEKDAY_LABELS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi",
+                        "samedi", "dimanche"]
+_KINDS = (("login", "À la connexion"), ("start", "Au début d'une lecture"),
+          ("tooshort", "Titre trop long pour le quota restant"),
+          ("warn", "Avertissement (palier)"), ("stop", "Préavis avant la coupure"),
+          ("stopped", "Au moment de la coupure"))
+
+
+def _qf(sec, key, label, typ, help="", **kw):
+    d = {"sec": sec, "key": key, "label": label, "type": typ, "help": help}
+    d.update(kw)
+    return d
+
+
+QUOTA_SCHEMA = [
+    {"id": "q_quota", "title": "Quotas par défaut", "fields": [
+        _qf("quota", "daily_minutes", "Minutes par jour", "optint",
+            "Vide = jour non compté ; 0 = illimité", min=0, max=100000),
+        _qf("quota", "weekly_minutes", "Minutes par semaine", "optint",
+            "Vide = semaine non comptée ; 0 = illimité", min=0, max=100000),
+        _qf("quota", "monthly_minutes", "Minutes par mois", "optint",
+            "Vide = mois non compté ; 0 = illimité", min=0, max=1000000),
+        _qf("quota", "reset_time", "Heure de remise à zéro", "hm", "ex. 04:00"),
+        _qf("quota", "reset_weekday", "Jour de remise à zéro de la semaine", "choice",
+            choices=QUOTA_WEEKDAYS, choice_labels=QUOTA_WEEKDAY_LABELS),
+        _qf("quota", "reset_day", "Jour de remise à zéro du mois", "int", min=1, max=28),
+        _qf("quota", "count_paused", "Compter le temps en pause", "bool"),
+        _qf("quota", "count_concurrent_streams",
+            "Deux lectures en même temps d'un même compte : additionner", "bool"),
+        _qf("quota", "exempt_users", "Comptes jamais limités", "list",
+            "Noms Emby séparés par des virgules ; leur temps n'est pas compté"),
+        _qf("quota", "exempt_networks", "Réseaux jamais limités", "nets",
+            "ATTENTION : y mettre le réseau de la maison désactive le quota à la maison"),
+    ]},
+    {"id": "q_when", "title": "Quand prévenir l'utilisateur", "fields": [
+        _qf("enforcement", "warn_on_login", "Récapitulatif à la connexion", "bool"),
+        _qf("enforcement", "greet_at_startup",
+            "Saluer les sessions déjà ouvertes au démarrage", "bool"),
+        _qf("enforcement", "login_idle_minutes",
+            "Reconnexion après (minutes d'inactivité)", "int", min=1, max=1440),
+        _qf("enforcement", "login_cooldown_enabled", "Anti-rebond du message d'accueil",
+            "bool"),
+        _qf("enforcement", "login_cooldown_minutes", "Anti-rebond (minutes)", "int",
+            min=1, max=1440),
+        _qf("enforcement", "warn_on_start", "Au début de chaque lecture", "bool"),
+        _qf("enforcement", "warn_if_too_short",
+            "Si le titre ne rentre pas dans le quota restant", "bool"),
+        _qf("enforcement", "warn_at_percent", "Paliers en % du quota", "intlist",
+            "ex. 50, 80, 90 ; vide = aucun"),
+        _qf("enforcement", "warn_percent_scope", "Période des paliers en %", "choice",
+            choices=["monthly", "weekly", "daily", "binding"],
+            choice_labels=["mois", "semaine", "jour", "la plus contraignante"]),
+        _qf("enforcement", "warn_at_minutes", "Paliers en minutes restantes", "intlist",
+            "ex. 15, 5, 1 ; vide = aucun"),
+        _qf("enforcement", "show_daily", "Afficher le jour dans le récapitulatif", "bool"),
+        _qf("enforcement", "show_weekly", "Afficher la semaine dans le récapitulatif",
+            "bool"),
+        _qf("enforcement", "show_monthly", "Afficher le mois dans le récapitulatif",
+            "bool"),
+    ]},
+    {"id": "q_cut", "title": "Coupure", "fields": [
+        _qf("enforcement", "grace_seconds", "Délai avant l'arrêt du film (secondes)",
+            "int", min=0, max=3600),
+        _qf("enforcement", "escalation", "Si l'utilisateur relance malgré tout",
+            "choice", choices=["none", "disable_user"],
+            choice_labels=["seulement couper", "désactiver le compte Emby"]),
+        _qf("enforcement", "escalation_after_restarts", "… après combien de relances",
+            "int", min=1, max=100),
+        _qf("enforcement", "escalation_minutes",
+            "Durée de désactivation (minutes, 0 = jusqu'à la fin de la période)", "int",
+            min=0, max=525600),
+        _qf("daemon", "dry_run", "Mode à blanc : compter sans rien envoyer ni couper",
+            "bool", "Pour roder pendant quelques jours"),
+        _qf("daemon", "poll_interval", "Intervalle de comptage (secondes)", "int",
+            min=2, max=3600),
+        _qf("daemon", "language", "Langue des messages", "choice",
+            choices=["fr", "en"], choice_labels=["français", "anglais"]),
+    ]},
+    {"id": "q_display", "title": "Affichage des messages", "fields": [
+        _qf("enforcement", "message_route", "Méthode d'envoi", "choice",
+            choices=["message", "command"], choice_labels=["Message", "Commande générale"],
+            help="Si un appareil n'affiche rien, essaie l'autre"),
+        _qf("enforcement", "message_timeout_seconds",
+            "Durée d'affichage (secondes, 0 = jusqu'à fermeture)", "optint",
+            min=0, max=3600),
+        _qf("enforcement", "message_repeat_count", "Nombre d'affichages", "int",
+            min=1, max=20),
+        _qf("enforcement", "message_repeat_interval_seconds",
+            "Délai entre deux affichages (secondes)", "float", min=0.5, max=600),
+    ] + [f for kind, lbl in _KINDS for f in (
+        _qf("enforcement", kind + "_timeout_seconds",
+            "%s : durée (s, vide = générale)" % lbl, "optint", min=0, max=3600),
+        _qf("enforcement", kind + "_repeat_count",
+            "%s : nombre d'affichages (vide = général)" % lbl, "optint", min=1, max=20))]},
+    {"id": "q_texts", "title": "Textes des messages", "preview": True, "fields": [
+        f for kind, lbl in _KINDS for f in (
+            _qf("enforcement", kind + "_header", "%s : titre" % lbl, "text"),
+            _qf("enforcement", kind + "_text", "%s : texte" % lbl, "textarea",
+                "Variables : %pseudo%, %bonjour%, %resume%, %tempsrestant%, "
+                "%periode_phrase%, %reset%, %restant_film%, %manque%, %delai%…"))]},
+]
+QUOTA_FIELDS = {"%s.%s" % (f["sec"], f["key"]): f
+                for grp in QUOTA_SCHEMA for f in grp["fields"]}
+_NAME_OK = re.compile(r"^[^=;#\[\]\r\n]{1,64}$")
+
+
+def _quota_validate(f, value):
+    """-> (valeur a ecrire ou None pour retirer la cle, erreur)."""
+    v = "" if value is None else str(value).strip()
+    t = f["type"]
+    if t == "bool":
+        return ("true" if v.lower() in ("1", "true", "on", "oui", "yes") else "false"), ""
+    if t in ("int", "optint", "float"):
+        if v == "":
+            return (None, "") if t == "optint" else (None, "valeur obligatoire")
+        try:
+            n = float(v.replace(",", ".")) if t == "float" else int(v)
+        except ValueError:
+            return None, "nombre attendu"
+        if not (f.get("min", -1e18) <= n <= f.get("max", 1e18)):
+            return None, "entre %s et %s" % (f.get("min"), f.get("max"))
+        return ("%g" % n if t == "float" else str(n)), ""
+    if t == "hm":
+        m = re.match(r"^(\d{1,2}):(\d{2})$", v)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            return None, "format HH:MM"
+        return "%02d:%s" % (int(m.group(1)), m.group(2)), ""
+    if t == "intlist":
+        try:
+            nums = [int(x) for x in re.split(r"[,\s;]+", v) if x]
+        except ValueError:
+            return None, "nombres separes par des virgules"
+        return ", ".join(str(n) for n in nums), ""
+    if t == "choice":
+        return (v, "") if v in f["choices"] else (None, "choix invalide")
+    if t == "nets":
+        try:
+            return ", ".join(str(n) for n in _nets(v)), ""
+        except ValueError:
+            return None, "ex. 192.168.1.0/24"
+    if t == "list":
+        names = [x.strip() for x in v.split(",") if x.strip()]
+        if any(not _NAME_OK.match(n) for n in names):
+            return None, "nom invalide"
+        return ", ".join(names), ""
+    if len(v) > 2000:
+        return None, "trop long"
+    return v, ""                 # text / textarea : emby_quota echappe lui-meme
+
+
+class QuotaService:
+    """Le moteur de quotas dans le proxy."""
+
+    def __init__(self, pcfg):
+        import emby_quota as eq          # module du meme dossier
+        self.eq = eq
+        self.pcfg = pcfg
+        self.path = str(pcfg.quotas_file)
+        self.qcfg = None
+        self.store = None
+        self.monitor = None
+        self.thread = None
+        self.error = ""
+        self.notify = None               # alertes par mail (posee par le proxy)
+        self._lock = threading.Lock()
+
+    # -- fichier de reglages -------------------------------------------
+    def ensure_file(self):
+        if os.path.exists(self.path):
+            return False
+        example = APP_DIR / "emby_quota.ini.example"
+        text = read_ini_text(example) if example.exists() else "[quota]\n"
+        Path(self.path).write_text(text, encoding="utf-8")
+        self._sanitize(self.path)
+        log.info("quotas : fichier de reglages cree : %s", self.path)
+        return True
+
+    def _sanitize(self, path):
+        """Adresse et cle d'Emby : celles du proxy (jamais dans ce fichier) ;
+        base et journal : ceux du proxy."""
+        self.eq.update_ini(path, {
+            "server": {"url": self.pcfg.upstream, "api_key": ""},
+            "daemon": {"db_path": str(self.pcfg.quotas_db), "log_path": ""}})
+
+    def _load(self, path=None):
+        cfg = self.eq.load_config(path or self.path, require_api_key=False)
+        cfg.url, cfg.api_key = self.pcfg.upstream, self.pcfg.api_key
+        cfg.db_path, cfg.log_path = str(self.pcfg.quotas_db), ""
+        return cfg
+
+    # -- marche / arret ------------------------------------------------
+    def start(self):
+        with self._lock:
+            if self.thread is not None and self.thread.running:
+                return
+            self.error = ""
+            try:
+                self.ensure_file()
+                self.qcfg = self._load()
+                if self.store is None:
+                    self.store = _NotifyingStore(self.eq, str(self.pcfg.quotas_db), self)
+                api = self.eq.EmbyApi(self.qcfg.url, self.qcfg.api_key,
+                                      self.qcfg.http_timeout)
+                self.monitor = self.eq.Monitor(self.qcfg, api, self.store)
+            except Exception as exc:
+                self.error = "reglages des quotas illisibles : %s" % exc
+                log.error("quotas : %s", self.error)
+                return
+            if not self.pcfg.api_key:
+                self.error = ("cle API Emby requise : renseigne-la dans l'onglet "
+                              "Configuration")
+                log.warning("quotas : %s", self.error)
+                return
+            self.thread = self.eq.MonitorThread(self.monitor)
+            self.thread.start()
+            log.info("quotas : surveillance demarree (%s)", self.path)
+
+    def stop(self):
+        with self._lock:
+            if self.thread is not None:
+                self.thread.stop()
+                self.thread = None
+
+    def close(self):
+        self.stop()
+        if self.store is not None:
+            try:
+                self.store.close()
+            except Exception:
+                pass
+            self.store = None
+
+    def reload(self):
+        """Nouveaux reglages (fichier, adresse ou cle d'Emby) : a chaud."""
+        try:
+            cfg = self._load()
+        except Exception as exc:
+            self.error = "reglages des quotas illisibles : %s" % exc
+            return
+        self.qcfg = cfg
+        if self.monitor is not None:
+            self.monitor.reload_config(cfg)
+        if self.pcfg.quotas_enabled and (self.thread is None or not self.thread.running):
+            self.start()
+        elif self.pcfg.quotas_enabled and self.pcfg.api_key:
+            self.error = ""
+
+    @property
+    def running(self):
+        return self.thread is not None and self.thread.running
+
+    # -- etat pour la page ---------------------------------------------
+    def snapshot(self):
+        out = {"enabled": self.pcfg.quotas_enabled, "running": self.running,
+               "error": self.error or (self.thread.error if self.thread else ""),
+               "file": self.path, "users": [], "sessions": [], "events": [],
+               "scopes": [], "dry_run": False}
+        if self.monitor is None or self.store is None:
+            return out
+        snap = self.eq.build_snapshot(self.qcfg, self.monitor, self.store, self.running)
+        out.update(dry_run=snap.dry_run, scopes=[
+            {"id": s, "label": self.qcfg.label(s),
+             "end": snap.scope_end[s].strftime("%d/%m %H:%M") if s in snap.scope_end
+             else ""} for s in snap.scopes])
+        for u in snap.users:
+            out["users"].append({
+                "id": u.user_id, "name": u.user_name, "state": u.state,
+                "exempt": u.exempt, "binding": u.binding,
+                "disabled_until": u.disabled_until,
+                "scopes": {s: {"used": round(v.used), "quota": round(v.quota),
+                               "bonus": round(v.bonus), "allowed": round(v.allowed),
+                               "remaining": round(v.remaining), "percent": v.percent,
+                               "limited": v.limited, "stops": v.stop_count}
+                           for s, v in u.scopes.items()}})
+        for s in snap.sessions:
+            out["sessions"].append({"user": s.user_name, "client": s.client,
+                                    "device": s.device, "ip": s.ip, "state": s.state,
+                                    "item": s.item, "detail": s.detail,
+                                    "can_message": s.can_message})
+        out["events"] = [{"t": int(e["ts"]), "user": e["user_name"], "kind": e["kind"],
+                          "detail": e["detail"]} for e in snap.events[:100]]
+        return out
+
+    def values(self):
+        """Valeurs effectives a afficher dans le formulaire."""
+        cfg = self.qcfg or self._load()
+        vals = {}
+        for k, f in QUOTA_FIELDS.items():
+            if f["key"] in ("daily_minutes", "weekly_minutes", "monthly_minutes"):
+                v = getattr(cfg, f["key"], None)      # None = periode non suivie
+            else:
+                v = getattr(cfg, f["key"], None)
+            if isinstance(v, bool):
+                v = "true" if v else "false"
+            elif isinstance(v, (list, tuple)):
+                v = ", ".join(str(x) for x in v)
+            vals[k] = "" if v is None else str(v)
+        users = [{"name": n, "quota": "/".join(str(q.get(s, "-")) for s in self.eq.SCOPES)}
+                 for n, q in sorted(cfg.user_quotas.items())]
+        return vals, users
+
+    # -- modifications -------------------------------------------------
+    def _apply_to_copy(self, changes):
+        """Ecrit dans une copie, la relit avec emby_quota (sa propre
+        validation) : le vrai fichier n'est touche que si tout est bon."""
+        tmp = self.path + ".tmp"
+        Path(tmp).write_text(read_ini_text(self.path) if os.path.exists(self.path)
+                             else "", encoding="utf-8")
+        try:
+            self.eq.update_ini(tmp, changes)
+            cfg = self._load(tmp)
+        except Exception:
+            os.remove(tmp)
+            raise
+        return tmp, cfg
+
+    def save(self, values, users):
+        errors, changes = {}, {}
+        for k, v in (values or {}).items():
+            f = QUOTA_FIELDS.get(k)
+            if not f:
+                continue
+            val, err = _quota_validate(f, v)
+            if err:
+                errors[k] = err
+            else:
+                changes.setdefault(f["sec"], {})[f["key"]] = val
+        if users is not None:
+            current = {n.lower() for n in (self.qcfg or self._load()).user_quotas}
+            new = {}
+            for i, u in enumerate(users):
+                name = str(u.get("name", "")).strip()
+                quota = str(u.get("quota", "")).strip()
+                if not name and not quota:
+                    continue
+                if not _NAME_OK.match(name):
+                    errors["users.%d" % i] = "nom invalide"
+                    continue
+                try:
+                    self.eq.parse_user_quota(quota)
+                except ValueError as exc:
+                    errors["users.%d" % i] = "quota invalide (%s) : ex. 60/300/1200" % exc
+                    continue
+                new[name.lower()] = quota
+            changes["users"] = dict({n: None for n in current if n not in new}, **new)
+        if errors:
+            return {"ok": False, "errors": errors, "error": "Corrige les champs en rouge."}
+        try:
+            tmp, cfg = self._apply_to_copy(changes)
+        except Exception as exc:
+            return {"ok": False, "error": "Reglages refuses par le moteur de quotas : %s"
+                                          % exc}
+        os.replace(tmp, self.path)
+        self.reload()
+        return {"ok": True}
+
+    def preview(self, values):
+        """Apercu des messages avec les textes en cours de saisie."""
+        changes = {}
+        for k, v in (values or {}).items():
+            f = QUOTA_FIELDS.get(k)
+            if f and f["type"] in ("text", "textarea"):
+                changes.setdefault(f["sec"], {})[f["key"]] = str(v)
+        try:
+            tmp, cfg = self._apply_to_copy(changes)
+            os.remove(tmp)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "messages": [
+            {"kind": kind, "label": lbl,
+             "header": self.eq.preview_message(cfg, kind)[0],
+             "text": self.eq.preview_message(cfg, kind)[1]} for kind, lbl in _KINDS]}
+
+    def import_file(self, text):
+        """Reprend un emby_quota.ini existant (quotas, utilisateurs, messages).
+        La cle API qu'il contient est retiree : le proxy utilise la sienne."""
+        if os.path.exists(self.path):
+            shutil.copyfile(self.path, self.path + ".avant-import")
+        tmp = self.path + ".import"
+        Path(tmp).write_text(text, encoding="utf-8")
+        try:
+            self._sanitize(tmp)
+            cfg = self._load(tmp)
+        except Exception as exc:
+            os.remove(tmp)
+            return {"ok": False, "error": "Fichier refuse : %s" % exc}
+        os.replace(tmp, self.path)
+        self.reload()
+        return {"ok": True, "users": len(cfg.user_quotas),
+                "exempt": len(cfg.exempt_users)}
+
+    def _user_name(self, user_id):
+        for u in (self.snapshot().get("users") or []):
+            if u["id"] == user_id:
+                return u["name"]
+        return ""
+
+    def grant(self, user_id, minutes):
+        self.eq.grant_bonus(self.qcfg, self.store, user_id, self._user_name(user_id),
+                            int(minutes))
+
+    def reset(self, user_id):
+        self.eq.reset_user(self.qcfg, self.store, user_id, self._user_name(user_id))
+
+    def greet(self, user_name):
+        return self.monitor.greet_now(user_name or "", journalise=True)
+
+
+class _NotifyingStore:
+    """La base de quotas, dont chaque evenement (coupure, desactivation...)
+    peut declencher une alerte par mail."""
+
+    def __init__(self, eq, path, service):
+        self._s = eq.Store(path)
+        self._svc = service
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+    def log_event(self, ts, user_id, user_name, kind, detail=""):
+        self._s.log_event(ts, user_id, user_name, kind, detail)
+        if self._svc.notify:
+            try:
+                self._svc.notify(kind, user_name or user_id, detail)
+            except Exception:
+                log.exception("alerte quota")
+
+
+# =====================================================================
 #  PROXY
 # =====================================================================
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -1683,6 +2455,10 @@ class EmbyProxy:
                 "ou place un relais HTTPS devant (et renseigne trusted_proxies).")
         if not cfg.status_password:
             cfg.status_password = secrets.token_urlsafe(12)   # jamais sans mot de passe
+        self.alerts = Alerts(cfg)
+        self.quota = QuotaService(cfg)
+        self.quota.notify = self._quota_event
+        self._emby_fail = 0
         self.restart_event = threading.Event()   # bouton Redemarrer de la page
         self.restart_error = ""
         if previous is not None:
@@ -1696,6 +2472,9 @@ class EmbyProxy:
                 self.activity.cfg, self.activity.guard = cfg, self.guard
             if previous.cfg.security_log == cfg.security_log:
                 self.seclog = previous.seclog
+        self.seclog.on_event = self._security_event
+        if self.activity is not None:
+            self.activity.on_delete = self._delete_event
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
@@ -1716,6 +2495,55 @@ class EmbyProxy:
         for w in self.warnings.values():
             log.warning(w)
         self._tasks.append(asyncio.create_task(self._startup_probe()))
+        self._tasks.append(asyncio.create_task(self._health_loop()))
+        if self.cfg.quotas_enabled:
+            await asyncio.get_running_loop().run_in_executor(None, self.quota.start)
+
+    # -- evenements -> alertes par mail -------------------------------------
+    def _security_event(self, e):
+        t, ip, who = e["type"], e["ip"], e.get("user") or "?"
+        if t == "ban":
+            self.alerts.add("on_ban", "Adresse bannie : %s" % ip,
+                            "%s ; nom tape : %s" % (e.get("detail", ""), who))
+        elif t == "login_ok" and not e.get("local"):
+            self.alerts.add("on_login_internet", "Connexion de %s depuis Internet" % who,
+                            "%s - %s %s" % (ip, e.get("client", ""), e.get("device", "")))
+        elif t in ("status_fail", "config_fail"):
+            self.alerts.add("on_status_fail", "Mot de passe faux sur la page "
+                            "d'administration", "depuis %s" % ip)
+        elif t == "config":
+            self.alerts.add("on_config", "Configuration modifiee",
+                            "par %s : %s" % (ip, e.get("detail", "")))
+
+    def _delete_event(self, c, item):
+        self.alerts.add("on_delete", "Suppression par %s" % (c.user_name or "?"),
+                        "%s (id %s) - %s %s, %s" % (
+                            self.activity.info.label(item), item, c.client, c.device,
+                            c.ip))
+
+    def _quota_event(self, kind, user, detail):
+        if kind in ("stop", "disable"):
+            self.alerts.add("on_quota", "Quota atteint : %s" % user,
+                            ("lecture coupee, " if kind == "stop" else
+                             "compte Emby desactive, ") + str(detail))
+
+    async def _health_loop(self):
+        """Toutes les minutes : Emby repond-il ? Alerte a la panne et au retour."""
+        while True:
+            await asyncio.sleep(60)
+            p = await self._probe_emby(self.cfg.upstream, "")
+            if p["ok"]:
+                if self._emby_fail >= 2:
+                    self.alerts.add("on_emby_down", "Emby repond de nouveau",
+                                    self.cfg.upstream)
+                    log.info("Emby repond de nouveau")
+                self._emby_fail = 0
+                self.warnings.pop("emby", None)
+            else:
+                self._emby_fail += 1
+                if self._emby_fail == 2:
+                    self.alerts.add("on_emby_down", "Emby ne repond plus",
+                                    "%s : %s" % (self.cfg.upstream, p.get("error", "")))
 
     async def _startup_probe(self):
         """Des le demarrage : Emby repond-il a l'adresse configuree ?"""
@@ -1750,6 +2578,9 @@ class EmbyProxy:
     async def cleanup(self, app):
         for t in self._tasks:
             t.cancel()
+        if self.alerts.pending:
+            await self.alerts.flush()          # ne pas perdre les dernieres alertes
+        await asyncio.get_running_loop().run_in_executor(None, self.quota.close)
         if self.session:
             await self.session.close()
 
@@ -1842,6 +2673,12 @@ class EmbyProxy:
         app.router.add_post("/__proxy/settings", self.settings_save)
         app.router.add_post("/__proxy/password", self.password_save)
         app.router.add_post("/__proxy/restart", self.restart_post)
+        app.router.add_post("/__proxy/alerts/test", self.alerts_test)
+        app.router.add_get("/__proxy/quotas.json", self.quotas_json)
+        app.router.add_post("/__proxy/quotas/settings", self.quotas_settings)
+        app.router.add_post("/__proxy/quotas/preview", self.quotas_preview)
+        app.router.add_post("/__proxy/quotas/import", self.quotas_import)
+        app.router.add_post("/__proxy/quotas/action", self.quotas_action)
 
     # -- securite ------------------------------------------------------
     @web.middleware
@@ -2293,7 +3130,11 @@ class EmbyProxy:
             "bans": self.guard.active_bans(),
             "cache_entries": c["entries"], "cache_bytes": c["bytes"],
             "cache_max_bytes": c["max_bytes"],
-            "warnings": list(self.warnings.values()),
+            "warnings": list(self.warnings.values()) + (
+                ["Alertes : dernier envoi de mail impossible : %s" % self.alerts.last["error"]]
+                if self.alerts.last.get("ok") is False else []) + (
+                ["Quotas : %s" % self.quota.error] if self.cfg.quotas_enabled and
+                self.quota.error else []),
             "emby_down": "emby" in self.warnings,
             "active_users": sum(
                 1 for x in list(self.activity.clients.values())
@@ -2438,7 +3279,7 @@ class EmbyProxy:
         saved = False
         try:
             update_ini(self.cfg.path, "proxy", "upstream", self.cfg.upstream)
-            update_ini(self.cfg.path, "emby", "api_key", self.cfg.api_key)
+            write_secret(self.cfg.path, "emby", "api_key", self.cfg.api_key)
             fv = self._file_values()            # relecture : vraiment ecrit ?
             saved = fv["upstream"] == self.cfg.upstream and \
                 fv["api_key"] == self.cfg.api_key
@@ -2475,12 +3316,24 @@ class EmbyProxy:
             return []
         return [a for a in RESTART_ATTRS if getattr(f, a) != getattr(self.cfg, a)]
 
+    def _plain(self, k, v):
+        f = SCHEMA_FIELDS[k]
+        if (f["sec"], f["key"]) in SECRET_KEYS:
+            try:
+                return unprotect(v, self.cfg.path.parent)
+            except Exception:
+                return None
+        return v
+
     async def settings_json(self, request):
         raw = raw_values(self.cfg.path)
         values = {}
         for k, f in SCHEMA_FIELDS.items():
             if f["type"] == "secret":
-                key = raw.get(k, "")
+                try:
+                    key = self._plain(k, raw.get(k, "")) or ""
+                except Exception:
+                    key = ""
                 values[k] = ""
                 values[k + ".hint"] = ("\u2022\u2022\u2022\u2022" + key[-4:]) if key else ""
             else:
@@ -2534,7 +3387,7 @@ class EmbyProxy:
             val, err = validate_field(f, v)
             if err:
                 errors[k] = err
-            elif val != raw.get(k, ""):
+            elif val != self._plain(k, raw.get(k, "")):
                 new[k] = val
         if errors:
             return web.json_response({"ok": False, "errors": errors,
@@ -2576,9 +3429,12 @@ class EmbyProxy:
         try:
             for k, v in new.items():
                 f = SCHEMA_FIELDS[k]
-                update_ini(self.cfg.path, f["sec"], f["key"], v)
+                if (f["sec"], f["key"]) in SECRET_KEYS:
+                    write_secret(self.cfg.path, f["sec"], f["key"], v)
+                else:
+                    update_ini(self.cfg.path, f["sec"], f["key"], v)
             after = raw_values(self.cfg.path)
-            saved = all(after.get(k) == v for k, v in new.items())
+            saved = all(self._plain(k, after.get(k)) == v for k, v in new.items())
             if not saved:
                 notes.append("ATTENTION : relu dans %s, certaines valeurs ne sont pas "
                              "celles envoyees" % self.cfg.path)
@@ -2604,6 +3460,14 @@ class EmbyProxy:
                 notes.append("cache des vignettes vide (autre serveur Emby)")
             if self.cfg.trusted or self.cfg.tls_cert:
                 self.warnings.pop("http", None)
+            loop = asyncio.get_running_loop()
+            if self.cfg.quotas_enabled:
+                if self.quota.running:
+                    await loop.run_in_executor(None, self.quota.reload)
+                else:
+                    await loop.run_in_executor(None, self.quota.start)
+            elif self.quota.running:
+                await loop.run_in_executor(None, self.quota.stop)
             self.warnings.pop("emby", None)
             for k in [k for k in self.warnings if k.startswith("config")]:
                 del self.warnings[k]
@@ -2639,7 +3503,7 @@ class EmbyProxy:
             return web.json_response({"ok": False, "error": "Pas d'espace, ni ; ni #."},
                                      status=400)
         try:
-            update_ini(self.cfg.path, "status", "password", new)
+            write_secret(self.cfg.path, "status", "password", new)
             if Settings(self.cfg.path).status_password != new:
                 raise OSError("relu different")
         except Exception as exc:
@@ -2652,6 +3516,108 @@ class EmbyProxy:
         self.seclog.add("config", ip, True, detail="mot de passe de la page change")
         log.warning("mot de passe de la page d'etat change par %s", ip)
         return web.json_response({"ok": True})
+
+    async def alerts_test(self, request):
+        """Mail de test avec les valeurs du formulaire (mot de passe enregistre
+        si le champ est laisse vide)."""
+        data = await request.json()
+        v = data.get("values") or {}
+        a = dict(self.cfg.alerts)
+        for k in list(a):
+            if "alerts." + k in v and (k != "smtp_password" or v["alerts." + k]):
+                a[k] = str(v["alerts." + k]).strip()
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, send_mail, a, "[Emby Proxy] Mail de test",
+                "Ceci est un mail de test d'Emby Proxy.\n\nSi tu le recois, les "
+                "alertes par mail fonctionnent.\n\nPage d'administration : "
+                "http://%s:%d/" % (lan_address(), self.cfg.status_port or
+                                   self.cfg.listen_port))
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)})
+        return web.json_response({"ok": True, "to": a.get("to_addrs", "")})
+
+    # -- quotas de lecture ------------------------------------------------
+    async def quotas_json(self, request):
+        loop = asyncio.get_running_loop()
+        snap = await loop.run_in_executor(None, self.quota.snapshot)
+        try:
+            values, users = await loop.run_in_executor(None, self.quota.values)
+        except Exception as exc:
+            values, users = {}, []
+            snap["error"] = snap["error"] or "reglages illisibles : %s" % exc
+        snap.update(schema=QUOTA_SCHEMA, values=values, user_quotas=users,
+                    api_key_set=bool(self.cfg.api_key))
+        return web.json_response(snap)
+
+    async def quotas_settings(self, request):
+        if not self.guard.is_local(request[CLIENT_IP]):
+            return web.json_response({"ok": False, "error": "reseau local seulement"},
+                                     status=403)
+        data = await request.json()
+        bad = self._confirm(request, data.get("password"))
+        if bad:
+            return bad
+        res = await asyncio.get_running_loop().run_in_executor(
+            None, self.quota.save, data.get("values"), data.get("users"))
+        if res.get("ok"):
+            self.seclog.add("config", request[CLIENT_IP], True,
+                            detail="reglages des quotas modifies")
+        return web.json_response(res, status=200 if res.get("ok") else 400)
+
+    async def quotas_preview(self, request):
+        data = await request.json()
+        return web.json_response(await asyncio.get_running_loop().run_in_executor(
+            None, self.quota.preview, data.get("values")))
+
+    async def quotas_import(self, request):
+        if not self.guard.is_local(request[CLIENT_IP]):
+            return web.json_response({"ok": False, "error": "reseau local seulement"},
+                                     status=403)
+        data = await request.json()
+        bad = self._confirm(request, data.get("password"))
+        if bad:
+            return bad
+        text = str(data.get("text", ""))
+        if not text.strip() or len(text) > 200_000:
+            return web.json_response({"ok": False, "error": "fichier vide ou trop gros"},
+                                     status=400)
+        res = await asyncio.get_running_loop().run_in_executor(
+            None, self.quota.import_file, text)
+        if res.get("ok"):
+            self.seclog.add("config", request[CLIENT_IP], True,
+                            detail="reglages des quotas importes")
+        return web.json_response(res, status=200 if res.get("ok") else 400)
+
+    async def quotas_action(self, request):
+        data = await request.json()
+        act, uid = data.get("action"), str(data.get("user_id", ""))
+        q = self.quota
+        if q.monitor is None or q.store is None:
+            return web.json_response({"ok": False, "error": "quotas non demarres"})
+        loop = asyncio.get_running_loop()
+        try:
+            if act == "grant":
+                minutes = int(data.get("minutes", 0))
+                if not -1440 <= minutes <= 1440:
+                    raise ValueError("entre -1440 et 1440 minutes")
+                await loop.run_in_executor(None, q.grant, uid, minutes)
+                msg = "%+d min accordees" % minutes
+            elif act == "reset":
+                await loop.run_in_executor(None, q.reset, uid)
+                msg = "compteurs remis a zero"
+            elif act == "greet":
+                sent = await loop.run_in_executor(None, q.greet, str(data.get("user", "")))
+                n = sum(1 for x in sent if x[3])
+                msg = "%d message(s) envoye(s)" % n if n else \
+                    "aucune session ouverte a qui envoyer le message"
+            else:
+                raise ValueError("action inconnue")
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)})
+        self.seclog.add("config", request[CLIENT_IP], True,
+                        detail="quotas : %s (%s)" % (msg, data.get("user") or uid))
+        return web.json_response({"ok": True, "message": msg})
 
     async def restart_post(self, request):
         if not self.guard.is_local(request[CLIENT_IP]):
@@ -2774,13 +3740,15 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.row button{margin-top:0}
 .confirm{margin-top:12px;padding:10px;border:1px solid var(--warn);border-radius:8px;background:#2a2316;display:flex;flex-direction:column;gap:8px}
 .res{margin-top:12px;padding:10px;border-radius:8px;border:1px solid var(--line)}.res.ok{border-color:var(--ok)}.res.bad{border-color:var(--bad)}
-.lock{color:var(--warn)}.fld{margin-top:6px}.fld .err{color:var(--bad);font-size:12px}
+.lock{color:var(--warn)}
+.qbar{height:6px;background:#3a3f4d;border-radius:3px;margin-top:3px;min-width:90px}.qbar>i{display:block;height:100%;border-radius:3px}
+.qact button{margin:2px}textarea{width:100%;min-height:58px;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}.fld{margin-top:6px}.fld .err{color:var(--bad);font-size:12px}
 .fld label{display:block}.fld input:not([type=checkbox]),.fld select{width:100%;margin-top:3px}
 </style></head><body>
 <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
 <h1>Emby Proxy</h1><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div>
 <div id="warn"></div>
-<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="cache">Cache</button><button data-t="conf">Configuration</button></div>
+<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="quota">Quotas</button><button data-t="cache">Cache</button><button data-t="conf">Configuration</button></div>
 
 <section id="act">
   <div class="sub" id="summary"></div>
@@ -2847,6 +3815,45 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
   </div>
 </section>
 
+<section id="quota" hidden>
+  <div id="qStatus"></div>
+  <h2>Utilisateurs</h2>
+  <div class="tw"><table><thead><tr id="qHead"></tr></thead><tbody id="qUsers"></tbody></table></div>
+  <h2>Lectures en cours</h2>
+  <div class="tw"><table><thead><tr><th>Utilisateur</th><th>Appareil</th><th>État</th><th>Titre</th><th>Message possible</th></tr></thead><tbody id="qSessions"></tbody></table></div>
+  <h2>Derniers événements des quotas</h2>
+  <div class="tw"><table><thead><tr><th>Date</th><th>Utilisateur</th><th>Événement</th><th>Détail</th></tr></thead><tbody id="qEvents"></tbody></table></div>
+  <h2>Quotas individuels</h2>
+  <div class="c form">
+    <div class="sub">Format jour/semaine/mois en minutes : <b>60/300/1200</b> ; <b>-</b> = valeur par défaut ; <b>0</b> = illimité. Ex. <b>-/120/-</b> = seulement 2 h par semaine.</div>
+    <div class="tw"><table><thead><tr><th>Nom Emby</th><th>Quota</th><th></th></tr></thead><tbody id="qUq"></tbody></table></div>
+    <div class="row"><button class="small" id="qUqAdd">Ajouter un utilisateur</button></div>
+  </div>
+  <div id="qForm"></div>
+  <div class="c form" style="margin-top:14px">
+    <div class="sub lock" id="qDirty" hidden>● Modifications non enregistrées</div>
+    <div class="row">
+      <button class="small" id="qPrev">Aperçu des messages</button>
+      <button class="red" id="qSave">Enregistrer les réglages des quotas…</button>
+      <button class="small" id="qReset">Annuler les modifications</button>
+    </div>
+    <div id="qConfirm" hidden class="confirm">
+      <div>Pour confirmer, retape le mot de passe de cette page.</div>
+      <input id="qPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
+      <div class="row"><button class="red" id="qDo">Confirmer et enregistrer</button><button class="small" id="qCancel">Annuler</button></div>
+    </div>
+    <div id="qOut"></div>
+  </div>
+  <h2>Reprendre un emby_quota.ini existant</h2>
+  <div class="c form">
+    <div class="sub">Quotas, utilisateurs et messages sont repris ; la clé API qu'il contient est ignorée (le proxy utilise la sienne, chiffrée). L'ancien réglage est sauvegardé en .avant-import.</div>
+    <input type="file" id="qFile" accept=".ini,.txt">
+    <input id="qImpPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
+    <div class="row"><button class="red" id="qImp">Importer</button></div>
+    <div id="qImpOut"></div>
+  </div>
+</section>
+
 <section id="cache" hidden>
   <div class="g" id="g"></div>
   <button class="red" id="purge">Vider le cache</button>
@@ -2861,7 +3868,8 @@ const hm=t=>new Date(t*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'
 const day=t=>new Date(t*1000).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
-  ['act','sec','cache','conf'].forEach(t=>$(t).hidden=b.dataset.t!==t);
+  ['act','sec','quota','cache','conf'].forEach(t=>$(t).hidden=b.dataset.t!==t);
+  if(b.dataset.t==='quota')loadQuota(true);
   if(b.dataset.t==='conf')loadConf();});
 
 function userCard(u){
@@ -2987,7 +3995,12 @@ function loadConf(){return fetch('settings.json').then(r=>{if(r.status===401){lo
     const b=el('button','red','Redémarrer le proxy maintenant');b.onclick=restart;d.append(b);top.push(d)}
   $('gTop').replaceChildren(...top);
   $('gForm').replaceChildren(...g.schema.map(grp=>{const box=el('div');box.append(el('h2',null,grp.title));const c=el('div','c form');
-    grp.fields.forEach(f=>c.append(fieldEl(f,g)));box.append(c);return box}));
+    grp.fields.forEach(f=>c.append(fieldEl(f,g)));
+    if(grp.action){const out=el('div'),b=el('button','small',grp.action.label),r=el('div','row');
+      b.onclick=()=>{out.replaceChildren(el('div','sub','En cours…'));post(grp.action.endpoint,{values:collect()}).then(x=>
+        out.replaceChildren(el('div','res '+(x.ok?'ok':'bad'),x.ok?'✔ Mail envoyé à '+(x.to||'?')+'. Vérifie la boîte de réception (et les indésirables).':'✖ '+x.error)))};
+      r.append(b);c.append(r,out)}
+    box.append(c);return box}));
   dirty()}).catch(e=>{if(e!==0)$('gOut').replaceChildren(el('div','res bad','✖ Lecture des réglages impossible : '+e))})}
 function collect(){const v={};inputs().forEach(i=>v[i.dataset.k]=val(i));return v}
 $('gTest').onclick=()=>{const v=collect();$('gOut').replaceChildren(el('div','sub','Test en cours…'));
@@ -3019,6 +4032,81 @@ $('pDo').onclick=()=>{post('password',{old:$('pOld').value,new:$('pNew').value,n
   $('pOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?'✔ Mot de passe changé. Les autres connexions à cette page ont été fermées.':'✖ '+r.error));
   if(r.ok)['pOld','pNew','pNew2'].forEach(i=>$(i).value='')})};
 
+// ---- Quotas de lecture
+let Q=null;
+const hms=s=>{s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.round(s%3600/60);return h?h+' h '+String(m).padStart(2,'0'):m+' min'};
+function qPost(body){return post('quotas/action',body).then(r=>{$('qOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),(r.ok?'✔ ':'✖ ')+(r.message||r.error)));loadQuota(false)})}
+function qFieldEl(f,vals){
+  const k=f.sec+'.'+f.key,v=vals[k]==null?'':vals[k],w=el('div','fld');w.dataset.k=k;let inp;
+  if(f.type==='bool'){const lb=el('label');inp=el('input');inp.type='checkbox';inp.checked=(v==='true');lb.append(inp,el('span',null,' '+f.label));w.append(lb)}
+  else{w.append(el('label',null,f.label));
+    if(f.type==='choice'){inp=el('select');f.choices.forEach((c,i)=>{const o=el('option',null,(f.choice_labels||[])[i]||c);o.value=c;inp.append(o)});inp.value=v}
+    else if(f.type==='textarea'){inp=el('textarea');inp.value=v}
+    else{inp=el('input');inp.value=v;inp.spellcheck=false;inp.autocomplete='off'}
+    w.append(inp)}
+  inp.dataset.k=k;inp.dataset.orig=f.type==='bool'?String(v==='true'):v;inp.oninput=inp.onchange=qDirty;
+  if(f.help)w.append(el('div','sub',f.help));w.append(el('div','err'));return w}
+function qInputs(){return [...document.querySelectorAll('#qForm [data-k]')].filter(i=>i.tagName!=='DIV')}
+function qUqRows(){return [...document.querySelectorAll('#qUq tr')].map(tr=>({name:tr.querySelector('.n').value,quota:tr.querySelector('.q').value}))}
+function qDirty(){const d=qInputs().some(i=>val(i)!==i.dataset.orig)||JSON.stringify(qUqRows())!==JSON.stringify(Q?Q.user_quotas:[]);$('qDirty').hidden=!d;return d}
+function qUqRow(u){const tr=el('tr'),n=el('input','n'),q=el('input','q'),x=el('button','small','Retirer'),e=el('div','err');
+  n.value=u.name;q.value=u.quota;q.placeholder='60/300/1200';n.oninput=q.oninput=qDirty;x.onclick=()=>{tr.remove();qDirty()};
+  const t1=el('td'),t2=el('td'),t3=el('td');t1.append(n);t2.append(q,e);t3.append(x);tr.append(t1,t2,t3);return tr}
+$('qUqAdd').onclick=()=>{$('qUq').append(qUqRow({name:'',quota:''}));qDirty()};
+function loadQuota(full){return fetch('quotas.json').then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()}).then(d=>{
+  if(full||!Q){Q=d;
+    $('qForm').replaceChildren(...d.schema.map(grp=>{const box=el('div');box.append(el('h2',null,grp.title));const c=el('div','c form');
+      grp.fields.forEach(f=>c.append(qFieldEl(f,d.values)));box.append(c);return box}));
+    $('qUq').replaceChildren(...d.user_quotas.map(qUqRow));qDirty()}
+  const st=[];
+  if(!d.enabled)st.push(el('div','w','Les quotas sont désactivés : active-les dans l\'onglet Configuration, section « Quotas de lecture ». Tu peux déjà préparer les réglages ci-dessous.'));
+  else if(d.running)st.push(el('div','res ok','✔ Surveillance des quotas en marche'+(d.dry_run?' — MODE À BLANC : rien n\'est envoyé ni coupé':'')));
+  if(d.error)st.push(el('div','res bad','✖ '+d.error));
+  if(!d.api_key_set)st.push(el('div','w','La clé API Emby est nécessaire aux quotas : renseigne-la dans l\'onglet Configuration.'));
+  $('qStatus').replaceChildren(...st);
+  const sc=d.scopes||[];
+  $('qHead').replaceChildren(el('th',null,'Utilisateur'),...sc.map(s=>el('th',null,s.label+(s.end?' (jusqu\'au '+s.end+')':''))),el('th',null,'État'),el('th',null,'Actions'));
+  $('qUsers').replaceChildren(...(d.users.length?d.users.map(u=>{const tr=el('tr');tr.append(el('td',null,u.name));
+    sc.forEach(s=>{const v=u.scopes[s.id],td=el('td');
+      if(u.exempt)td.append(el('span','sub','exempté'));
+      else if(!v||!v.limited)td.append(el('span','sub',v?hms(v.used)+' (illimité)':'-'));
+      else{td.append(el('div',null,hms(v.used)+' / '+hms(v.allowed)),el('div','sub','reste '+hms(v.remaining)+(v.bonus?' · bonus '+hms(v.bonus):'')));
+        const b=el('div','qbar'),i=el('i');i.style.width=v.percent+'%';i.style.background=v.percent>=100?'var(--bad)':v.percent>=80?'var(--warn)':'var(--ok)';b.append(i);td.append(b)}
+      tr.append(td)});
+    tr.append(el('td',null,(u.exempt?'exempté : '+u.exempt:u.state)+(u.disabled_until?' · compte désactivé':'')));
+    const a=el('td','qact');
+    [15,30,60].forEach(m=>{const b=el('button','small','+'+m+' min');b.onclick=()=>qPost({action:'grant',user_id:u.id,user:u.name,minutes:m});a.append(b)});
+    const r=el('button','small','Remise à zéro');r.onclick=()=>{if(confirm('Remettre à zéro les compteurs de '+u.name+' ?'))qPost({action:'reset',user_id:u.id,user:u.name})};
+    const g=el('button','small','Message maintenant');g.onclick=()=>qPost({action:'greet',user:u.name,user_id:u.id});
+    a.append(r,g);tr.append(a);return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty',d.running?'Aucun utilisateur compté pour l\'instant.':'Surveillance arrêtée.');td.colSpan=sc.length+3;tr.append(td);return tr})()]));
+  $('qSessions').replaceChildren(...(d.sessions.length?d.sessions.map(x=>{const tr=el('tr');
+    tr.append(el('td',null,x.user),el('td','sub',[x.client,x.device].filter(Boolean).join(' · ')),el('td',null,x.state+(x.detail?' ('+x.detail+')':'')),el('td',null,x.item||'-'),el('td',null,x.can_message===false?'non':x.can_message?'oui':'?'));return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune session ouverte.');td.colSpan=5;tr.append(td);return tr})()]));
+  $('qEvents').replaceChildren(...d.events.slice(0,50).map(e=>{const tr=el('tr');tr.append(el('td',null,day(e.t)),el('td',null,e.user),el('td',null,e.kind),el('td','sub',e.detail));return tr}));
+}).catch(e=>{if(e!==0)$('qStatus').replaceChildren(el('div','res bad','✖ Lecture des quotas impossible : '+e))})}
+function qCollect(){const v={};qInputs().forEach(i=>v[i.dataset.k]=val(i));return v}
+$('qPrev').onclick=()=>post('quotas/preview',{values:qCollect()}).then(r=>{
+  if(!r.ok){$('qOut').replaceChildren(el('div','res bad','✖ '+r.error));return}
+  $('qOut').replaceChildren(...r.messages.map(m=>{const d=el('div','res');d.append(el('div','sub',m.label),el('b',null,m.header));
+    m.text.split('\n').forEach(l=>d.append(el('div',null,l)));return d}))});
+$('qSave').onclick=()=>{$('qConfirm').hidden=false;$('qPwd').value='';$('qPwd').focus()};
+$('qCancel').onclick=()=>{$('qConfirm').hidden=true};
+$('qReset').onclick=()=>{loadQuota(true);$('qOut').replaceChildren()};
+$('qPwd').onkeydown=e=>{if(e.key==='Enter')$('qDo').click()};
+$('qDo').onclick=()=>{document.querySelectorAll('#quota .err').forEach(e=>e.textContent='');
+  post('quotas/settings',{values:qCollect(),users:qUqRows(),password:$('qPwd').value}).then(r=>{
+    if(!r.ok){$('qOut').replaceChildren(el('div','res bad','✖ '+r.error));
+      Object.entries(r.errors||{}).forEach(([k,m])=>{let f;
+        if(k.startsWith('users.'))f=document.querySelectorAll('#qUq tr')[+k.slice(6)].querySelector('.err');
+        else f=document.querySelector('#qForm div.fld[data-k="'+k+'"] .err');if(f)f.textContent='✖ '+m});
+      if(r.errors)$('qConfirm').hidden=true;return}
+    $('qConfirm').hidden=true;$('qOut').replaceChildren(el('div','res ok','✔ Réglages des quotas enregistrés et appliqués.'));loadQuota(true)})};
+$('qImp').onclick=()=>{const f=$('qFile').files[0];if(!f){$('qImpOut').replaceChildren(el('div','res bad','✖ Choisis d\'abord ton fichier emby_quota.ini'));return}
+  const rd=new FileReader();rd.onload=()=>post('quotas/import',{text:rd.result,password:$('qImpPwd').value}).then(r=>{
+    $('qImpOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?'✔ Importé : '+r.users+' quota(s) individuel(s), '+r.exempt+' compte(s) exempté(s).':'✖ '+r.error));if(r.ok){$('qImpPwd').value='';loadQuota(true)}});rd.readAsText(f)};
+setInterval(()=>{if(!$('quota').hidden&&!qDirty())loadQuota(false)},5000);
+
 function tick(){
   const j=u=>fetch(u).then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()});
   j('activity.json').then(renderAct).catch(()=>{});
@@ -3048,6 +4136,11 @@ def setup_logging(cfg, to_console=True):
             log.addHandler(fh)
         except OSError:
             pass
+    # le moteur de quotas ecrit dans le meme journal
+    qlog = logging.getLogger("emby_quota")
+    qlog.handlers = list(log.handlers)
+    qlog.setLevel(log.level)
+    qlog.propagate = False
 
 
 def ssl_context(cfg):
@@ -3304,8 +4397,11 @@ def main(argv=None):
         check = Settings(cfg_path).upstream
         print("Adresse d'Emby enregistree dans %s : upstream = %s%s" % (
             cfg_path, check, "" if check == url else "  /!\\ relue differente"))
+    migrated = migrate_plain_secrets(cfg_path)
     cfg = Settings(cfg_path)
     setup_logging(cfg, to_console=not args.gui)
+    if migrated:
+        log.info("secrets chiffres dans %s : %s", cfg_path, ", ".join(migrated))
     if ensure_status_password(cfg_path, cfg):
         # jamais le mot de passe lui-meme dans le journal (on le partage
         # parfois pour demander de l'aide)

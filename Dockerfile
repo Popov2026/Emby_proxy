@@ -3,7 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY emby_proxy.py .
+COPY emby_proxy.py emby_quota.py emby_quota_i18n.py emby_quota.ini.example ./
 
 # Reglages, cache et journal dans un volume : ils survivent aux mises a jour.
 ENV EMBY_PROXY_CONFIG=/data/emby_proxy.ini \

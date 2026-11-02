@@ -1,0 +1,280 @@
+; ---------------------------------------------------------------------------
+; emby_quota.ini - quotas de temps de lecture Emby
+; Copier en emby_quota.ini et adapter.
+; ---------------------------------------------------------------------------
+
+[server]
+; URL du serveur Emby (avec le port, sans / final)
+url = http://192.168.1.10:8096
+; Cle API : Tableau de bord Emby > Avance > Cles API > Nouvelle cle API
+api_key = REMPLACER_PAR_VOTRE_CLE
+; Timeout HTTP en secondes
+timeout = 10
+
+[daemon]
+; Langue de l'interface ET des messages envoyes aux utilisateurs : fr | en
+; (bouton EN/FR dans la fenetre, option --lang en ligne de commande)
+language = fr
+; Intervalle de scrutation en secondes (minimum 5).
+; 15-20 s est un bon compromis : precision de la coupure vs charge serveur.
+poll_interval = 20
+db_path = /var/lib/emby_quota/emby_quota.db
+log_path = /var/log/emby_quota.log
+; DEBUG | INFO | WARNING | ERROR
+log_level = INFO
+; Verbosite, prioritaire sur log_level (equivaut aux options -v / -vv) :
+;   0 = evenements seuls (avertissements, coupures)
+;   1 = detaille : etat de chaque session et de chaque utilisateur a chaque cycle
+;   2 = ultra verbeux : ajoute la trace des appels HTTP et les sessions inactives
+verbose = 0
+; true = observe et journalise sans rien envoyer au serveur (rodage)
+dry_run = false
+
+[quota]
+; ---------------------------------------------------------------------------
+; Durees utilisables, en minutes. Les trois peuvent etre actives ensemble :
+; la periode la plus contraignante s'applique (ex. 2h par jour ET 10h par
+; semaine : un gros week-end epuise le quota hebdo avant le quota du jour).
+;   > 0  = limite
+;   0    = periode comptabilisee mais sans limite (utile pour les statistiques)
+;   ligne absente ou vide = periode non suivie du tout
+; ---------------------------------------------------------------------------
+daily_minutes = 120
+weekly_minutes = 600
+monthly_minutes = 0
+
+; Mode compatible mono-periode : utilise UNIQUEMENT si aucune des trois lignes
+; ci-dessus n'est presente.
+; period = daily
+; default_minutes = 120
+
+; Heure de remise a zero des compteurs (HH:MM, heure locale du serveur).
+; 04:00 evite de couper une seance qui deborde sur minuit.
+reset_time = 04:00
+; Pour period = weekly : jour de reset (0 = lundi ... 6 = dimanche)
+reset_weekday = 0
+; Pour period = monthly : jour du mois (1-28)
+reset_day = 1
+; ---------------------------------------------------------------------------
+; EXEMPTIONS - MANUELLES UNIQUEMENT, et aucune par defaut.
+; Aucun role, aucun statut ne dispense qui que ce soit : les administrateurs
+; Emby sont soumis au quota comme les autres. Le quota s'applique aussi sur
+; TOUS LES RESEAUX, y compris le LAN de la maison.
+;
+; La seule dispense possible est de nommer explicitement un compte ci-dessous.
+;
+; Preferer un quota illimite a une exemption quand c'est possible : dans
+; [users], "Alice = 0/0/0" laisse le compte libre tout en continuant a
+; comptabiliser son temps (utile pour les statistiques).
+; ---------------------------------------------------------------------------
+; Utilisateurs jamais limites (noms Emby ou IDs, separes par des virgules).
+; Leur temps n'est meme pas comptabilise.
+; exempt_users = Alice
+; Sessions provenant de ces reseaux : ni comptabilisees, ni limitees.
+; ATTENTION : mettre le LAN ici desactive le quota a la maison.
+; exempt_networks = 192.168.1.0/24
+; Compter le temps quand la lecture est en pause
+count_paused = false
+; Deux flux simultanes du meme compte : false = on compte le temps une fois,
+; true = on additionne (utile si le quota vise la charge serveur)
+count_concurrent_streams = false
+
+[enforcement]
+; ---------------------------------------------------------------------------
+; QUAND PREVENIR L'UTILISATEUR - les quatre declencheurs sont independants,
+; activez ceux que vous voulez (laissez vide pour desactiver).
+;
+;   1. a la connexion du client            -> warn_on_login   (recapitulatif)
+;   2. au demarrage de chaque lecture      -> warn_on_start
+;   3. si le titre ne rentre pas dans le quota restant -> warn_if_too_short
+;      (remplace le message 2 pour ce titre : plus utile de dire
+;       "tu ne pourras pas le finir" que "bon film")
+;   4. a un pourcentage du quota consomme  -> warn_at_percent
+;   5. a N minutes de la fin               -> warn_at_minutes
+;
+; Et a la coupure, deux messages : un preavis (stop_*) au debut du delai de
+; grace, puis un message final (stopped_*) juste avant l'arret du film.
+;
+; Pour n'avoir QUE le recapitulatif a la connexion :
+;     warn_on_login = true / warn_on_start = false
+;     warn_at_percent = / warn_at_minutes =
+;
+; MESSAGES SUR PLUSIEURS LIGNES : un INI n'accepte qu'une valeur par ligne.
+; Les retours a la ligne s'ecrivent \n sur la meme ligne physique :
+;     login_text = Bonjour %pseudo%,\n\nBon visionnage.
+; Espaces multiples, indentation, lignes vides, ; et # sont conserves tels
+; quels. La fenetre graphique fait l'echappement toute seule : on y tape le
+; texte sur plusieurs lignes normalement.
+; ---------------------------------------------------------------------------
+warn_on_login = true
+warn_on_start = false
+; Prevenir quand le titre lance ne tiendra pas dans le quota restant
+warn_if_too_short = true
+warn_at_percent = 80
+; Periode sur laquelle les paliers en % sont evalues :
+;   monthly (defaut) | weekly | daily | binding (la periode qui contraint)
+; "80 % de ton forfait" n'a de sens que sur une longue periode : 80 % d'un
+; quota de 2h par jour, c'est juste "il te reste 24 min", ce que dit deja
+; warn_at_minutes.
+warn_percent_scope = monthly
+warn_at_minutes = 5
+; NB : un palier plus large que le quota lui-meme est ignore (il partirait
+; des la premiere seconde).
+
+; ---------------------------------------------------------------------------
+; DETECTION DE LA CONNEXION.
+; Emby garde une session listee TRES longtemps apres que le client l'a quittee :
+; se fier a l'apparition d'une nouvelle session ne suffit pas, l'utilisateur
+; rouvre son application sans que la session change. Trois signaux :
+;   1. session jamais vue ;
+;   2. session reveillee apres login_idle_minutes d'inactivite (LastActivityDate) ;
+;   3. sessions deja ouvertes au demarrage du service, si greet_at_startup.
+;
+; ANTI-REBOND : DESACTIVE par defaut (login_cooldown_enabled = false). Tant
+; qu'il est a false, chaque connexion detectee donne son message, point.
+; A n'activer que si un client qui recree ses sessions se met a repeter le
+; message. Une fois actif, il est memorise EN BASE et survit au redemarrage :
+; vous ne serez pas salue deux fois de suite, meme en relancant le service.
+;     python3 emby_quota.py --greet     (envoi force, ignore l'anti-rebond)
+;     python3 emby_quota.py --status    (dit qui est bloque et jusqu'a quand)
+; ---------------------------------------------------------------------------
+login_cooldown_enabled = false
+login_cooldown_minutes = 60
+login_idle_minutes = 15
+greet_at_startup = true
+
+; ---------------------------------------------------------------------------
+; DUREE D'AFFICHAGE du message sur l'ecran du client, EN SECONDES.
+; message_timeout_seconds s'applique a tous les types ; chaque type peut le
+; surcharger. 0 = laisse le client decider (souvent : affichage persistant).
+; Le recapitulatif de connexion est long a lire, la coupure doit rester
+; visible : d'ou des valeurs differentes.
+;
+; La forme en millisecondes (message_timeout_ms, login_timeout_ms...) reste
+; acceptee pour compatibilite ; les secondes l'emportent si les deux sont la.
+; ---------------------------------------------------------------------------
+; ATTENTION : TimeoutMs est une DEMANDE faite au client, pas une garantie.
+; Il n'y a pas de plafond cote API, mais plusieurs clients ont une duree codee
+; en dur (releve du forum Emby, fil "Message display maximum time") :
+;     Roku ............ 6 s      Nvidia Shield / Android TV ..... ~5 s
+; L'equipe Emby a demande aux clients de respecter le parametre, mais les
+; versions concernees gardent leur limite. Trois leviers :
+;   1. mettre 0 : le champ n'est pas envoye du tout et le message doit alors
+;      rester affiche jusqu'a ce que l'utilisateur le ferme (comportement
+;      documente par Emby) ;
+;   2. message_route = command : l'autre route de l'API, certains clients la
+;      traitent differemment ;
+;   3. message_repeat_count : afficher le message plusieurs fois de suite.
+; Mesurez sur vos appareils avec :  emby_quota.py -c emby_quota.ini --test-message
+message_timeout_seconds = 8
+login_timeout_seconds = 15
+; start_timeout_seconds = 8
+; tooshort_timeout_seconds = 15
+; warn_timeout_seconds = 10
+stop_timeout_seconds = 20
+stopped_timeout_seconds = 20
+
+; Route d'affichage : message | command
+;   message -> POST /Sessions/{id}/Message
+;   command -> POST /Sessions/{id}/Command/DisplayMessage
+message_route = message
+; ---------------------------------------------------------------------------
+; NOMBRE D'AFFICHAGES SUCCESSIFS de chaque message.
+; 1 = une seule fois (defaut). Sur un client qui n'applique pas la duree
+; demandee et n'affiche que 2 s, trois affichages espaces de 2 s donnent
+; environ 6 s de presence a l'ecran.
+; message_repeat_count s'applique a tous les types ; chaque type peut le
+; surcharger.
+; ---------------------------------------------------------------------------
+message_repeat_count = 1
+; login_repeat_count = 3
+; start_repeat_count = 1
+; tooshort_repeat_count = 3
+; warn_repeat_count = 2
+; stop_repeat_count = 2
+; stopped_repeat_count = 3
+; Delai entre deux affichages successifs, en secondes (accepte les decimales).
+; A regler un peu SOUS la duree reelle d'affichage de votre client : le nouveau
+; message remplace alors l'ancien sans laisser de trou. Trop long, l'ecran se
+; vide entre deux. Reperes : Roku 6 s -> intervalle 5 ; Shield 5 s -> 4.
+; `--test-message` affiche les plafonds connus et calcule le nombre
+; d'affichages necessaire pour tenir 15, 30 ou 60 secondes.
+message_repeat_interval_seconds = 3
+
+; ---------------------------------------------------------------------------
+; TEXTES DES MESSAGES - syntaxe %variable% (ou {variable}), noms francais ou
+; anglais. Une variable inconnue est laissee telle quelle : une faute de frappe
+; n'empeche jamais l'envoi. Titre ET texte acceptent les variables.
+;
+;   %pseudo%              nom de l'utilisateur Emby
+;   %bonjour%             Bonjour avant 18h, Bonsoir apres
+;   %resume%              les temps restants des periodes cochees ci-dessous,
+;                         en une phrase : "20h00 pour le mois, 5h00 pour la
+;                         semaine et 1h00 pour la journee"
+;   %tempsrestant_jour%   %tempsrestant_semaine%   %tempsrestant_mois%
+;   %tempsrestant%        restant sur la periode qui contraint
+;   %tempsconsomme%       %quota%   %pourcentage%
+;   %periode%             jour / semaine / mois
+;   %periode_phrase%      la journee / la semaine / le mois
+;   %titre%               titre en cours de lecture
+;   %duree_film%          duree totale du titre lance
+;   %restant_film%        ce qu'il reste a voir
+;   %manque%              temps de quota manquant pour le terminer
+;   %delai%               delai de grace avant la coupure
+;   %client%  %appareil%  %reset%  %reset_heure%
+;
+; Exemple :
+;   login_text = Bonjour %pseudo% il vous reste %tempsrestant_jour% pour
+;                aujourd'hui et %tempsrestant_mois% pour le mois.
+; ---------------------------------------------------------------------------
+
+; Ce qui apparait dans %resume% : une case par periode. Decocher une periode la
+; retire du message SANS toucher au quota, qui continue de s'appliquer.
+show_daily = true
+show_weekly = true
+show_monthly = true
+
+login_header = Temps de visionnage
+login_text = %bonjour% %pseudo%, il vous reste %resume%. Bon visionnage.
+
+start_header = Bon film
+start_text = Il te reste %tempsrestant% de visionnage pour %periode_phrase%.
+
+; envoye a la place du precedent quand le titre lance ne rentre pas
+tooshort_header = Attention
+tooshort_text = Il te reste %tempsrestant% de visionnage mais ce film dure %restant_film% : tu ne pourras pas le terminer (il manque %manque%).
+
+warn_header = Temps de visionnage
+warn_text = Il te reste %tempsrestant% de visionnage pour %periode_phrase% (%pourcentage% % consomme).
+; preavis, envoye quand le quota est atteint - uniquement si grace_seconds > 0
+stop_header = Quota atteint
+stop_text = Quota de %periode_phrase% atteint (%tempsconsomme% vues). Le film va s'arreter dans %delai%.
+
+; message final, envoye juste avant la commande d'arret
+stopped_header = Quota epuise
+stopped_text = Quota epuise : arret du film. Retour le %reset%.
+; Delai entre le message final et la coupure effective, en secondes.
+; 0 = coupure immediate. Sinon prevoir >= poll_interval pour que le message
+; ait le temps d'etre lu.
+grace_seconds = 20
+; Que faire si la lecture repart apres la coupure (ou si le client ignore
+; la commande Stop) : none | disable_user
+escalation = none
+; Nombre de coupures tolerees avant escalade
+escalation_after_restarts = 2
+; Duree de desactivation du compte en minutes ; 0 = jusqu'a la fin de periode
+escalation_minutes = 0
+
+[users]
+; Quotas individuels, format  jour/semaine/mois  (en minutes).
+; La cle est le nom d'utilisateur Emby (insensible a la casse).
+;   -   = herite de la valeur globale ci-dessus
+;   0   = illimite pour cette periode
+; Formats acceptes :
+;   Enfant1 = 60/300/1200      ; 1h par jour, 5h par semaine, 20h par mois
+;   Enfant2 = 90               ; 1h30 par jour, le reste au defaut
+;   Invite  = -/120/-          ; seulement 2h par semaine
+;   Ado     = daily=120, monthly=1800   ; forme explicite
+; Enfant1 = 60/300/1200
+; Enfant2 = 90
+; Invite = -/120/-
