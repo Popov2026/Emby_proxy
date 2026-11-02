@@ -157,6 +157,40 @@ Sans fenêtre (console) : `py emby_proxy.py`.
    derrière un proxy inverse, pour que les journaux et les limites de débit à
    distance d'Emby utilisent la vraie adresse.
 
+## HTTPS avec un proxy inverse devant
+Configuration conseillée pour l'accès depuis Internet : un relais HTTPS
+(proxy inverse du NAS, Nginx Proxy Manager, Caddy, Traefik…) reçoit les
+utilisateurs sur `https://emby.mondomaine.fr` et transmet au proxy.
+
+```
+ Internet ──► box (443) ──► relais HTTPS ──► Emby Proxy (8097) ──► Emby (8096)
+```
+
+1. **Sur le relais** : une entrée `https://emby.mondomaine.fr` qui pointe vers
+   `http://ADRESSE-DU-PROXY:8097`, avec le WebSocket activé, et qui transmet
+   les en-têtes `X-Forwarded-For`, `X-Forwarded-Proto` et `X-Forwarded-Host`
+   (c'est le réglage par défaut de la plupart des relais).
+2. **Dans `emby_proxy.ini`** : l'adresse du relais **vue par le proxy** dans
+   `trusted_proxies` (par exemple `trusted_proxies = 192.168.1.5/32`, ou
+   `127.0.0.1/32` si le relais tourne sur la même machine).
+3. **Sur la box** : redirige le port 443 vers le **relais**, et **supprime**
+   les redirections vers 8097, 8096 et 8098.
+
+Avec `trusted_proxies` renseigné, le proxy :
+- lit l'adresse réelle de chaque visiteur (bannissements, activité, blocage
+  de l'administration depuis Internet) ;
+- transmet à Emby le schéma `https` et le nom de domaine vus par
+  l'utilisateur ;
+- **refuse les connexions venues d'Internet qui arrivent directement** sur
+  le port 8097 sans passer par le relais, car elles contourneraient le HTTPS
+  (option `require_relay = true`, active par défaut). Le réseau local reste
+  accepté.
+- n'affiche plus l'avertissement « HTTP sans chiffrement ».
+
+Si le relais tourne sur la même machine que le proxy, tu peux en plus mettre
+`listen_host = 127.0.0.1` : le port 8097 n'est alors joignable que par le
+relais. Les appareils de la maison passent alors eux aussi par le relais.
+
 ## Page d'état
 Depuis le réseau local seulement : **`http://ADRESSE-DU-PROXY:8098/`**
 

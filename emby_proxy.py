@@ -101,6 +101,7 @@ DEFAULTS = {
         "rate_per_second": "100",
         "rate_burst": "400",
         "trusted_proxies": "",
+        "require_relay": "true",
     },
     "log": {
         "file": "emby_proxy.log",
@@ -257,6 +258,7 @@ class Settings:
         self.rate = s.getfloat("rate_per_second")
         self.burst = s.getfloat("rate_burst")
         self.trusted = _nets(s.get("trusted_proxies"))
+        self.require_relay = s.getboolean("require_relay")
 
         self.log_file = self._path(base, cp["log"].get("file"))
         self.log_level = cp["log"].get("level", "INFO").upper()
@@ -340,6 +342,10 @@ rate_burst = 400
 # adresses ici : l'adresse reelle du client est alors lue dans
 # X-Forwarded-For.
 trusted_proxies =
+# Avec un relais declare ci-dessus : refuser les connexions venues
+# d'Internet qui arrivent directement sur le proxy sans passer par le relais
+# (elles contourneraient son HTTPS). Le reseau local reste accepte.
+require_relay = true
 
 [log]
 file = emby_proxy.log
@@ -1409,7 +1415,8 @@ class EmbyProxy:
         self.seclog.restore_bans(self.guard, cfg.ban_seconds)
         self.sessions = {}          # jeton de la page d'etat -> expiration
         self.warnings = {}
-        if not cfg.tls_cert and cfg.listen_host not in ("127.0.0.1", "::1", "localhost"):
+        if not cfg.tls_cert and not cfg.trusted and \
+                cfg.listen_host not in ("127.0.0.1", "::1", "localhost"):
             self.warnings["http"] = (
                 "HTTP sans chiffrement : si le proxy est ouvert sur Internet, les "
                 "mots de passe circulent en clair. Configure tls_cert / tls_key, "
@@ -1561,6 +1568,11 @@ class EmbyProxy:
             # (sinon impossible de debannir sa propre adresse)
             return await self._status_gate(request, handler, ip)
         refus = self.guard.check(ip, np)
+        remote = request.remote or ""
+        if not refus and self.cfg.trusted and self.cfg.require_relay \
+                and not self.guard._in(remote, self.cfg.trusted) \
+                and not self.guard.is_local(remote):
+            refus = (403, "Connexion directe refusee : passe par l'adresse HTTPS.")
         if refus:
             self.guard.blocked += 1
             if refus[0] != 429:
@@ -1675,12 +1687,24 @@ class EmbyProxy:
              if k.lower() not in HOP and k.lower() not in drop}
         ip = request[CLIENT_IP]
         prev = request.headers.get("X-Forwarded-For")
-        h["X-Forwarded-For"] = "%s, %s" % (prev, ip) if prev and \
+        # relais de confiance : on prolonge sa chaine avec SON adresse
+        # (visiteur, relais) ; sinon on ignore ce que le client pretend
+        h["X-Forwarded-For"] = "%s, %s" % (prev, request.remote) if prev and \
             self.guard._in(request.remote or "", self.cfg.trusted) else ip
         h["X-Real-IP"] = ip
-        h["X-Forwarded-Proto"] = request.scheme
-        h["X-Forwarded-Host"] = request.host
+        proto, host = self._public_origin(request)
+        h["X-Forwarded-Proto"] = proto
+        h["X-Forwarded-Host"] = host
         return h
+
+    def _public_origin(self, request):
+        """Schema et nom vus par l'utilisateur : ceux du relais HTTPS s'il est
+        de confiance (sinon Emby croirait etre en HTTP)."""
+        proto, host = request.scheme, request.host
+        if self.guard._in(request.remote or "", self.cfg.trusted):
+            proto = request.headers.get("X-Forwarded-Proto", proto).split(",")[0].strip()
+            host = request.headers.get("X-Forwarded-Host", host).split(",")[0].strip()
+        return proto, host
 
     def _rewrite_location(self, value, request):
         """Une redirection d'Emby ne doit pas devoiler son adresse."""
@@ -1792,6 +1816,8 @@ class EmbyProxy:
         headers = {k: v for k, v in request.headers.items() if k.lower() in keep}
         headers["X-Forwarded-For"] = request[CLIENT_IP]
         headers["X-Real-IP"] = request[CLIENT_IP]
+        headers["X-Forwarded-Proto"], headers["X-Forwarded-Host"] = \
+            self._public_origin(request)
         protos = [x.strip() for x in request.headers.get(
             "Sec-WebSocket-Protocol", "").split(",") if x.strip()]
         try:

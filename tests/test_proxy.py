@@ -59,6 +59,8 @@ def fake_emby():
             return web.json_response({"Items": [ITEMS[i] for i in ids if i in ITEMS]})
         return web.json_response({"Items": [{"Name": "Dune"}],
                                   "auth": request.headers.get("X-Emby-Token"),
+                                  "proto": request.headers.get("X-Forwarded-Proto"),
+                                  "host": request.headers.get("X-Forwarded-Host"),
                                   "xff": request.headers.get("X-Forwarded-For")})
 
     async def echo_post(request):
@@ -883,3 +885,40 @@ def test_cle_de_bannissement():
     assert k("1.2.3.4") == "1.2.3.4"
     assert k("::ffff:1.2.3.4") == "1.2.3.4"
     assert k("2a01:e0a:1:2::5") == "2a01:e0a:1:2::/64"
+
+
+
+# ---------------------------------------------------------------------
+#  HTTPS assure par un relais (proxy inverse) place devant
+# ---------------------------------------------------------------------
+async def test_relais_https_devant_le_proxy(env):
+    make, _, _ = env
+    proxy, c = await make(security__trusted_proxies="127.0.0.1/32",
+                          security__local_networks="10.0.0.0/8")
+    assert "http" not in proxy.warnings          # le relais fait le HTTPS
+    relais = {"X-Forwarded-For": "82.64.10.20", "X-Forwarded-Proto": "https",
+              "X-Forwarded-Host": "emby.exemple.fr"}
+    d = await (await c.get("/emby/Users/u1/Items", headers=relais)).json()
+    assert d["xff"] == "82.64.10.20, 127.0.0.1"    # visiteur, puis relais
+    assert d["proto"] == "https" and d["host"] == "emby.exemple.fr"
+    # depuis Internet, l'administration reste bloquee (le visiteur n'est pas local)
+    r = await c.get("/emby/System/Configuration", headers=relais)
+    assert r.status == 403
+
+
+async def test_connexion_directe_sans_relais_refusee(env):
+    make, _, _ = env
+    # relais declare ailleurs (192.0.2.1) ; 127.0.0.1 joue un visiteur d'Internet
+    proxy, c = await make(security__trusted_proxies="192.0.2.1/32",
+                          security__local_networks="10.0.0.0/8")
+    r = await c.get("/emby/Users/u1/Items")
+    assert r.status == 403 and "HTTPS" in await r.text()
+    assert proxy.seclog.events[-1]["type"] == "refused"
+    # sans l'option, la connexion directe passe
+    _, c2 = await make(security__trusted_proxies="192.0.2.1/32",
+                       security__local_networks="10.0.0.0/8",
+                       security__require_relay="false")
+    assert (await c2.get("/emby/Users/u1/Items")).status == 200
+    # depuis le reseau local, la connexion directe reste permise
+    _, c3 = await make(security__trusted_proxies="192.0.2.1/32")
+    assert (await c3.get("/emby/Users/u1/Items")).status == 200
