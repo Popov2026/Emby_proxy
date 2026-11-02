@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2426,7 +2426,13 @@ class _NotifyingStore:
 #  PROXY
 # =====================================================================
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-       "te", "trailer", "trailers", "transfer-encoding", "upgrade", "host"}
+       "te", "trailer", "trailers", "transfer-encoding", "upgrade", "host", "expect"}
+# recalcules par le proxy : jamais recopies depuis le client (sinon en double,
+# l'un en minuscules, l'autre non, et Emby lirait celui du client)
+FORWARD_HDRS = {"x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarded-host"}
+# Emby y annonce sa propre adresse : les applis (Android TV...) s'en servent
+# pour se reconnecter, en contournant le proxy
+RE_SYSINFO = re.compile(r"^/System/Info(?:/Public)?/?$", re.I)
 CHUNK = 256 * 1024
 try:                                     # aiohttp >= 3.11
     CLIENT_IP = web.RequestKey("client_ip", str)
@@ -2899,7 +2905,8 @@ class EmbyProxy:
 
     def _up_headers(self, request, drop=()):
         h = {k: v for k, v in request.headers.items()
-             if k.lower() not in HOP and k.lower() not in drop}
+             if k.lower() not in HOP and k.lower() not in drop
+             and k.lower() not in FORWARD_HDRS}
         ip = request[CLIENT_IP]
         prev = request.headers.get("X-Forwarded-For")
         # relais de confiance : on prolonge sa chaine avec SON adresse
@@ -2967,8 +2974,21 @@ class EmbyProxy:
                 body_json = json.loads(data or b"{}")
             except ValueError:
                 body_json = None
+            if body_json is None and "form" in request.headers.get("Content-Type", ""):
+                # applis Android : identifiants envoyes en formulaire
+                try:
+                    body_json = dict(parse_qsl(data.decode("utf-8", "replace")))
+                except ValueError:
+                    body_json = None
         if act and act.wants_body(request):
-            headers["Accept-Encoding"] = "gzip, deflate"
+            # pour lire la reponse : compression seulement si l'appli l'accepte
+            # elle-meme (une appli qui ne l'attend pas ne pourrait pas la lire)
+            acc = {x.split(";")[0].strip().lower() for x in
+                   request.headers.get("Accept-Encoding", "").split(",")}
+            for k in [k for k in headers if k.lower() == "accept-encoding"]:
+                del headers[k]
+            headers["Accept-Encoding"] = ", ".join(
+                x for x in ("gzip", "deflate") if x in acc) or "identity"
         try:
             up = await self.session.request(
                 request.method, url, headers=headers,
@@ -2990,6 +3010,9 @@ class EmbyProxy:
         try:
             if is_login and up.status in (200, 401, 403):
                 self._record_login(request, body_json, up.status == 200)
+            if request.method == "GET" and up.status == 200 and RE_SYSINFO.match(np) \
+                    and "json" in up.headers.get("Content-Type", ""):
+                return await self._sysinfo(request, up)
             resp = web.StreamResponse(status=up.status, reason=up.reason)
             for k, v in up.headers.items():
                 lk = k.lower()
@@ -3022,6 +3045,29 @@ class EmbyProxy:
             if act and todo:
                 act.after(c, todo, up.status)
             up.release()
+
+    async def _sysinfo(self, request, up):
+        """Infos du serveur : les adresses d'Emby remplacees par celle du proxy,
+        vue par l'utilisateur (sinon les applis se reconnectent en direct)."""
+        raw = await up.read()
+        try:
+            data = json.loads(_decode(raw, up.headers.get("Content-Encoding")))
+        except (ValueError, OSError, zlib.error):
+            data = None
+        if not isinstance(data, dict):
+            resp = web.Response(status=200, body=raw)
+            for k, v in up.headers.items():
+                if k.lower() not in HOP and k.lower() != "content-length":
+                    resp.headers.add(k, v)
+            return resp
+        origin = "%s://%s" % self._public_origin(request)
+        for k in ("LocalAddress", "WanAddress"):
+            if k in data:
+                data[k] = origin
+        for k in ("LocalAddresses", "RemoteAddresses"):
+            if k in data:
+                data[k] = [origin]
+        return web.json_response(data, headers={"Cache-Control": "no-cache"})
 
     def _record_login(self, request, body, ok):
         ip = request[CLIENT_IP]

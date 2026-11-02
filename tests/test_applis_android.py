@@ -1,0 +1,146 @@
+"""Applis natives (Android TV...) : ce qu'elles envoient doit arriver a Emby
+tel qu'Emby l'attend, et la reponse doit leur rester lisible."""
+import gzip
+import json
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+import emby_proxy as ep
+
+UID = "b" * 32
+AUTH = ('Emby UserId="", Client="Android TV", Device="SHIELD", '
+        'DeviceId="abc123", Version="2.0.95"')
+
+
+def fake_emby(seen):
+    app = web.Application()
+
+    def maybe_gzip(request, obj):
+        body = json.dumps(obj).encode()
+        if "gzip" in request.headers.get("Accept-Encoding", ""):
+            return web.Response(body=gzip.compress(body), headers={
+                "Content-Type": "application/json", "Content-Encoding": "gzip"})
+        return web.Response(body=body, content_type="application/json")
+
+    async def login(request):
+        seen["login_headers"] = request.headers.copy()
+        form = await request.post()
+        seen["form"] = dict(form)
+        if form.get("Username") == "tv" and form.get("Pw") == "bon":
+            return maybe_gzip(request, {"AccessToken": "TOKTV",
+                                        "User": {"Id": UID, "Name": "tv"}})
+        return web.Response(status=401)
+
+    async def info_public(request):
+        seen["info_headers"] = request.headers.copy()
+        return maybe_gzip(request, {
+            "ServerName": "NAS", "Version": "4.8.11.0", "Id": "srv1",
+            "LocalAddress": "http://192.168.1.10:8096",
+            "WanAddress": "http://90.1.2.3:8096",
+            "LocalAddresses": ["http://192.168.1.10:8096"],
+            "RemoteAddresses": ["http://90.1.2.3:8096"]})
+
+    async def user(request):
+        return maybe_gzip(request, {"Id": UID, "Name": "tv"})
+
+    app.router.add_post("/emby/Users/AuthenticateByName", login)
+    app.router.add_get("/emby/System/Info/Public", info_public)
+    app.router.add_get("/System/Info/Public", info_public)
+    app.router.add_get("/emby/Users/{uid}", user)
+    return app
+
+
+@pytest.fixture
+async def env(aiohttp_server, tmp_path):
+    seen = {}
+    srv = await aiohttp_server(fake_emby(seen))
+    cfg = ep.Settings(tmp_path / "absent.ini", overrides={
+        ("proxy", "upstream"): str(srv.make_url("")).rstrip("/"),
+        ("cache", "dir"): str(tmp_path / "cache"), ("log", "file"): "",
+        ("status", "port"): "0"})
+    proxy = ep.EmbyProxy(cfg)
+    c = TestClient(TestServer(proxy.build_app()), auto_decompress=False)
+    await c.start_server()
+    yield proxy, c, seen
+    await c.close()
+
+
+async def test_connexion_android_tv_sans_compression(env):
+    """L'appli n'annonce pas gzip : la reponse doit lui arriver en clair."""
+    proxy, c, seen = env
+    r = await c.post("/emby/Users/AuthenticateByName?format=json",
+                     data="Username=tv&Pw=bon",
+                     headers={"X-Emby-Authorization": AUTH,
+                              "Content-Type": "application/x-www-form-urlencoded",
+                              "Accept-Encoding": "identity"})
+    assert r.status == 200
+    assert "Content-Encoding" not in r.headers
+    assert json.loads(await r.read())["AccessToken"] == "TOKTV"
+    assert seen["form"] == {"Username": "tv", "Pw": "bon"}
+    assert seen["login_headers"].get("Accept-Encoding") == "identity"
+    # nom tape visible dans l'onglet Securite
+    ev = proxy.seclog.events[-1]
+    assert ev["type"] == "login_ok" and ev["user"] == "tv"
+    assert ev["client"] == "Android TV" and ev["device"] == "SHIELD"
+
+
+async def test_connexion_avec_compression_acceptee(env):
+    proxy, c, seen = env
+    r = await c.post("/emby/Users/AuthenticateByName",
+                     data="Username=tv&Pw=bon",
+                     headers={"X-Emby-Authorization": AUTH,
+                              "Content-Type": "application/x-www-form-urlencoded",
+                              "Accept-Encoding": "gzip"})
+    assert r.headers.get("Content-Encoding") == "gzip"
+    assert json.loads(gzip.decompress(await r.read()))["AccessToken"] == "TOKTV"
+    # l'activite a quand meme appris le nom de l'utilisateur
+    assert proxy.activity.info.users.get(UID) == "tv"
+
+
+async def test_mot_de_passe_faux_en_formulaire(env):
+    proxy, c, _ = env
+    r = await c.post("/emby/Users/AuthenticateByName", data="Username=tv&Pw=faux",
+                     headers={"X-Emby-Authorization": AUTH,
+                              "Content-Type": "application/x-www-form-urlencoded"})
+    assert r.status == 401
+    ev = proxy.seclog.events[-1]
+    assert ev["type"] == "login_fail" and ev["user"] == "tv"
+
+
+@pytest.mark.parametrize("path", ["/emby/System/Info/Public", "/System/Info/Public"])
+async def test_adresses_d_emby_remplacees_par_le_proxy(env, path):
+    """Sinon l'appli Android TV se reconnecte directement a Emby."""
+    proxy, c, _ = env
+    r = await c.get(path, headers={"Accept-Encoding": "gzip"})
+    assert r.status == 200
+    d = json.loads(await r.read())
+    me = str(c.make_url("")).rstrip("/")
+    assert d["LocalAddress"] == me and d["WanAddress"] == me
+    assert d["LocalAddresses"] == [me] and d["RemoteAddresses"] == [me]
+    assert d["Id"] == "srv1" and d["ServerName"] == "NAS"
+    assert "192.168.1.10" not in json.dumps(d) and "90.1.2.3" not in json.dumps(d)
+
+
+async def test_adresse_publique_du_relais_https(env):
+    proxy, c, _ = env
+    proxy.cfg.trusted = ep._nets("127.0.0.1/32")
+    r = await c.get("/emby/System/Info/Public", headers={
+        "X-Forwarded-For": "8.8.8.8", "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "emby.exemple.fr"})
+    d = json.loads(await r.read())
+    assert d["WanAddress"] == "https://emby.exemple.fr"
+
+
+async def test_en_tetes_de_relais_jamais_en_double(env):
+    """Un client qui envoie x-forwarded-for en minuscules ne doit pas faire
+    passer sa propre version a Emby."""
+    proxy, c, seen = env
+    await c.get("/emby/System/Info/Public", headers={
+        "x-forwarded-for": "1.1.1.1", "x-real-ip": "1.1.1.1",
+        "Expect": "100-continue"})
+    h = seen["info_headers"]
+    assert h.getall("X-Forwarded-For") == ["127.0.0.1"]
+    assert h.getall("X-Real-IP") == ["127.0.0.1"]
+    assert "Expect" not in h
