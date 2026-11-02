@@ -144,3 +144,67 @@ async def test_en_tetes_de_relais_jamais_en_double(env):
     assert h.getall("X-Forwarded-For") == ["127.0.0.1"]
     assert h.getall("X-Real-IP") == ["127.0.0.1"]
     assert "Expect" not in h
+
+
+async def test_relais_local_non_declare_annonce_https(env):
+    """Relais HTTPS sur le reseau local mais pas (encore) declare : l'adresse
+    annoncee doit quand meme etre en https, sinon la lecture echoue."""
+    proxy, c, seen = env
+    assert not proxy.cfg.trusted
+    r = await c.get("/emby/System/Info/Public", headers={
+        "X-Forwarded-For": "8.8.8.8", "X-Forwarded-Proto": "https",
+        "Host": "emby.example.com"})
+    d = json.loads(await r.read())
+    assert d["WanAddress"] == "https://emby.example.com"
+    assert d["LocalAddress"] == "https://emby.example.com"
+    assert seen["info_headers"]["X-Forwarded-Proto"] == "https"
+    # l'adresse du visiteur, elle, n'est reprise que d'un relais declare
+    assert seen["info_headers"]["X-Forwarded-For"] == "127.0.0.1"
+
+
+async def test_relais_sans_schema_aucune_fausse_adresse(env):
+    """Relais qui ne dit pas s'il est en HTTPS : pas d'adresse plutot qu'une
+    adresse http fausse (l'appli garde celle qu'on lui a donnee)."""
+    proxy, c, _ = env
+    r = await c.get("/emby/System/Info/Public", headers={
+        "X-Forwarded-For": "8.8.8.8", "Host": "emby.example.com"})
+    d = json.loads(await r.read())
+    for k in ("LocalAddress", "WanAddress", "LocalAddresses", "RemoteAddresses"):
+        assert k not in d
+    assert d["Id"] == "srv1"
+
+
+async def test_demande_de_lecture_envoyee_entiere(aiohttp_server, tmp_path):
+    """PlaybackInfo et son gros profil d'appareil, meme envoye en morceaux par
+    l'appli : Emby recoit tout, avec la longueur exacte."""
+    got = {}
+
+    async def pbinfo(request):
+        got["cl"] = request.headers.get("Content-Length")
+        got["te"] = request.headers.get("Transfer-Encoding")
+        got["body"] = await request.read()
+        return web.json_response({"MediaSources": [{"Id": "m1"}]})
+    app = web.Application()
+    app.router.add_post("/emby/Items/{id}/PlaybackInfo", pbinfo)
+    srv = await aiohttp_server(app)
+    cfg = ep.Settings(tmp_path / "absent.ini", overrides={
+        ("proxy", "upstream"): str(srv.make_url("")).rstrip("/"),
+        ("cache", "dir"): str(tmp_path / "cache"), ("log", "file"): "",
+        ("status", "port"): "0"})
+    c = TestClient(TestServer(ep.EmbyProxy(cfg).build_app()))
+    await c.start_server()
+    try:
+        profil = json.dumps({"DeviceProfile": {"x": "y" * 300_000}}).encode()
+
+        async def morceaux():
+            for i in range(0, len(profil), 4096):
+                yield profil[i:i + 4096]
+        r = await c.post("/emby/Items/42/PlaybackInfo?UserId=u&IsPlayback=true",
+                         data=morceaux(), headers={"Content-Type": "application/json",
+                                                   "X-Emby-Authorization": AUTH})
+        assert r.status == 200
+        assert (await r.json())["MediaSources"][0]["Id"] == "m1"
+        assert got["body"] == profil
+        assert got["cl"] == str(len(profil)) and got["te"] is None
+    finally:
+        await c.close()

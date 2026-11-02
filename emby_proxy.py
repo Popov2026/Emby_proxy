@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.2"
+__version__ = "2.1.3"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3003,14 +3003,27 @@ class EmbyProxy:
                 % (self.cfg.upstream, admin, admin))
         return web.Response(status=502, text=html, content_type="text/html")
 
-    def _public_origin(self, request):
-        """Schema et nom vus par l'utilisateur : ceux du relais HTTPS s'il est
-        de confiance (sinon Emby croirait etre en HTTP)."""
+    def _relay_peer(self, request):
+        """La connexion vient d'un relais (proxy inverse) : declare, ou sur le
+        reseau local. Seule l'adresse du visiteur (X-Forwarded-For) exige un
+        relais declare ; le schema et le nom public d'un relais local sont
+        toujours repris (ils ne servent qu'a ecrire des adresses)."""
+        remote = request.remote or ""
+        return self.guard._in(remote, self.cfg.trusted) or self.guard.is_local(remote)
+
+    def _public_origin(self, request, certain=False):
+        """Schema et nom vus par l'utilisateur (https://emby.exemple.fr derriere
+        un relais HTTPS). certain=True : renvoie aussi si on en est sur."""
         proto, host = request.scheme, request.host
-        if self.guard._in(request.remote or "", self.cfg.trusted):
-            proto = request.headers.get("X-Forwarded-Proto", proto).split(",")[0].strip()
-            host = request.headers.get("X-Forwarded-Host", host).split(",")[0].strip()
-        return proto, host
+        sure = "X-Forwarded-For" not in request.headers     # connexion directe
+        if self._relay_peer(request):
+            fp = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+            fh = request.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
+            if fp.lower() in ("http", "https"):
+                proto, sure = fp.lower(), True
+            if fh:
+                host = fh
+        return (proto, host, sure) if certain else (proto, host)
 
     def _rewrite_location(self, value, request):
         """Une redirection d'Emby ne doit pas devoiler son adresse."""
@@ -3043,6 +3056,18 @@ class EmbyProxy:
                     body_json = dict(parse_qsl(data.decode("utf-8", "replace")))
                 except ValueError:
                     body_json = None
+        elif request.body_exists and request.method in ("POST", "PUT", "PATCH",
+                                                         "DELETE"):
+            # Corps lu en entier puis envoye a Emby avec sa longueur exacte
+            # (demande de lecture PlaybackInfo et son profil d'appareil...) :
+            # jamais "en morceaux", que certains serveurs lisent mal.
+            cl = request.content_length
+            if cl is None or cl <= 8 * 1024 * 1024:
+                try:
+                    data = await read_limited(request, cl if cl is not None
+                                              else 32 * 1024 * 1024)
+                except TooLarge:
+                    return web.Response(status=413, text="Requete trop grosse.")
         if act and act.wants_body(request):
             # pour lire la reponse : compression seulement si l'appli l'accepte
             # elle-meme (une appli qui ne l'attend pas ne pourrait pas la lire)
@@ -3123,13 +3148,17 @@ class EmbyProxy:
                 if k.lower() not in HOP and k.lower() != "content-length":
                     resp.headers.add(k, v)
             return resp
-        origin = "%s://%s" % self._public_origin(request)
-        for k in ("LocalAddress", "WanAddress"):
-            if k in data:
-                data[k] = origin
-        for k in ("LocalAddresses", "RemoteAddresses"):
-            if k in data:
-                data[k] = [origin]
+        proto, host, sure = self._public_origin(request, certain=True)
+        origin = "%s://%s" % (proto, host)
+        for k in ("LocalAddress", "WanAddress", "LocalAddresses", "RemoteAddresses"):
+            if k not in data:
+                continue
+            if not sure:
+                # relais qui ne dit pas s'il est en HTTPS : aucune adresse plutot
+                # qu'une fausse (l'appli garde celle qu'on lui a donnee)
+                del data[k]
+            else:
+                data[k] = [origin] if k.endswith("es") else origin
         return web.json_response(data, headers={"Cache-Control": "no-cache"})
 
     def _record_login(self, request, body, ok):
