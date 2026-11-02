@@ -230,8 +230,8 @@ async def test_demande_de_lecture_envoyee_entiere(aiohttp_server, tmp_path):
     ({"MediaSources": [{"SupportsDirectPlay": False, "SupportsDirectStream": False,
                         "TranscodingUrl": "/videos/9/master.m3u8?TranscodeReasons="
                                           "ContainerBitrateExceedsLimit"}]}, 200,
-     "Demande de lecture : Argylle (2024) → transcodage "
-     "(ContainerBitrateExceedsLimit)"),
+     "Demande de lecture : Argylle (2024) \u2192 pr\u00e9vu : vid\u00e9o transcod\u00e9e, "
+     "son copi\u00e9 \u2014 raisons : ContainerBitrateExceedsLimit"),
     ({"ErrorCode": "NoCompatibleStream", "MediaSources": []}, 200,
      "Demande de lecture : Argylle (2024) → REFUSEE par Emby : NoCompatibleStream"),
     ({"x": 1}, 500, "Demande de lecture : Argylle (2024) → erreur Emby HTTP 500"),
@@ -330,3 +330,41 @@ async def test_option_emby_voit_tout_le_monde_en_local(env):
     await c.post("/emby/Users/AuthenticateByName", data="Username=tv&Pw=faux",
                  headers=dict(hdr, **{"Content-Type": "application/x-www-form-urlencoded"}))
     assert proxy.seclog.events[-1]["ip"] == "83.204.193.128"
+
+
+async def test_infos_serveur_gardent_les_autorisations_cors(aiohttp_server, tmp_path):
+    """L'appli iPhone (navigateur integre) a besoin des en-tetes CORS d'Emby
+    sur la reponse System/Info/Public reecrite par le proxy."""
+    async def info(request):
+        return web.json_response(
+            {"Id": "srv1", "LocalAddress": "http://192.168.1.10:8096"},
+            headers={"Access-Control-Allow-Origin": "*",
+                     "Access-Control-Allow-Headers": "Accept, Content-Type, X-Emby-Authorization",
+                     "Access-Control-Allow-Methods": "GET, POST, OPTIONS"})
+
+    async def img(request):
+        return web.Response(body=b"\x89PNG", content_type="image/png",
+                            headers={"Access-Control-Allow-Origin": "*"})
+    app = web.Application()
+    app.router.add_get("/emby/System/Info/Public", info)
+    app.router.add_get("/emby/Items/{id}/Images/{k}", img)
+    srv = await aiohttp_server(app)
+    cfg = ep.Settings(tmp_path / "absent.ini", overrides={
+        ("proxy", "upstream"): str(srv.make_url("")).rstrip("/"),
+        ("cache", "dir"): str(tmp_path / "cache"), ("log", "file"): "",
+        ("status", "port"): "0"})
+    c = TestClient(TestServer(ep.EmbyProxy(cfg).build_app()))
+    await c.start_server()
+    try:
+        r = await c.get("/emby/System/Info/Public",
+                        headers={"Origin": "ionic://localhost"})
+        assert r.headers.get("Access-Control-Allow-Origin") == "*"
+        assert "X-Emby-Authorization" in r.headers.get("Access-Control-Allow-Headers", "")
+        assert (await r.json())["Id"] == "srv1"
+        for etat in ("MISS", "HIT"):              # vignette : aussi depuis le cache
+            r = await c.get("/emby/Items/5/Images/Primary?tag=t",
+                            headers={"Origin": "ionic://localhost"})
+            assert r.headers["X-Proxy-Cache"] == etat
+            assert r.headers.get("Access-Control-Allow-Origin") == "*"
+    finally:
+        await c.close()

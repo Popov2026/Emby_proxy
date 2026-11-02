@@ -384,7 +384,7 @@ async def test_activite_navigation_et_lecture(env):
     assert u["location"] == "Fiche : Dune : Deuxieme partie (2024)"
     pl = u["playing"]
     assert pl["title"] == "Dune : Deuxieme partie (2024)" and pl["paused"]
-    assert pl["mode"] == "transcodage" and pl["pos"] == "10:00"
+    assert pl["mode"] == "flux Emby HLS" and pl["pos"] == "10:00"
     assert pl["duration"] == "2:46:00" and pl["percent"] == 6.0
     texts = [e["text"] for e in u["events"]]
     assert "Connexion reussie (Paul)" in texts
@@ -394,7 +394,7 @@ async def test_activite_navigation_et_lecture(env):
     assert "Parcourt : Films (Movie, tri DateCreated)" in texts
     assert [t for t in texts if t.startswith("Recherche")] == [
         "Recherche : \u00ab oppen \u00bb"]
-    assert "Lecture : Dune : Deuxieme partie (2024) (transcodage)" in texts
+    assert "Lecture : Dune : Deuxieme partie (2024) (flux Emby HLS)" in texts
     assert "Pause : Dune : Deuxieme partie (2024)" in texts
     assert "Ajoute aux favoris : Dune : Deuxieme partie (2024)" in texts
 

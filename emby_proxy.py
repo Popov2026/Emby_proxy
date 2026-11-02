@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.9"
+__version__ = "2.2.0"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1398,6 +1398,25 @@ TICKS = 10_000_000
 X = "\x00"            # remplace par le nom de l'element a l'affichage
 
 
+# Raisons de transcodage d'Emby : ce qu'elles obligent a convertir
+_VIDEO_REASONS = re.compile(r"^(?:Video|RefFrames|Anamorphic|Interlaced|UnknownVideo|"
+                            r"Subtitle|ContainerBitrate|DirectPlayError)", re.I)
+_AUDIO_REASONS = re.compile(r"^(?:Audio|SecondaryAudio|UnknownAudio)", re.I)
+
+
+def transcode_label(video_copied, audio_copied, vcodec="", acodec=""):
+    """Ce qu'Emby fait de la video et du son, en clair."""
+    vc = " (\u2192 %s)" % vcodec if vcodec else ""
+    ac = " (\u2192 %s)" % acodec if acodec else ""
+    if video_copied and audio_copied:
+        return "changement de conteneur (vid\u00e9o et son copi\u00e9s)"
+    if audio_copied:
+        return "vid\u00e9o transcod\u00e9e%s, son copi\u00e9" % vc
+    if video_copied:
+        return "son transcod\u00e9%s, vid\u00e9o copi\u00e9e" % ac
+    return "vid\u00e9o%s et son%s transcod\u00e9s" % (vc, ac)
+
+
 def _hms(seconds):
     s = int(max(0, seconds or 0))
     h, m, s = s // 3600, s % 3600 // 60, s % 60
@@ -1486,6 +1505,7 @@ class Activity:
         self.log_path = cfg.activity_log
         self._log_lock = threading.Lock()
         self.on_delete = None
+        self.on_play = None         # verification aupres d'Emby (posee par le proxy)
 
     # -- identification ------------------------------------------------
     @staticmethod
@@ -1742,7 +1762,9 @@ class Activity:
             elif kind == "stream" and ok:
                 item, q = arg
                 if not c.playing or c.playing["item"] != item:
-                    mode = "transcodage" if q.get("VideoCodec") and \
+                    # flux prepare par Emby (HLS...) : conversion OU simple
+                    # changement de conteneur ; le detail est demande a Emby
+                    mode = "flux Emby HLS" if q.get("VideoCodec") and \
                         q.get("Static", "").lower() != "true" else "direct"
                     self._start_play(c, item, mode, 0, False)
             elif kind == "download" and ok:
@@ -1779,12 +1801,14 @@ class Activity:
         c.playing = {"item": item, "mode": mode, "pos": pos, "paused": paused,
                      "started": time.time(), "updated": time.time()}
         self.event(c, "play", "Lecture : %s (%s)" % (X, mode), item, merge=600)
+        if self.on_play:
+            self.on_play(c, item)
 
     def _playing(self, c, what, body):
         item = str(body.get("ItemId") or (c.playing or {}).get("item") or "")
         pos = (body.get("PositionTicks") or 0) / TICKS
         mode = {"DirectPlay": "lecture directe", "DirectStream": "flux direct",
-                "Transcode": "transcodage"}.get(body.get("PlayMethod"), "")
+                "Transcode": "flux Emby HLS"}.get(body.get("PlayMethod"), "")
         if what == "start" and c.playing and c.playing["item"] == item:
             # flux deja vu : on complete seulement (mode exact, position)
             c.playing.update(mode=mode or c.playing["mode"], pos=pos,
@@ -1844,9 +1868,14 @@ class Activity:
         if s.get("SupportsDirectStream"):
             return False, "flux direct" + info
         if s.get("TranscodingUrl"):
-            q = dict(parse_qsl(urlsplit(s["TranscodingUrl"]).query))
-            why = q.get("TranscodeReasons") or q.get("transcodereasons") or ""
-            return False, ("transcodage (%s)" % why if why else "transcodage") + info
+            q = {k.lower(): v for k, v in
+                 parse_qsl(urlsplit(s["TranscodingUrl"]).query)}
+            why = q.get("transcodereasons", "")
+            reasons = [r for r in why.split(",") if r]
+            video = any(_VIDEO_REASONS.match(r) for r in reasons)
+            audio = any(_AUDIO_REASONS.match(r) for r in reasons)
+            label = "pr\u00e9vu : " + transcode_label(not video, not audio)
+            return False, label + (" \u2014 raisons : %s" % why if why else "") + info
         return True, "REFUSEE par Emby : ni lecture directe ni transcodage possible" + info
 
     def learn_response(self, c, request, data):
@@ -2660,6 +2689,7 @@ class EmbyProxy:
         self.seclog.on_event = self._security_event
         if self.activity is not None:
             self.activity.on_delete = self._delete_event
+            self.activity.on_play = self._schedule_play_check
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
@@ -2795,6 +2825,66 @@ class EmbyProxy:
             for auth, ids in groups.items():
                 for i in range(0, len(ids), 50):
                     await self._resolve(auth, ids[i:i + 50])
+
+    # -- lecture reelle, demandee a Emby -----------------------------------
+    def _schedule_play_check(self, c, item):
+        if not self.cfg.api_key or not c.device_id:
+            return
+        key = (c.key, item)
+        pending = self.__dict__.setdefault("_play_checks", set())
+        if key in pending:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._play_check(c, item))
+        except RuntimeError:
+            return
+        pending.add(key)
+        task.add_done_callback(lambda t: pending.discard(key))
+        self._tasks.append(task)
+
+    async def _play_check(self, c, item, delays=(4, 8, 15)):
+        """Quelques secondes apres le debut d'une lecture, Emby dit ce qu'il fait
+        vraiment (liste des sessions) : video et son copies ou convertis."""
+        for d in delays:
+            await asyncio.sleep(d)
+            try:
+                async with self.session.get(
+                        "%s/emby/Sessions" % self.cfg.upstream,
+                        params={"api_key": self.cfg.api_key,
+                                "DeviceId": c.device_id},
+                        timeout=ClientTimeout(total=10)) as r:
+                    raw = await r.read()
+                    if r.status != 200:
+                        return
+                    sessions = json.loads(_decode(raw, r.headers.get("Content-Encoding")))
+            except (ClientError, asyncio.TimeoutError, OSError, ValueError):
+                return
+            for sess in sessions if isinstance(sessions, list) else []:
+                if sess.get("DeviceId") != c.device_id:
+                    continue
+                now = sess.get("NowPlayingItem") or {}
+                if not now:
+                    continue
+                if now.get("Id") and str(now["Id"]) != str(item):
+                    continue
+                method = (sess.get("PlayState") or {}).get("PlayMethod") or ""
+                ti = sess.get("TranscodingInfo") or {}
+                why = ", ".join(ti.get("TranscodeReasons") or [])
+                if method == "DirectPlay":
+                    label = "lecture directe"
+                elif not ti:
+                    label = "flux direct"
+                else:
+                    label = transcode_label(bool(ti.get("IsVideoDirect")),
+                                            bool(ti.get("IsAudioDirect")),
+                                            ti.get("VideoCodec") or "",
+                                            ti.get("AudioCodec") or "")
+                if c.playing and c.playing.get("item") == item:
+                    c.playing["mode"] = label
+                self.activity.event(c, "play", "Emby : %s \u2192 %s%s" % (
+                    X, label, " \u2014 raisons : %s" % why if why else ""),
+                    item, merge=600)
+                return
 
     async def _resolve_users(self):
         """Nom des utilisateurs vus sans connexion (appli deja connectee avant
@@ -3266,7 +3356,16 @@ class EmbyProxy:
                 del data[k]
             else:
                 data[k] = [origin] if k.endswith("es") else origin
-        return web.json_response(data, headers={"Cache-Control": "no-cache"})
+        # en-tetes d'Emby gardes (autorisations CORS surtout : sans elles,
+        # l'appli iPhone, construite sur un navigateur integre, rejette la
+        # reponse et ne peut pas se connecter)
+        resp = web.json_response(data)
+        for k, v in up.headers.items():
+            if k.lower() not in HOP and k.lower() not in (
+                    "content-length", "content-encoding", "content-type"):
+                resp.headers.add(k, v)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
     def _record_login(self, request, body, ok):
         ip = request[CLIENT_IP]
@@ -3345,6 +3444,8 @@ class EmbyProxy:
                                               "style-src 'unsafe-inline'; sandbox"}
         if meta.get("last_modified"):
             headers["Last-Modified"] = meta["last_modified"]
+        # autorisations CORS d'Emby (applis construites sur un navigateur)
+        headers.update(meta.get("cors") or {"Access-Control-Allow-Origin": "*"})
         inm = request.headers.get("If-None-Match", "")
         if etag and etag in [x.strip() for x in inm.split(",")]:
             return web.Response(status=304, headers=headers)
@@ -3422,7 +3523,9 @@ class EmbyProxy:
                 "etag": '"%s"' % hashlib.sha1(body).hexdigest()[:20],
                 "last_modified": up.headers.get("Last-Modified", ""),
                 "expires": time.time() + ttl, "max_age": int(min(ttl, 86400 * 30)),
-                "key": key, "stored": time.time()}
+                "key": key, "stored": time.time(),
+                "cors": {k: v for k, v in up.headers.items()
+                         if k.lower().startswith("access-control-")}}
         if len(body) <= self.cfg.item_max:
             try:
                 await asyncio.get_running_loop().run_in_executor(
