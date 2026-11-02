@@ -1,0 +1,14 @@
+services:
+  emby-proxy:
+    build: .
+    container_name: emby-proxy
+    restart: unless-stopped
+    ports:
+      - "8097:8097"
+    environment:
+      # Adresse du vrai serveur Emby, vue depuis le conteneur.
+      EMBY_PROXY_UPSTREAM: "http://192.168.1.10:8096"
+      # Taille maximale du cache des vignettes, en Mo.
+      EMBY_PROXY_CACHE_MB: "4096"
+    volumes:
+      - ./data:/data

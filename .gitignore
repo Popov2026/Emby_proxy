@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+emby_proxy.ini
+emby_proxy.log
+cache_images/
+data/
+*.pem
