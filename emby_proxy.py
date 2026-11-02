@@ -473,6 +473,213 @@ def ensure_status_password(path, cfg):
 
 
 # =====================================================================
+#  REGLAGES MODIFIABLES DEPUIS LA PAGE D'ADMINISTRATION
+# =====================================================================
+# type : url, secret, text, int, float, bool, nets, choice
+# live : True = applique tout de suite ; False = au redemarrage du proxy
+CONFIG_SCHEMA = [
+    {"id": "emby", "title": "Serveur Emby", "fields": [
+        {"sec": "proxy", "key": "upstream", "type": "url", "live": True,
+         "label": "Adresse du serveur Emby",
+         "help": "Vue depuis la machine du proxy, ex. http://192.168.1.234:8096. "
+                 "Les utilisateurs ne la voient jamais."},
+        {"sec": "emby", "key": "api_key", "type": "secret", "live": True,
+         "label": "Clé API Emby (facultative)",
+         "help": "Emby : Tableau de bord › Avancé › Clés API. Sert à afficher le nom "
+                 "de tous les films dans l'activité."},
+    ]},
+    {"id": "proxy", "title": "Proxy", "fields": [
+        {"sec": "proxy", "key": "listen_port", "type": "int", "min": 1, "max": 65535,
+         "live": False, "label": "Port des utilisateurs",
+         "help": "Port sur lequel les applications Emby se connectent (8097)."},
+        {"sec": "proxy", "key": "listen_host", "type": "text", "live": False,
+         "label": "Adresse d'écoute",
+         "help": "0.0.0.0 = toutes les cartes réseau ; 127.0.0.1 = seulement un "
+                 "relais HTTPS sur cette machine."},
+        {"sec": "proxy", "key": "tls_cert", "type": "text", "live": False,
+         "label": "Certificat HTTPS (fichier PEM)",
+         "help": "Vide si le HTTPS est fait par un relais (proxy inverse) devant."},
+        {"sec": "proxy", "key": "tls_key", "type": "text", "live": False,
+         "label": "Clé du certificat (fichier PEM)", "help": ""},
+    ]},
+    {"id": "cache", "title": "Cache des vignettes", "fields": [
+        {"sec": "cache", "key": "max_size_mb", "type": "float", "min": 10,
+         "max": 10_000_000, "live": True, "label": "Taille maximale du cache (Mo)",
+         "help": "Au-delà, les vignettes les moins vues sont effacées."},
+        {"sec": "cache", "key": "max_item_mb", "type": "float", "min": 0.1, "max": 500,
+         "live": True, "label": "Taille maximale d'une image gardée (Mo)", "help": ""},
+        {"sec": "cache", "key": "ttl_tagged_days", "type": "float", "min": 0,
+         "max": 3650, "live": True, "label": "Durée de vie d'une image avec empreinte (jours)",
+         "help": "Emby change l'adresse d'une image quand elle change : durée longue "
+                 "sans risque."},
+        {"sec": "cache", "key": "ttl_untagged_hours", "type": "float", "min": 0,
+         "max": 8760, "live": True, "label": "Durée de vie d'une image sans empreinte (heures)",
+         "help": ""},
+        {"sec": "cache", "key": "serve_stale_on_error", "type": "bool", "live": True,
+         "label": "Emby en panne : afficher quand même les vignettes déjà vues", "help": ""},
+        {"sec": "cache", "key": "dir", "type": "text", "live": False,
+         "label": "Dossier du cache", "help": ""},
+    ]},
+    {"id": "security", "title": "Sécurité", "fields": [
+        {"sec": "security", "key": "local_networks", "type": "nets", "live": True,
+         "label": "Réseau local",
+         "help": "Adresses autorisées pour l'administration (Emby et cette page). "
+                 "Ex. 192.168.1.0/24, 127.0.0.1/32"},
+        {"sec": "security", "key": "allowed_networks", "type": "nets", "live": True,
+         "label": "Seules adresses autorisées (vide = toutes)", "help": ""},
+        {"sec": "security", "key": "denied_networks", "type": "nets", "live": True,
+         "label": "Adresses toujours refusées", "help": ""},
+        {"sec": "security", "key": "trusted_proxies", "type": "nets", "live": True,
+         "label": "Relais HTTPS de confiance (proxy inverse devant ce proxy)",
+         "help": "Adresse du relais vue par le proxy, ex. 127.0.0.1/32, 192.168.1.123/32"},
+        {"sec": "security", "key": "require_relay", "type": "bool", "live": True,
+         "label": "Refuser les connexions d'Internet qui ne passent pas par le relais",
+         "help": "Sinon elles contourneraient son HTTPS. Le réseau local reste accepté."},
+        {"sec": "security", "key": "block_admin_from_internet", "type": "bool",
+         "live": True, "label": "Bloquer l'administration d'Emby depuis Internet",
+         "help": ""},
+        {"sec": "security", "key": "login_max_failures", "type": "int", "min": 1,
+         "max": 100, "live": True, "label": "Mots de passe faux avant bannissement",
+         "help": ""},
+        {"sec": "security", "key": "login_window_minutes", "type": "float", "min": 1,
+         "max": 1440, "live": True, "label": "… sur une durée de (minutes)", "help": ""},
+        {"sec": "security", "key": "ban_minutes", "type": "float", "min": 1,
+         "max": 525600, "live": True, "label": "Durée du bannissement (minutes)",
+         "help": ""},
+        {"sec": "security", "key": "rate_per_second", "type": "float", "min": 0,
+         "max": 100000, "live": True, "label": "Requêtes par seconde par adresse (0 = sans limite)",
+         "help": "Une page d'accueil Emby charge facilement 100 vignettes d'un coup."},
+        {"sec": "security", "key": "rate_burst", "type": "float", "min": 1,
+         "max": 100000, "live": True, "label": "Pointe autorisée (requêtes)", "help": ""},
+    ]},
+    {"id": "activity", "title": "Activité et journaux", "fields": [
+        {"sec": "activity", "key": "enabled", "type": "bool", "live": False,
+         "label": "Suivre l'activité des utilisateurs", "help": ""},
+        {"sec": "activity", "key": "record_searches", "type": "bool", "live": True,
+         "label": "Enregistrer les recherches tapées", "help": ""},
+        {"sec": "activity", "key": "idle_minutes", "type": "float", "min": 1,
+         "max": 1440, "live": True, "label": "Inactif après (minutes)", "help": ""},
+        {"sec": "activity", "key": "keep_hours", "type": "float", "min": 1,
+         "max": 8760, "live": True, "label": "Garder un utilisateur parti (heures)",
+         "help": ""},
+        {"sec": "activity", "key": "log_days", "type": "float", "min": 0, "max": 3650,
+         "live": True, "label": "Effacer les journaux après (jours, 0 = jamais)",
+         "help": ""},
+        {"sec": "activity", "key": "log_file", "type": "text", "live": False,
+         "label": "Journal d'activité (fichier, vide = aucun)", "help": ""},
+        {"sec": "activity", "key": "security_log_file", "type": "text", "live": False,
+         "label": "Journal de sécurité (fichier)", "help": ""},
+    ]},
+    {"id": "status", "title": "Page d'administration", "fields": [
+        {"sec": "status", "key": "port", "type": "int", "min": 1, "max": 65535,
+         "live": False, "label": "Port de cette page",
+         "help": "À part du port des utilisateurs. Ne jamais le rediriger sur la box."},
+        {"sec": "status", "key": "host", "type": "text", "live": False,
+         "label": "Adresse d'écoute de cette page",
+         "help": "Vide = la même que le proxy ; 127.0.0.1 = seulement depuis cette machine."},
+        {"sec": "status", "key": "session_hours", "type": "float", "min": 0.1,
+         "max": 720, "live": True, "label": "Durée d'une connexion (heures)", "help": ""},
+        {"sec": "status", "key": "allow_internet", "type": "bool", "live": True,
+         "label": "Accessible depuis Internet (déconseillé)", "help": ""},
+    ]},
+    {"id": "log", "title": "Journal technique", "fields": [
+        {"sec": "log", "key": "file", "type": "text", "live": False,
+         "label": "Fichier", "help": ""},
+        {"sec": "log", "key": "level", "type": "choice",
+         "choices": ["DEBUG", "INFO", "WARNING", "ERROR"], "live": False,
+         "label": "Niveau de détail", "help": ""},
+    ]},
+]
+SCHEMA_FIELDS = {"%s.%s" % (f["sec"], f["key"]): f
+                 for grp in CONFIG_SCHEMA for f in grp["fields"]}
+# attributs de Settings recopies a chaud apres un enregistrement
+LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
+              "ttl_untagged", "serve_stale", "allowed", "denied", "local",
+              "block_admin", "login_max", "login_window", "ban_seconds", "rate",
+              "burst", "trusted", "require_relay", "activity_idle_minutes",
+              "activity_keep_hours", "log_days", "record_searches",
+              "status_internet", "session_hours")
+RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
+                 "activity_enabled", "activity_log", "security_log", "status_port",
+                 "status_host", "log_file", "log_level")
+
+
+def raw_values(path):
+    """Valeurs du fichier, telles qu'ecrites (avec les valeurs par defaut)."""
+    cp = configparser.ConfigParser()
+    cp.read_dict(DEFAULTS)
+    if Path(path).exists():
+        cp.read_string(read_ini_text(path))
+    return {k: cp[f["sec"]].get(f["key"], "") for k, f in SCHEMA_FIELDS.items()}
+
+
+def validate_field(f, value):
+    """-> (valeur a ecrire, erreur ou "")."""
+    v = str(value if value is not None else "").strip()
+    t = f["type"]
+    if "\n" in v or "\r" in v or len(v) > 500:
+        return None, "valeur trop longue ou sur plusieurs lignes"
+    if t == "bool":
+        return ("true" if str(value).lower() in ("1", "true", "on", "yes", "oui")
+                else "false"), ""
+    if t in ("int", "float"):
+        try:
+            n = int(v) if t == "int" else float(v.replace(",", "."))
+        except ValueError:
+            return None, "nombre attendu"
+        if not (f.get("min", -1e18) <= n <= f.get("max", 1e18)):
+            return None, "entre %s et %s" % (f.get("min"), f.get("max"))
+        return (str(n) if t == "int" else ("%g" % n)), ""
+    if t == "url":
+        u = normalize_upstream(v)
+        return (u, "") if u else (None, "adresse invalide, ex. http://192.168.1.234:8096")
+    if t == "nets":
+        try:
+            nets = _nets(v)
+        except ValueError:
+            return None, "liste d'adresses invalide, ex. 192.168.1.0/24, 127.0.0.1/32"
+        return ", ".join(str(n) for n in nets), ""
+    if t == "choice":
+        return (v.upper(), "") if v.upper() in f["choices"] else (None, "choix invalide")
+    if t == "secret":
+        return (v, "") if not re.search(r"[\s;#]", v) else (None, "caracteres interdits")
+    if re.search(r"[;#]", v):
+        return None, "caracteres ; et # interdits"
+    return v, ""
+
+
+def port_free(host, port):
+    """Le port est-il libre ? (avant de l'accepter, pour ne pas casser le proxy)"""
+    import socket as _s
+    fam = _s.AF_INET6 if ":" in (host or "") else _s.AF_INET
+    sock = _s.socket(fam, _s.SOCK_STREAM)
+    try:
+        if os.name != "nt":
+            # comme le serveur lui-meme : les connexions qui finissent juste de
+            # se fermer (TIME_WAIT) n'empechent pas de reprendre le port
+            sock.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+        sock.bind((host or "0.0.0.0", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def lan_address():
+    """Adresse de cette machine sur le reseau local (pour afficher les liens)."""
+    import socket as _s
+    sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))         # aucun paquet n'est envoye
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+# =====================================================================
 #  CACHE DISQUE DES VIGNETTES
 # =====================================================================
 # /Items/123/Images/Primary, /emby/Users/x/Images/Primary/0, /Persons/Nom/Images/...
@@ -1453,7 +1660,7 @@ class Stats:
 
 
 class EmbyProxy:
-    def __init__(self, cfg):
+    def __init__(self, cfg, previous=None):
         self.cfg = cfg
         self.cache = DiskCache(cfg.cache_dir, cfg.cache_max)
         self.guard = Guard(cfg)
@@ -1476,6 +1683,19 @@ class EmbyProxy:
                 "ou place un relais HTTPS devant (et renseigne trusted_proxies).")
         if not cfg.status_password:
             cfg.status_password = secrets.token_urlsafe(12)   # jamais sans mot de passe
+        self.restart_event = threading.Event()   # bouton Redemarrer de la page
+        self.restart_error = ""
+        if previous is not None:
+            # redemarrage depuis la page : on garde connexions, bannissements,
+            # activite et journal de securite en memoire
+            self.sessions = previous.sessions
+            self.guard.banned = previous.guard.banned
+            self.guard.failures = previous.guard.failures
+            if previous.activity is not None and self.activity is not None:
+                self.activity = previous.activity
+                self.activity.cfg, self.activity.guard = cfg, self.guard
+            if previous.cfg.security_log == cfg.security_log:
+                self.seclog = previous.seclog
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
@@ -1618,6 +1838,10 @@ class EmbyProxy:
         app.router.add_get("/__proxy/config.json", self.config_json)
         app.router.add_post("/__proxy/config", self.config_save)
         app.router.add_post("/__proxy/config/test", self.config_test)
+        app.router.add_get("/__proxy/settings.json", self.settings_json)
+        app.router.add_post("/__proxy/settings", self.settings_save)
+        app.router.add_post("/__proxy/password", self.password_save)
+        app.router.add_post("/__proxy/restart", self.restart_post)
 
     # -- securite ------------------------------------------------------
     @web.middleware
@@ -2070,6 +2294,7 @@ class EmbyProxy:
             "cache_entries": c["entries"], "cache_bytes": c["bytes"],
             "cache_max_bytes": c["max_bytes"],
             "warnings": list(self.warnings.values()),
+            "emby_down": "emby" in self.warnings,
             "active_users": sum(
                 1 for x in list(self.activity.clients.values())
                 if time.time() - x.last_seen < self.cfg.activity_idle_minutes * 60
@@ -2241,6 +2466,205 @@ class EmbyProxy:
                                   "probe": await self._probe_emby(self.cfg.upstream,
                                                                   self.cfg.api_key)})
 
+    # -- tous les reglages (onglet Configuration) ---------------------------
+    def _restart_pending(self):
+        """Reglages enregistres mais pas encore en service."""
+        try:
+            f = Settings(self.cfg.path)
+        except Exception:
+            return []
+        return [a for a in RESTART_ATTRS if getattr(f, a) != getattr(self.cfg, a)]
+
+    async def settings_json(self, request):
+        raw = raw_values(self.cfg.path)
+        values = {}
+        for k, f in SCHEMA_FIELDS.items():
+            if f["type"] == "secret":
+                key = raw.get(k, "")
+                values[k] = ""
+                values[k + ".hint"] = ("\u2022\u2022\u2022\u2022" + key[-4:]) if key else ""
+            else:
+                values[k] = raw.get(k, "")
+        return web.json_response({
+            "schema": CONFIG_SCHEMA, "values": values,
+            "locked": ["%s.%s" % sk for sk in self.cfg.env_locked],
+            "config_file": str(self.cfg.path),
+            "file_warnings": self.cfg.config_warnings,
+            "restart_pending": self._restart_pending(),
+            "restart_error": self.restart_error,
+            "running": {"upstream": self.cfg.upstream,
+                        "listen_port": self.cfg.listen_port,
+                        "status_port": self.cfg.status_port},
+            "lan": lan_address(), "your_ip": request[CLIENT_IP]})
+
+    def _confirm(self, request, given):
+        ip = request[CLIENT_IP]
+        local = self.guard.is_local(ip)
+        if hmac.compare_digest(str(given or "").encode("utf-8"),
+                               self.cfg.status_password.encode("utf-8")):
+            self.guard.login_result(ip, True)
+            return None
+        self.seclog.add("config_fail", ip, local, detail="mot de passe de "
+                        "confirmation faux")
+        if self.guard.login_result(ip, False):
+            self.seclog.add("ban", ip, local, detail="configuration : %d mots de "
+                            "passe faux" % self.cfg.login_max, ban_key=self.guard.key(ip))
+        return web.json_response({"ok": False, "error": "Mot de passe de "
+                                  "confirmation incorrect."}, status=403)
+
+    async def settings_save(self, request):
+        ip = request[CLIENT_IP]
+        if not self.guard.is_local(ip):
+            return web.json_response({"ok": False, "error": "Modification possible "
+                                      "uniquement depuis le reseau local."}, status=403)
+        data = await request.json()
+        bad = self._confirm(request, data.get("password"))
+        if bad:
+            return bad
+        sent = data.get("values") or {}
+        raw = raw_values(self.cfg.path)
+        locked = {"%s.%s" % sk for sk in self.cfg.env_locked}
+        errors, new = {}, {}
+        for k, v in sent.items():
+            f = SCHEMA_FIELDS.get(k)
+            if not f or k in locked:
+                continue
+            if f["type"] == "secret" and v == "" and not data.get("clear_" + k):
+                continue                         # secret laisse vide : on garde
+            val, err = validate_field(f, v)
+            if err:
+                errors[k] = err
+            elif val != raw.get(k, ""):
+                new[k] = val
+        if errors:
+            return web.json_response({"ok": False, "errors": errors,
+                                      "error": "Corrige les champs en rouge."}, status=400)
+        if not new:
+            return web.json_response({"ok": True, "changed": [], "saved": True,
+                                      "notes": ["Rien n'a change."],
+                                      "restart_pending": self._restart_pending()})
+        # garde-fous : ne pas se bloquer soi-meme, ne pas casser le proxy
+        merged = dict(raw, **new)
+        local = _nets(merged["security.local_networks"])
+        if not (Guard._in(ip, local) or merged["status.allow_internet"] == "true"):
+            errors["security.local_networks"] = (
+                "ton adresse %s n'y serait plus : tu ne pourrais plus revenir sur "
+                "cette page" % ip)
+        if Guard._in(ip, _nets(merged["security.denied_networks"])):
+            errors["security.denied_networks"] = "contient ton adresse %s" % ip
+        allowed = _nets(merged["security.allowed_networks"])
+        if allowed and not Guard._in(ip, allowed):
+            errors["security.allowed_networks"] = "ne contient pas ton adresse %s" % ip
+        lp, sp = int(merged["proxy.listen_port"]), int(merged["status.port"])
+        if lp == sp:
+            errors["status.port"] = "doit etre different du port des utilisateurs"
+        for k, port, host in (("proxy.listen_port", lp, merged["proxy.listen_host"]),
+                              ("status.port", sp, merged["status.host"]
+                               or merged["proxy.listen_host"])):
+            if k in new and port not in (self.cfg.listen_port, self.cfg.status_port) \
+                    and not port_free(host, port):
+                errors[k] = "port %d deja utilise par un autre programme" % port
+        for k in ("proxy.tls_cert", "proxy.tls_key"):
+            if k in new and new[k] and not self.cfg._path(self.cfg.path.parent,
+                                                          new[k]).exists():
+                errors[k] = "fichier introuvable"
+        if errors:
+            return web.json_response({"ok": False, "errors": errors,
+                                      "error": "Corrige les champs en rouge."}, status=400)
+        # ecriture puis relecture
+        notes, saved = [], False
+        try:
+            for k, v in new.items():
+                f = SCHEMA_FIELDS[k]
+                update_ini(self.cfg.path, f["sec"], f["key"], v)
+            after = raw_values(self.cfg.path)
+            saved = all(after.get(k) == v for k, v in new.items())
+            if not saved:
+                notes.append("ATTENTION : relu dans %s, certaines valeurs ne sont pas "
+                             "celles envoyees" % self.cfg.path)
+        except Exception as exc:
+            notes.append("ATTENTION : fichier %s non modifie (%s)" % (self.cfg.path, exc))
+        # application a chaud
+        try:
+            fresh = Settings(self.cfg.path)
+        except Exception as exc:
+            fresh = None
+            notes.append("relecture impossible : %s" % exc)
+        if fresh is not None:
+            old_up = self.cfg.upstream
+            for a in LIVE_ATTRS:
+                setattr(self.cfg, a, getattr(fresh, a))
+            self.cfg.config_warnings = fresh.config_warnings
+            self.cache.max_bytes = self.cfg.cache_max
+            await asyncio.get_running_loop().run_in_executor(None, self.cache._evict)
+            if urlsplit(old_up).netloc.lower() != urlsplit(self.cfg.upstream).netloc.lower():
+                await asyncio.get_running_loop().run_in_executor(None, self.cache.clear)
+                if self.activity:
+                    self.activity.info.items.clear()
+                notes.append("cache des vignettes vide (autre serveur Emby)")
+            if self.cfg.trusted or self.cfg.tls_cert:
+                self.warnings.pop("http", None)
+            self.warnings.pop("emby", None)
+            for k in [k for k in self.warnings if k.startswith("config")]:
+                del self.warnings[k]
+        shown = ["%s : %s" % (SCHEMA_FIELDS[k]["label"],
+                              "(modifiee)" if SCHEMA_FIELDS[k]["type"] == "secret"
+                              else (v or "(vide)")) for k, v in new.items()]
+        self.seclog.add("config", ip, True, detail="; ".join(shown)[:300])
+        log.warning("configuration modifiee par %s : %s", ip, "; ".join(shown))
+        probe = None
+        if "proxy.upstream" in new or "emby.api_key" in new:
+            probe = await self._probe_emby(self.cfg.upstream, self.cfg.api_key)
+        return web.json_response({"ok": True, "changed": shown, "saved": saved,
+                                  "notes": notes, "probe": probe,
+                                  "restart_pending": self._restart_pending()})
+
+    async def password_save(self, request):
+        ip = request[CLIENT_IP]
+        if not self.guard.is_local(ip):
+            return web.json_response({"ok": False, "error": "Modification possible "
+                                      "uniquement depuis le reseau local."}, status=403)
+        data = await request.json()
+        bad = self._confirm(request, data.get("old"))
+        if bad:
+            return bad
+        new, new2 = str(data.get("new", "")), str(data.get("new2", ""))
+        if len(new) < 10:
+            return web.json_response({"ok": False, "error": "10 caracteres minimum."},
+                                     status=400)
+        if new != new2:
+            return web.json_response({"ok": False, "error": "Les deux saisies sont "
+                                      "differentes."}, status=400)
+        if re.search(r"[\s;#]", new) or len(new) > 200:
+            return web.json_response({"ok": False, "error": "Pas d'espace, ni ; ni #."},
+                                     status=400)
+        try:
+            update_ini(self.cfg.path, "status", "password", new)
+            if Settings(self.cfg.path).status_password != new:
+                raise OSError("relu different")
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": "Fichier %s non modifie : %s"
+                                      % (self.cfg.path, exc)}, status=500)
+        self.cfg.status_password = new
+        mine = request.cookies.get("epx_session", "")
+        for tok in [t for t in self.sessions if t != mine]:
+            del self.sessions[tok]               # les autres sont deconnectes
+        self.seclog.add("config", ip, True, detail="mot de passe de la page change")
+        log.warning("mot de passe de la page d'etat change par %s", ip)
+        return web.json_response({"ok": True})
+
+    async def restart_post(self, request):
+        if not self.guard.is_local(request[CLIENT_IP]):
+            return web.json_response({"ok": False, "error": "reseau local seulement"},
+                                     status=403)
+        log.warning("redemarrage demande par %s", request[CLIENT_IP])
+        self.seclog.add("config", request[CLIENT_IP], True,
+                        detail="redemarrage du proxy")
+        f = Settings(self.cfg.path)
+        asyncio.get_running_loop().call_later(0.5, self.restart_event.set)
+        return web.json_response({"ok": True, "status_port": f.status_port or
+                                  f.listen_port})
+
     async def security_json(self, request):
         return web.json_response(self.seclog.snapshot(self.guard))
 
@@ -2350,7 +2774,8 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.row button{margin-top:0}
 .confirm{margin-top:12px;padding:10px;border:1px solid var(--warn);border-radius:8px;background:#2a2316;display:flex;flex-direction:column;gap:8px}
 .res{margin-top:12px;padding:10px;border-radius:8px;border:1px solid var(--line)}.res.ok{border-color:var(--ok)}.res.bad{border-color:var(--bad)}
-.lock{color:var(--warn)}
+.lock{color:var(--warn)}.fld{margin-top:6px}.fld .err{color:var(--bad);font-size:12px}
+.fld label{display:block}.fld input:not([type=checkbox]),.fld select{width:100%;margin-top:3px}
 </style></head><body>
 <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
 <h1>Emby Proxy</h1><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div>
@@ -2395,30 +2820,30 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
 </section>
 
 <section id="conf" hidden>
-  <h2 style="margin-top:4px">Serveur Emby</h2>
-  <div class="c form">
-    <label for="cUrl">Adresse du serveur Emby</label>
-    <input id="cUrl" placeholder="http://192.168.1.10:8096" autocomplete="off" spellcheck="false">
-    <div class="sub">Adresse vue depuis la machine du proxy. Les utilisateurs ne la voient jamais.</div>
-    <div class="sub" id="cState"></div>
-    <div class="sub lock" id="cUrlLock" hidden></div>
-    <label for="cKey">Clé API Emby <span class="sub">(facultative)</span></label>
-    <input id="cKey" type="password" autocomplete="off" spellcheck="false">
-    <div class="sub">Emby : Tableau de bord › Avancé › Clés API. Sert à afficher le nom de tous les films dans l'activité.</div>
-    <label class="sub"><input type="checkbox" id="cClear"> effacer la clé enregistrée</label>
-    <div class="sub lock" id="cKeyLock" hidden></div>
-    <div class="sub lock" id="cDirty" hidden>● Modification non enregistrée</div>
+  <div class="sub" id="gFile"></div>
+  <div id="gTop"></div>
+  <div id="gForm"></div>
+  <div class="c form" style="margin-top:14px">
+    <div class="sub lock" id="gDirty" hidden>● Modifications non enregistrées</div>
     <div class="row">
-      <button class="small" id="cTest">Tester la connexion</button>
-      <button class="red" id="cSave">Enregistrer…</button>
+      <button class="small" id="gTest">Tester la connexion à Emby</button>
+      <button class="red" id="gSave">Enregistrer…</button>
+      <button class="small" id="gReset">Annuler les modifications</button>
     </div>
-    <div id="cConfirm" hidden class="confirm">
-      <div>Ces réglages décident vers quel serveur partent les mots de passe de tes utilisateurs. Pour confirmer, retape le mot de passe de cette page.</div>
-      <input id="cPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
-      <div class="row"><button class="red" id="cDo">Confirmer et appliquer</button><button class="small" id="cCancel">Annuler</button></div>
+    <div id="gConfirm" hidden class="confirm">
+      <div>Pour confirmer, retape le mot de passe de cette page.</div>
+      <input id="gPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
+      <div class="row"><button class="red" id="gDo">Confirmer et enregistrer</button><button class="small" id="gCancel">Annuler</button></div>
     </div>
-    <div id="cOut"></div>
-    <div class="sub" id="cFile"></div>
+    <div id="gOut"></div>
+  </div>
+  <h2>Mot de passe de cette page</h2>
+  <div class="c form">
+    <label for="pOld">Mot de passe actuel</label><input id="pOld" type="password" autocomplete="current-password">
+    <label for="pNew">Nouveau mot de passe (10 caractères minimum)</label><input id="pNew" type="password" autocomplete="new-password">
+    <label for="pNew2">Nouveau mot de passe, encore</label><input id="pNew2" type="password" autocomplete="new-password">
+    <div class="row"><button class="red" id="pDo">Changer le mot de passe</button></div>
+    <div id="pOut"></div>
   </div>
 </section>
 
@@ -2484,7 +2909,9 @@ const F=[['Vignettes servies du cache','cache_hits'],['Demandées à Emby','cach
 ['Erreurs Emby','upstream_errors'],['WebSocket ouverts','websockets'],
 ['Utilisateurs actifs','active_users'],
 ['En service depuis','uptime_s',v=>Math.floor(v/3600)+' h '+Math.floor(v%3600/60)+' min']];
+let autoConf=true;
 function renderStats(d){
+  if(autoConf){autoConf=false;if(d.emby_down)document.querySelector('button[data-t=conf]').click()}
   $('g').replaceChildren(...F.map(([l,k,f])=>{const c=el('div','c');c.append(el('div','l',l),el('div','v',f?f(d[k]):String(d[k])));return c}));
   $('warn').replaceChildren(...(d.warnings||[]).map(w=>el('div','w','⚠ '+w)))}
 $('purge').onclick=()=>{if(confirm('Vider le cache des vignettes ?'))fetch('purge',{method:'POST'}).then(tick)};
@@ -2513,8 +2940,7 @@ function renderSecFeed(){
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun événement.');td.colSpan=6;tr.append(td);return tr})()]))}
 ['sKind','sNet'].forEach(i=>$(i).onchange=renderSecFeed);$('sText').oninput=renderSecFeed;
 
-// ---- Configuration du serveur Emby
-let conf=null;
+// ---- Configuration : tous les reglages
 // Jamais d'echec silencieux : toute erreur devient {ok:false, error:"..."}
 function post(u,body){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
   .then(r=>{if(r.status===401){location.href='login';throw 0}
@@ -2522,40 +2948,76 @@ function post(u,body){return fetch(u,{method:'POST',headers:{'Content-Type':'app
       if(j&&typeof j==='object')return j;
       return {ok:false,error:'Erreur '+r.status+' : '+(t||r.statusText).slice(0,200)}})},
     e=>{if(e===0)throw 0;return {ok:false,error:'Le proxy ne répond pas ('+e+').'}})}
-function unsaved(){if(!conf)return;const d=$('cUrl').value.trim().replace(/\/+$/,'')!==conf.upstream||$('cKey').value!==''||$('cClear').checked;
-  $('cDirty').hidden=!d}
-function loadConf(){fetch('config.json').then(r=>r.json()).then(c=>{conf=c;$('cUrl').value=c.upstream;$('cKey').value='';
-  $('cKey').placeholder=c.api_key_set?'clé enregistrée ('+c.api_key_hint+') : laisser vide pour la garder':'aucune clé enregistrée';
-  $('cClear').checked=false;$('cClear').parentElement.hidden=!c.api_key_set;
-  const lk=(id,on,what)=>{$(id).hidden=!on;$(id).textContent=on?'⚠ '+what+' est aussi fixée par une variable d\'environnement (docker-compose) : elle reprendra le dessus au redémarrage.':''};
-  lk('cUrlLock',c.locked.upstream,"L'adresse");lk('cKeyLock',c.locked.api_key,'La clé API');
-  $('cFile').textContent='Fichier de réglages : '+c.config_file;
-  $('cState').replaceChildren(el('div',null,'Adresse en service : '+c.upstream),
-    el('div',null,'Adresse dans le fichier : '+(c.file_upstream||'?')+(c.file_upstream===c.upstream?'  ✔':'  ✖ différente : elle sera reprise au redémarrage')),
-    ...(c.file_warnings||[]).map(w=>el('div','lock','⚠ '+w)));
-  unsaved()}).catch(e=>$('cOut').replaceChildren(el('div','res bad','✖ Lecture de la configuration impossible : '+e)))}
+let G=null;
 function probeBox(p){const d=el('div','res '+(p.ok&&p.key_ok!==false?'ok':'bad'));
   if(!p.ok){d.append(el('div',null,'✖ '+(p.error||'Échec')));return d}
   d.append(el('div',null,'✔ Emby joignable : « '+(p.server_name||'?')+' », version '+(p.version||'?')+(p.latency_ms!=null?' ('+p.latency_ms+' ms)':'')));
   if(p.key_ok===true)d.append(el('div',null,'✔ Clé API acceptée'));
   if(p.key_ok===false)d.append(el('div',null,'✖ '+(p.key_error||'Clé API refusée')));
   return d}
-function form(){return {upstream:$('cUrl').value,api_key:$('cKey').value,clear_key:$('cClear').checked}}
-$('cTest').onclick=()=>{$('cOut').replaceChildren(el('div','sub','Test en cours…'));
-  post('config/test',form()).then(p=>{const box=el('div');box.append(probeBox(p));
-    if(!$('cDirty').hidden)box.append(el('div','sub lock','Ce n\'est qu\'un test : rien n\'est encore enregistré. Clique sur « Enregistrer… » puis « Confirmer et appliquer ».'));
-    $('cOut').replaceChildren(box)}).catch(()=>{})};
-['cUrl','cKey'].forEach(i=>$(i).oninput=unsaved);$('cClear').onchange=unsaved;
-$('cSave').onclick=()=>{$('cConfirm').hidden=false;$('cPwd').value='';$('cPwd').focus()};
-$('cCancel').onclick=()=>{$('cConfirm').hidden=true};
-$('cDo').onclick=()=>{const b=form();b.password=$('cPwd').value;
-  post('config',b).then(r=>{
-    if(!r.ok){$('cOut').replaceChildren(el('div','res bad','✖ '+r.error));return}
-    $('cConfirm').hidden=true;const box=el('div');
-    box.append(el('div','res '+(r.changed&&!r.saved?'bad':'ok'),r.changed?(r.saved?'✔ Appliqué immédiatement et enregistré dans le fichier : ':'⚠ Appliqué, mais PAS enregistré dans le fichier : ')+r.changes.join(' ; '):'Rien n\'a changé.'));
+function fieldEl(f,G){
+  const k=f.sec+'.'+f.key,v=G.values[k],lock=G.locked.includes(k),w=el('div','fld');w.dataset.k=k;
+  let inp;
+  if(f.type==='bool'){const lb=el('label');inp=el('input');inp.type='checkbox';inp.checked=(v==='true');lb.append(inp,el('span',null,' '+f.label));w.append(lb)}
+  else{w.append(el('label',null,f.label+(f.live?'':'  ')),);
+    if(!f.live)w.lastChild.append(el('span','tag','au redémarrage'));
+    if(f.type==='choice'){inp=el('select');f.choices.forEach(c=>{const o=el('option',null,c);o.value=c;inp.append(o)});inp.value=v}
+    else{inp=el('input');inp.value=v;inp.spellcheck=false;inp.autocomplete='off';
+      if(f.type==='secret'){inp.type='password';inp.placeholder=G.values[k+'.hint']?'enregistrée ('+G.values[k+'.hint']+') : laisser vide pour la garder':'aucune'}
+      if(f.type==='int'||f.type==='float'){inp.inputMode='decimal'}
+      if(f.type==='nets')inp.placeholder='ex. 192.168.1.0/24, 127.0.0.1/32';
+      if(f.type==='url')inp.placeholder='http://192.168.1.234:8096'}
+    w.append(inp)}
+  inp.dataset.k=k;inp.dataset.orig=f.type==='bool'?String(v==='true'):(f.type==='secret'?'':v);
+  inp.oninput=inp.onchange=dirty;
+  if(lock){inp.disabled=true;w.append(el('div','sub lock','Fixé par une variable d\'environnement (docker-compose).'))}
+  if(f.help)w.append(el('div','sub',f.help));
+  if(f.type==='secret'&&G.values[k+'.hint']){const lb=el('label','sub'),c=el('input');c.type='checkbox';c.dataset.clear=k;c.onchange=dirty;lb.append(c,el('span',null,' effacer la clé enregistrée'));w.append(lb)}
+  w.append(el('div','err'));
+  return w}
+function inputs(){return [...document.querySelectorAll('#gForm [data-k]')].filter(i=>i.tagName!=='DIV')}
+function val(i){return i.type==='checkbox'?String(i.checked):i.value}
+function dirty(){const d=inputs().some(i=>val(i)!==i.dataset.orig)||[...document.querySelectorAll('#gForm [data-clear]')].some(c=>c.checked);$('gDirty').hidden=!d;return d}
+function loadConf(){return fetch('settings.json').then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()}).then(g=>{G=g;
+  $('gFile').textContent='Fichier de réglages : '+g.config_file+'  ·  ton adresse : '+g.your_ip;
+  const top=[];
+  if(g.restart_error)top.push(el('div','res bad','✖ '+g.restart_error));
+  (g.file_warnings||[]).forEach(w=>top.push(el('div','w','⚠ '+w)));
+  if(g.restart_pending.length){const d=el('div','res bad');d.append(el('div',null,'Réglages enregistrés mais pas encore en service : un redémarrage du proxy est nécessaire.'));
+    const b=el('button','red','Redémarrer le proxy maintenant');b.onclick=restart;d.append(b);top.push(d)}
+  $('gTop').replaceChildren(...top);
+  $('gForm').replaceChildren(...g.schema.map(grp=>{const box=el('div');box.append(el('h2',null,grp.title));const c=el('div','c form');
+    grp.fields.forEach(f=>c.append(fieldEl(f,g)));box.append(c);return box}));
+  dirty()}).catch(e=>{if(e!==0)$('gOut').replaceChildren(el('div','res bad','✖ Lecture des réglages impossible : '+e))})}
+function collect(){const v={};inputs().forEach(i=>v[i.dataset.k]=val(i));return v}
+$('gTest').onclick=()=>{const v=collect();$('gOut').replaceChildren(el('div','sub','Test en cours…'));
+  post('config/test',{upstream:v['proxy.upstream'],api_key:v['emby.api_key']}).then(p=>{const b=el('div');b.append(probeBox(p));
+    if(dirty())b.append(el('div','sub lock','Ce n\'est qu\'un test : rien n\'est encore enregistré.'));$('gOut').replaceChildren(b)}).catch(()=>{})};
+$('gSave').onclick=()=>{$('gConfirm').hidden=false;$('gPwd').value='';$('gPwd').focus()};
+$('gCancel').onclick=()=>{$('gConfirm').hidden=true};
+$('gReset').onclick=()=>{loadConf();$('gOut').replaceChildren()};
+$('gPwd').onkeydown=e=>{if(e.key==='Enter')$('gDo').click()};
+$('gDo').onclick=()=>{const body={values:collect(),password:$('gPwd').value};
+  document.querySelectorAll('#gForm [data-clear]').forEach(c=>{if(c.checked)body['clear_'+c.dataset.clear]=true});
+  document.querySelectorAll('#gForm .err').forEach(e=>e.textContent='');
+  post('settings',body).then(r=>{
+    if(!r.ok){$('gOut').replaceChildren(el('div','res bad','✖ '+r.error));
+      Object.entries(r.errors||{}).forEach(([k,m])=>{const f=document.querySelector('#gForm div.fld[data-k="'+k+'"] .err');if(f)f.textContent='✖ '+m});
+      if(r.errors)$('gConfirm').hidden=true;return}
+    $('gConfirm').hidden=true;const box=el('div');
+    box.append(el('div','res '+(r.saved?'ok':'bad'),(r.saved?'✔ Enregistré dans le fichier':'⚠ PAS enregistré dans le fichier')+(r.changed.length?' : '+r.changed.join(' ; '):'')));
     (r.notes||[]).forEach(n=>box.append(el('div','sub lock','⚠ '+n)));
     if(r.probe)box.append(probeBox(r.probe));
-    $('cOut').replaceChildren(box);loadConf();tick()}).catch(()=>{})};
+    $('gOut').replaceChildren(box);loadConf();tick()})};
+function restart(){if(!confirm('Redémarrer le proxy ? Les lectures en cours seront coupées quelques secondes.'))return;
+  post('restart',{}).then(r=>{if(!r.ok){$('gTop').prepend(el('div','res bad','✖ '+r.error));return}
+    const url=location.protocol+'//'+location.hostname+':'+r.status_port+'/__proxy/';
+    $('gTop').replaceChildren(el('div','res ok','Redémarrage en cours…'));let n=0;
+    const t=setInterval(()=>{n++;fetch(url.replace(/\/__proxy\/$/,'')+'/__proxy/settings.json',{credentials:'include'}).then(x=>{if(x.ok||x.status===401){clearInterval(t);location.href=url}}).catch(()=>{});
+      if(n>40){clearInterval(t);$('gTop').replaceChildren(el('div','res bad','Le proxy ne revient pas : regarde la console. Adresse attendue : '+url))}},1000)})}
+$('pDo').onclick=()=>{post('password',{old:$('pOld').value,new:$('pNew').value,new2:$('pNew2').value}).then(r=>{
+  $('pOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?'✔ Mot de passe changé. Les autres connexions à cette page ont été fermées.':'✖ '+r.error));
+  if(r.ok)['pOld','pNew','pNew2'].forEach(i=>$(i).value='')})};
 
 function tick(){
   const j=u=>fetch(u).then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()});
@@ -2623,15 +3085,61 @@ async def serve(proxy, stop_event=None):
         proxy.warnings["same_port"] = (
             "La page d'etat partage le port des utilisateurs (status.port = 0) : "
             "mets-la sur un port a part (8098 par defaut).")
+    lan = lan_address()
+    print("\n  PAGE D'ADMINISTRATION : %s://%s:%d/\n" % (
+        "https" if ctx else "http", lan, proxy.cfg.status_port or proxy.cfg.listen_port),
+        flush=True) if sys.stdout else None
     try:
-        if stop_event is None:
-            await asyncio.Event().wait()
-        else:
-            while not stop_event.is_set():
-                await asyncio.sleep(0.3)
+        while not proxy.restart_event.is_set() and \
+                not (stop_event is not None and stop_event.is_set()):
+            await asyncio.sleep(0.3)
     finally:
         for r in reversed(runners):
             await r.cleanup()
+
+
+def run_with_restarts(cfg, stop_event=None, holder=None):
+    """Fait tourner le proxy ; le bouton Redemarrer de la page relance avec les
+    reglages du fichier. Si les nouveaux reglages empechent de demarrer (port
+    pris...), on repart avec les anciens et on le signale sur la page."""
+    proxy = EmbyProxy(cfg)
+    while True:
+        if holder is not None:
+            holder["proxy"] = proxy
+        asyncio.run(serve(proxy, stop_event))
+        if not proxy.restart_event.is_set():
+            return
+        old = proxy
+        try:
+            new_cfg = Settings(cfg.path)
+            new_cfg.status_password = new_cfg.status_password or old.cfg.status_password
+            proxy = EmbyProxy(new_cfg, previous=old)
+            setup_logging(new_cfg, to_console=bool(sys.stderr) and holder is None)
+            # essai de demarrage ; en cas d'echec on revient aux anciens reglages
+            try:
+                asyncio.run(_try_bind(new_cfg))
+            except OSError as exc:
+                log.error("redemarrage impossible avec les nouveaux reglages : %s", exc)
+                proxy = EmbyProxy(old.cfg, previous=old)
+                proxy.restart_error = ("Redemarrage impossible avec les nouveaux "
+                                       "reglages (%s) : anciens reglages remis en "
+                                       "service." % exc)
+                proxy.warnings["restart"] = proxy.restart_error
+        except Exception as exc:
+            log.exception("redemarrage")
+            proxy = EmbyProxy(old.cfg, previous=old)
+            proxy.restart_error = "Redemarrage impossible : %s" % exc
+            proxy.warnings["restart"] = proxy.restart_error
+        log.info("proxy redemarre")
+
+
+async def _try_bind(cfg):
+    """Verifie que les ports et le certificat sont utilisables."""
+    ssl_context(cfg)
+    for host, port in ((cfg.listen_host, cfg.listen_port),
+                       (cfg.status_host, cfg.status_port)):
+        if port and not port_free(host, port):
+            raise OSError("port %d deja utilise" % port)
 
 
 def run_gui(cfg):
@@ -2639,13 +3147,13 @@ def run_gui(cfg):
     import tkinter as tk
     from tkinter import messagebox
 
-    proxy = EmbyProxy(cfg)
+    holder = {"proxy": None}
     stop = threading.Event()
     errors = []
 
     def worker():
         try:
-            asyncio.run(serve(proxy, stop))
+            run_with_restarts(cfg, stop, holder)
         except OSError as exc:            # port deja pris, certificat absent...
             if exc.errno in (98, 10048):
                 errors.append("port %d deja utilise par un autre programme"
@@ -2658,10 +3166,20 @@ def run_gui(cfg):
             log.exception("arret du proxy")
 
     threading.Thread(target=worker, daemon=True).start()
+    for _ in range(50):                  # le proxy est cree dans le thread
+        if holder["proxy"] is not None:
+            break
+        time.sleep(0.05)
+
+    class _P:                            # toujours le proxy en service
+        def __getattr__(self, name):
+            return getattr(holder["proxy"], name)
+    proxy = _P()
 
     scheme = "https" if cfg.tls_cert else "http"
-    status_url = "%s://127.0.0.1:%d/__proxy/" % (scheme, cfg.status_port
-                                                  or cfg.listen_port)
+    def status_url():
+        c = holder["proxy"].cfg if holder["proxy"] else cfg
+        return "%s://127.0.0.1:%d/__proxy/" % (scheme, c.status_port or c.listen_port)
     root = tk.Tk()
     root.title("Emby Proxy")
     root.configure(bg="#16181f")
@@ -2692,7 +3210,7 @@ def run_gui(cfg):
 
     def copy_pwd():
         root.clipboard_clear()
-        root.clipboard_append(cfg.status_password)
+        root.clipboard_append(holder["proxy"].cfg.status_password)
         messagebox.showinfo("Emby Proxy", "Mot de passe de la page d'etat copie.\n"
                             "Colle-le dans la page qui s'ouvre.")
 
@@ -2705,7 +3223,7 @@ def run_gui(cfg):
         root.after(600, root.destroy)
 
     tk.Button(bar, text="Activite / page d'etat",
-              command=lambda: webbrowser.open(status_url)).pack(side="left")
+              command=lambda: webbrowser.open(status_url())).pack(side="left")
     tk.Button(bar, text="Copier le mot de passe", command=copy_pwd).pack(side="left",
                                                                          padx=(8, 0))
     tk.Button(bar, text="Vider le cache", command=purge).pack(side="left", padx=8)
@@ -2725,8 +3243,9 @@ def run_gui(cfg):
             vals["state"].config(text="ARRETE : %s" % errors[0], fg="#e05555")
         else:
             vals["state"].config(text="en service", fg="#2ecc71")
-        head.config(text="%s://%s:%d  ->  %s" % (scheme, cfg.listen_host,
-                                                  cfg.listen_port, cfg.upstream))
+        c = holder["proxy"].cfg
+        head.config(text="%s://%s:%d  ->  %s" % (scheme, c.listen_host,
+                                                  c.listen_port, c.upstream))
         vals["users"].config(text=str(d["active_users"]))
         fails = sum(1 for e in list(proxy.seclog.events)
                     if e["type"] == "login_fail" and time.time() - e["t"] < 86400)
@@ -2794,9 +3313,8 @@ def main(argv=None):
                     "(ou bouton Copier le mot de passe de la fenetre)", cfg_path)
     if args.gui:
         return run_gui(cfg)
-    proxy = EmbyProxy(cfg)
     try:
-        asyncio.run(serve(proxy))
+        run_with_restarts(cfg)
     except KeyboardInterrupt:
         pass
 

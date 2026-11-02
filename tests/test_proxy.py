@@ -1018,8 +1018,7 @@ def test_option_emby_enregistre_l_adresse(tmp_path, monkeypatch):
     ini = tmp_path / "emby_proxy.ini"
     ep.write_example_config(ini)
     # main() s'arrete apres l'enregistrement si on simule un serveur qui echoue
-    monkeypatch.setattr(ep, "serve", lambda proxy: (_ for _ in ()).throw(KeyboardInterrupt))
-    monkeypatch.setattr(ep.asyncio, "run", lambda coro: None)
+    monkeypatch.setattr(ep, "run_with_restarts", lambda cfg, *a, **k: None)
     ep.main(["--config", str(ini), "--emby", "192.168.1.234:8096"])
     assert ep.Settings(ini).upstream == "http://192.168.1.234:8096"
     assert ep.main(["--config", str(ini), "--emby", "pas valable"]) == 2
@@ -1031,3 +1030,94 @@ async def test_page_explicative_si_emby_injoignable(env):
     r = await c.get("/")
     t = await r.text()
     assert r.status == 502 and "Configuration" in t and "--emby" in t and ":8098/" in t
+
+
+
+# ---------------------------------------------------------------------
+#  Onglet Configuration : tous les reglages, mot de passe, redemarrage
+# ---------------------------------------------------------------------
+async def _admin_with_ini(env, tmp_path):
+    make, _, _ = env
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    ep.update_ini(ini, "status", "port", "0")
+    proxy, c = await make()
+    proxy.cfg.path = ini
+    await login(c, proxy)
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    return proxy, c, own, ini
+
+
+async def test_reglages_tous_modifiables_depuis_la_page(env, tmp_path):
+    proxy, c, own, ini = await _admin_with_ini(env, tmp_path)
+    g = await (await c.get("/__proxy/settings.json")).json()
+    keys = {f["sec"] + "." + f["key"] for grp in g["schema"] for f in grp["fields"]}
+    assert {"proxy.upstream", "cache.max_size_mb", "security.local_networks",
+            "status.port", "activity.record_searches"} <= keys
+    pwd = proxy.cfg.status_password
+    r = await c.post("/__proxy/settings", headers=own, json={"password": pwd, "values": {
+        "cache.max_size_mb": "500", "security.ban_minutes": "120",
+        "activity.record_searches": "false", "proxy.listen_port": "18097"}})
+    d = await r.json()
+    assert d["ok"] and d["saved"], d
+    # applique tout de suite pour les reglages "a chaud"
+    assert proxy.cfg.cache_max == 500 * 1024 * 1024 and proxy.cache.max_bytes == proxy.cfg.cache_max
+    assert proxy.cfg.ban_seconds == 7200 and proxy.cfg.record_searches is False
+    # le port ne change qu'au redemarrage, et c'est signale
+    assert proxy.cfg.listen_port != 18097 and "listen_port" in d["restart_pending"]
+    f = ep.Settings(ini)
+    assert f.cache_max == 500 * 1024 * 1024 and f.listen_port == 18097
+    assert "# Taille maximale du cache" in ini.read_text(encoding="utf-8")
+
+
+async def test_reglages_valeurs_refusees(env, tmp_path):
+    proxy, c, own, ini = await _admin_with_ini(env, tmp_path)
+    pwd = proxy.cfg.status_password
+    r = await c.post("/__proxy/settings", headers=own, json={"password": pwd, "values": {
+        "cache.max_size_mb": "beaucoup", "security.local_networks": "pas un reseau",
+        "proxy.upstream": "ftp://x", "log.level": "BAVARD"}})
+    d = await r.json()
+    assert r.status == 400 and set(d["errors"]) == {
+        "cache.max_size_mb", "security.local_networks", "proxy.upstream", "log.level"}
+    # ne pas se bloquer soi-meme
+    r = await c.post("/__proxy/settings", headers=own, json={"password": pwd, "values": {
+        "security.local_networks": "10.0.0.0/8"}})
+    d = await r.json()
+    assert r.status == 400 and "security.local_networks" in d["errors"]
+    r = await c.post("/__proxy/settings", headers=own, json={"password": pwd, "values": {
+        "security.denied_networks": "127.0.0.1/32"}})
+    assert r.status == 400
+    # mauvais mot de passe de confirmation
+    r = await c.post("/__proxy/settings", headers=own, json={"password": "x", "values": {
+        "cache.max_size_mb": "100"}})
+    assert r.status == 403
+    assert ep.Settings(ini).cache_max != 100 * 1024 * 1024
+
+
+async def test_changer_le_mot_de_passe_depuis_la_page(env, tmp_path):
+    proxy, c, own, ini = await _admin_with_ini(env, tmp_path)
+    old = proxy.cfg.status_password
+    proxy.sessions["autre-navigateur"] = time.time() + 3600
+    for body, code in (({"old": "faux", "new": "x" * 12, "new2": "x" * 12}, 403),
+                       ({"old": old, "new": "court", "new2": "court"}, 400),
+                       ({"old": old, "new": "abcdefghij1", "new2": "abcdefghij2"}, 400)):
+        assert (await c.post("/__proxy/password", headers=own, json=body)).status == code
+    r = await c.post("/__proxy/password", headers=own,
+                     json={"old": old, "new": "NouveauMotDePasse42", "new2": "NouveauMotDePasse42"})
+    assert (await r.json())["ok"]
+    assert proxy.cfg.status_password == "NouveauMotDePasse42"
+    assert ep.Settings(ini).status_password == "NouveauMotDePasse42"
+    assert "autre-navigateur" not in proxy.sessions          # les autres deconnectes
+    assert (await c.get("/__proxy/stats.json")).status == 200 # moi, toujours connecte
+
+
+def test_redemarrage_garde_connexions_et_bannissements(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    cfg = ep.Settings(ini, overrides={("log", "file"): ""})
+    cfg.status_password = "x" * 12
+    p1 = ep.EmbyProxy(cfg)
+    p1.sessions["tok"] = time.time() + 3600
+    p1.guard.banned["203.0.113.7"] = time.time() + 600
+    p2 = ep.EmbyProxy(ep.Settings(ini), previous=p1)
+    assert "tok" in p2.sessions and "203.0.113.7" in p2.guard.active_bans()

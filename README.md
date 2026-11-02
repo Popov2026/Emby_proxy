@@ -93,21 +93,25 @@ l'utilisateur.
 - Journal sur disque `emby_security.log`, relu au redémarrage.
 
 ### Onglet Configuration
-- **Adresse du serveur Emby** et **clé API**, modifiables depuis la page.
-- Bouton **Tester la connexion** : nom du serveur, version d'Emby, temps de
-  réponse, et validité de la clé API.
-- **Enregistrer** applique **immédiatement**, sans redémarrage, et écrit dans
-  `emby_proxy.ini` en gardant ses commentaires.
-- Garde-fous, car cette adresse décide où partent les mots de passe des
-  utilisateurs :
-  - il faut **retaper le mot de passe** de la page pour confirmer ;
-  - les modifications ne sont possibles **que depuis le réseau local** ;
-  - la clé API n'est jamais renvoyée à la page (seulement ses 4 derniers
-    caractères) ;
-  - chaque modification est tracée dans l'onglet Sécurité ;
-  - en passant à un autre serveur, le cache des vignettes est vidé.
-- Sous Docker, si l'adresse vient de `docker-compose.yml`, la page prévient
-  que cette valeur reprendra le dessus au redémarrage.
+**Tous les réglages se font dans la page d'administration**
+(`http://192.168.1.123:8098/`), sans jamais éditer de fichier :
+
+- Serveur Emby (adresse, clé API, bouton **Tester la connexion**), ports,
+  HTTPS, cache, sécurité (réseau local, relais, bannissements, débit),
+  activité et journaux, page d'administration, journal technique.
+- **Enregistrer…** : mot de passe de la page à retaper, valeurs vérifiées
+  (champ en rouge si invalide), écrites dans `emby_proxy.ini` puis relues.
+- Les réglages marqués « au redémarrage » (ports, HTTPS, dossiers…) : bouton
+  **Redémarrer le proxy maintenant**. Le proxy redémarre seul, sans couper
+  ta connexion à la page ; si les nouveaux réglages l'empêchent de démarrer
+  (port déjà pris…), il reprend les anciens et le signale.
+- Garde-fous : impossible de se bloquer soi-même (réseau local qui
+  n'inclut plus ton adresse, adresse refusée…), port déjà utilisé refusé,
+  certificat introuvable refusé, modification seulement depuis le réseau
+  local, tracée dans l'onglet Sécurité.
+- **Changer le mot de passe** de la page (10 caractères minimum) : les
+  autres connexions à la page sont fermées.
+- Si Emby ne répond pas, la page s'ouvre directement sur cet onglet.
 
 ### Tout le reste passe tel quel
 API, lecture vidéo (avec avance rapide / reprise), WebSocket des applications
