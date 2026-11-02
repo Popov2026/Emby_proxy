@@ -4,7 +4,9 @@ services:
     container_name: emby-proxy
     restart: unless-stopped
     ports:
-      - "8097:8097"
+      - "8097:8097"     # utilisateurs (a rediriger sur la box)
+      - "8098:8098"     # page d'administration : reseau local seulement,
+                        # NE PAS rediriger ce port sur la box
     environment:
       # Adresse du vrai serveur Emby, vue depuis le conteneur.
       EMBY_PROXY_UPSTREAM: "http://192.168.1.10:8096"

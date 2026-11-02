@@ -14,5 +14,5 @@ ENV EMBY_PROXY_CONFIG=/data/emby_proxy.ini \
     PYTHONUNBUFFERED=1
 VOLUME /data
 
-EXPOSE 8097
+EXPOSE 8097 8098
 CMD ["python", "emby_proxy.py"]

@@ -49,6 +49,9 @@ def fake_emby():
                             content_type="image/png")
 
     async def items(request):
+        tok = request.headers.get("X-Emby-Token") or request.query.get("X-Emby-Token")
+        if tok and tok not in ("TOKPAUL", "TOKMARIE", "tok"):
+            return web.Response(status=401)          # jeton inconnu d'Emby
         if request.query.get("Ids"):           # resolution avec le jeton utilisateur
             calls.setdefault("resolve_user", []).append(
                 request.headers.get("X-Emby-Token"))
@@ -152,7 +155,9 @@ async def env(aiohttp_server, aiohttp_client, tmp_path):
     async def make(**sec):
         over = {("proxy", "upstream"): str(emby.make_url("")).rstrip("/"),
                 ("cache", "dir"): str(tmp_path / "cache"),
-                ("log", "file"): ""}
+                ("log", "file"): "",
+                # page d'etat montee sur le meme port : un seul client de test
+                ("status", "port"): "0"}
         for k, v in sec.items():
             section, key = k.split("__")
             over[(section, key)] = v
@@ -674,7 +679,7 @@ async def test_config_enregistrer_applique_tout_de_suite(env, aiohttp_server, tm
     srv1 = await aiohttp_server(emby_app)
     cfg = ep.Settings(ini, overrides={("proxy", "upstream"): str(srv1.make_url("")).rstrip("/"),
                                       ("cache", "dir"): str(tmp_path / "cache"),
-                                      ("log", "file"): ""})
+                                      ("log", "file"): "", ("status", "port"): "0"})
     proxy = ep.EmbyProxy(cfg)
     from aiohttp.test_utils import TestClient, TestServer
     c = TestClient(TestServer(proxy.build_app()))
@@ -754,3 +759,127 @@ def test_normalisation_adresse_emby():
                 "http://x/?a=1", "pas une adresse", "http://a b:8096",
                 "javascript:alert(1)", "http://[zz]:1"):
         assert n(bad) == "", bad
+
+
+
+# ---------------------------------------------------------------------
+#  Audit de securite (2e passe)
+# ---------------------------------------------------------------------
+async def test_administration_sur_un_port_separe(env, aiohttp_client):
+    make, _, _ = env
+    proxy, c = await make(status__port="8098")
+    # le port des utilisateurs ne sert plus du tout la page d'administration
+    for path in ("/__proxy/", "/__proxy/login", "/__proxy/stats.json"):
+        assert (await c.get(path, allow_redirects=False)).status == 404
+    a = await aiohttp_client(proxy.build_admin_app())
+    r = await a.get("/", allow_redirects=False)
+    assert r.status == 302 and r.headers["Location"] == "/__proxy/"
+    r = await a.get("/__proxy/login")
+    csp = r.headers["Content-Security-Policy"]
+    assert "frame-ancestors 'none'" in csp and r.headers["X-Frame-Options"] == "DENY"
+    await login(a, proxy)
+    assert (await a.get("/__proxy/stats.json")).status == 200
+    # pas de gros envoi sur la page d'administration
+    own = {"Origin": str(a.make_url("")).rstrip("/")}
+    r = await a.post("/__proxy/login", data={"password": "x" * 400_000}, headers=own)
+    assert r.status == 413
+
+
+async def test_connexion_geante_refusee_sans_tout_lire(env):
+    make, _, calls = env
+    _, c = await make()
+
+    async def gros():                       # envoi "chunked" : pas de taille annoncee
+        for _ in range(64):
+            yield b"x" * 65536              # 4 Mo au total
+    r = await c.post("/emby/Users/AuthenticateByName", data=gros())
+    assert r.status == 413 and calls["login"] == 0
+
+
+async def test_fausse_activite_impossible_sans_compte(env):
+    make, _, _ = env
+    proxy, c = await make()
+    # Paul se connecte normalement
+    await c.get("/emby/Users/%s/Views?%s" % (UID, q()))
+    # un pirate sans compte se fait passer pour l'appareil et l'utilisateur de Paul
+    pirate = q(**{"X-Emby-Token": "PIRATE"})
+    r = await c.get("/emby/Users/%s/Items?SearchTerm=honteux&%s" % (UID, pirate))
+    assert r.status == 401
+    paul = [u for u in proxy.activity.snapshot()["clients"] if u["user"] != "inconnu"]
+    assert len(paul) == 1
+    assert not any("honteux" in e["text"] for e in paul[0]["events"])
+    # un autre compte valable qui reprend l'identifiant d'appareil de Paul
+    marie = q(**{"X-Emby-Token": "TOKMARIE"})
+    await c.get("/emby/Users/%s/Items?SearchTerm=autre&%s" % ("b" * 32, marie))
+    cards = proxy.activity.snapshot()["clients"]
+    paul = [u for u in cards if "Accueil" in [e["text"] for e in u["events"]]][0]
+    assert not any("autre" in e["text"] for e in paul["events"])
+
+
+async def test_une_seule_fiche_apres_connexion(env):
+    make, _, _ = env
+    proxy, c = await make()
+    sans_jeton = "&".join("%s=%s" % kv for kv in WEB.items()
+                          if kv[0] != "X-Emby-Token")
+    await c.post("/emby/Users/AuthenticateByName?" + sans_jeton,
+                 json={"Username": "Paul", "Pw": "bon"})
+    await c.get("/emby/Users/%s/Views?%s" % (UID, q()))      # avec le jeton recu
+    cards = [u for u in proxy.activity.snapshot()["clients"] if u["user"] == "Paul"]
+    assert len(cards) == 1
+    texts = [e["text"] for e in cards[0]["events"]]
+    assert "Connexion reussie (Paul)" in texts and "Accueil" in texts
+
+
+async def test_bannissement_ipv6_par_bloc(env):
+    make, _, calls = env
+    proxy, c = await make(security__trusted_proxies="127.0.0.1/32",
+                          security__login_max_failures="3")
+    for i in range(3):                       # 3 adresses differentes, meme abonne
+        await c.post("/emby/Users/AuthenticateByName", json={"Pw": "faux"},
+                     headers={"X-Forwarded-For": "2a01:e0a:1:2::%x" % (i + 1)})
+    r = await c.get("/emby/Users/u1/Items",
+                    headers={"X-Forwarded-For": "2a01:e0a:1:2:ffff::9"})
+    assert r.status == 403                   # tout le bloc /64 est banni
+    r = await c.get("/emby/Users/u1/Items",
+                    headers={"X-Forwarded-For": "2a01:e0a:1:3::1"})
+    assert r.status == 200                   # le voisin n'est pas touche
+    assert "2a01:e0a:1:2::/64" in proxy.guard.active_bans()
+
+
+async def test_bannissements_conserves_au_redemarrage(env, tmp_path):
+    make, _, _ = env
+    log_file = tmp_path / "s.log"
+    proxy, c = await make(security__login_max_failures="2",
+                          activity__security_log_file=str(log_file))
+    for _ in range(2):
+        await c.post("/emby/Users/AuthenticateByName", json={"Pw": "faux"})
+    proxy2, c2 = await make(activity__security_log_file=str(log_file))
+    assert "127.0.0.1" in proxy2.guard.active_bans()
+    assert (await c2.get("/emby/Users/u1/Items")).status == 403
+    proxy2.guard.unban("127.0.0.1")
+    proxy2.seclog.add("unban", "127.0.0.1", ban_key="127.0.0.1")
+    proxy3, _ = await make(activity__security_log_file=str(log_file))
+    assert proxy3.guard.active_bans() == {}
+
+
+async def test_journal_texte_non_falsifiable(env, caplog):
+    make, _, _ = env
+    _, c = await make(security__denied_networks="127.0.0.1/32")
+    import logging
+    with caplog.at_level(logging.INFO, logger="emby_proxy"):
+        await c.get("/emby/x%0a2026-01-01 FAUSSE LIGNE")
+    assert all("\n" not in r.getMessage() for r in caplog.records)
+
+
+async def test_vignette_svg_neutralisee(env):
+    make, _, _ = env
+    _, c = await make()
+    r = await c.get("/Items/3/Images/Logo?tag=s")
+    assert "sandbox" in r.headers["Content-Security-Policy"]
+
+
+def test_cle_de_bannissement():
+    k = ep.Guard.key
+    assert k("1.2.3.4") == "1.2.3.4"
+    assert k("::ffff:1.2.3.4") == "1.2.3.4"
+    assert k("2a01:e0a:1:2::5") == "2a01:e0a:1:2::/64"

@@ -31,7 +31,7 @@ Lancement :
     pythonw emby_proxy.py --gui              petite fenetre de suivi (Windows)
     python emby_proxy.py --config autre.ini  autre fichier de reglages
 
-Page d'etat (reseau local + mot de passe) : http://<proxy>:8097/__proxy/
+Page d'etat (port a part, reseau local + mot de passe) : http://<proxy>:8098/
 """
 
 import argparse
@@ -113,6 +113,8 @@ DEFAULTS = {
         "password": "",
         "allow_internet": "false",
         "session_hours": "12",
+        "port": "8098",
+        "host": "",
     },
     "activity": {
         "enabled": "true",
@@ -140,6 +142,7 @@ ENV_OVERRIDES = {
     "EMBY_PROXY_ACTIVITY_LOG": ("activity", "log_file"),
     "EMBY_PROXY_SECURITY_LOG": ("activity", "security_log_file"),
     "EMBY_PROXY_STATUS_PASSWORD": ("status", "password"),
+    "EMBY_PROXY_STATUS_PORT": ("status", "port"),
 }
 
 
@@ -273,6 +276,8 @@ class Settings:
         self.status_password = st.get("password", "").strip()
         self.status_internet = st.getboolean("allow_internet")
         self.session_hours = st.getfloat("session_hours")
+        self.status_port = st.getint("port")
+        self.status_host = st.get("host", "").strip() or self.listen_host
 
     @staticmethod
     def _path(base, value):
@@ -354,6 +359,14 @@ password =
 allow_internet = false
 # Duree d'une connexion a la page d'etat.
 session_hours = 12
+# Port de la page d'etat, SEPARE de celui des utilisateurs : une faille dans
+# l'interface web d'Emby ne peut pas atteindre la page d'administration.
+# Ne jamais rediriger ce port vers Internet. 0 = meme port que le proxy
+# (deconseille).
+port = 8098
+# Adresse d'ecoute de la page d'etat (vide = la meme que le proxy ;
+# 127.0.0.1 = accessible seulement depuis cette machine).
+host =
 
 [activity]
 # Suivi de ce que font les utilisateurs (page d'etat, onglet Activite).
@@ -589,6 +602,21 @@ class Guard:
     def is_local(self, ip):
         return self._in(ip, self.cfg.local)
 
+    @staticmethod
+    def key(ip):
+        """Unite de bannissement et de debit : l'adresse IPv4, ou le bloc /64
+        en IPv6 (un abonne en a des milliards : sinon il change d'adresse a
+        chaque essai et echappe au bannissement)."""
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return ip
+        if a.version == 6:
+            if a.ipv4_mapped:                  # ::ffff:1.2.3.4 = une IPv4
+                return str(a.ipv4_mapped)
+            return str(ipaddress.ip_network("%s/64" % a, strict=False))
+        return str(a)
+
     def client_ip(self, request):
         ip = request.remote or ""
         if self.cfg.trusted and self._in(ip, self.cfg.trusted):
@@ -603,11 +631,12 @@ class Guard:
     def check(self, ip, path):
         """-> None si autorise, sinon (statut, message)."""
         now = time.time()
-        until = self.banned.get(ip)
+        k = self.key(ip)
+        until = self.banned.get(k)
         if until:
             if until > now:
                 return 403, "Adresse bannie temporairement (mots de passe faux)."
-            del self.banned[ip]
+            self.banned.pop(k, None)
         if self.cfg.denied and self._in(ip, self.cfg.denied):
             return 403, "Adresse refusee."
         if self.cfg.allowed and not self._in(ip, self.cfg.allowed):
@@ -615,12 +644,12 @@ class Guard:
         if self.cfg.block_admin and ADMIN_RE.match(path) and not self.is_local(ip):
             return 403, "Administration d'Emby interdite depuis Internet."
         if self.cfg.rate > 0:
-            tok, last = self.buckets.get(ip, (self.cfg.burst, now))
+            tok, last = self.buckets.get(k, (self.cfg.burst, now))
             tok = min(self.cfg.burst, tok + (now - last) * self.cfg.rate)
             if tok < 1:
-                self.buckets[ip] = [tok, now]
+                self.buckets[k] = [tok, now]
                 return 429, "Trop de requetes, ralentis."
-            self.buckets[ip] = [tok - 1, now]
+            self.buckets[k] = [tok - 1, now]
             if len(self.buckets) > 20000:          # menage des IP inactives
                 for k in [k for k, v in self.buckets.items() if now - v[1] > 60]:
                     del self.buckets[k]
@@ -628,29 +657,38 @@ class Guard:
 
     def login_result(self, ip, ok):
         """-> True si cet echec vient de declencher un bannissement."""
+        k = self.key(ip)
         if ok:
-            self.failures.pop(ip, None)
+            self.failures.pop(k, None)
             return False
         now = time.time()
-        q = self.failures.setdefault(ip, deque())
+        if len(self.failures) > 10000:           # menage : echecs trop anciens
+            for x in [x for x, d in self.failures.items()
+                      if not d or now - d[-1] > self.cfg.login_window]:
+                del self.failures[x]
+        if len(self.banned) > 10000:
+            for x in [x for x, t in self.banned.items() if t <= now]:
+                del self.banned[x]
+        q = self.failures.setdefault(k, deque())
         q.append(now)
         while q and now - q[0] > self.cfg.login_window:
             q.popleft()
         if len(q) >= self.cfg.login_max:
-            self.banned[ip] = now + self.cfg.ban_seconds
-            self.failures.pop(ip, None)
+            self.banned[k] = now + self.cfg.ban_seconds
+            self.failures.pop(k, None)
             log.warning("bannissement de %s pour %d min (%d mots de passe faux)",
-                        ip, self.cfg.ban_seconds / 60, self.cfg.login_max)
+                        k, self.cfg.ban_seconds / 60, self.cfg.login_max)
             return True
         return False
 
     def unban(self, ip):
-        self.failures.pop(ip, None)
-        return self.banned.pop(ip, None) is not None
+        k = self.key(ip) if "/" not in ip else ip
+        self.failures.pop(k, None)
+        return self.banned.pop(k, None) is not None
 
     def active_bans(self):
         now = time.time()
-        return {ip: int(t - now) for ip, t in self.banned.items() if t > now}
+        return {ip: int(t - now) for ip, t in list(self.banned.items()) if t > now}
 
 
 def prune_jsonl(path, days):
@@ -711,11 +749,15 @@ class SecurityLog:
             except OSError:
                 pass
 
-    def add(self, kind, ip, local=False, user="", client="", device="", detail=""):
+    def add(self, kind, ip, local=False, user="", client="", device="", detail="",
+            ban_key=""):
         now = time.time()
         e = {"date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-             "type": kind, "ip": ip, "local": bool(local), "user": user or "",
-             "client": client or "", "device": device or "", "detail": detail or ""}
+             "type": kind, "ip": ip, "local": bool(local), "user": (user or "")[:100],
+             "client": (client or "")[:100], "device": (device or "")[:100],
+             "detail": (detail or "")[:300]}
+        if ban_key:
+            e["ban_key"] = ban_key
         if kind == "refused" and self.events:
             last = self.events[-1]          # rafales de refus : une seule ligne
             if last["type"] == "refused" and last["ip"] == ip and \
@@ -738,9 +780,18 @@ class SecurityLog:
                 pass
         return e
 
+    def restore_bans(self, guard, ban_seconds):
+        """Un redemarrage du proxy ne doit pas lever les bannissements."""
+        now = time.time()
+        for e in list(self.events):
+            if e.get("type") == "ban" and e["t"] + ban_seconds > now:
+                guard.banned[e.get("ban_key") or guard.key(e["ip"])] = e["t"] + ban_seconds
+            elif e.get("type") == "unban":
+                guard.banned.pop(e.get("ban_key") or guard.key(e["ip"]), None)
+
     def snapshot(self, guard):
         now = time.time()
-        day = [e for e in self.events if now - e["t"] < 86400]
+        day = [e for e in list(self.events) if now - e["t"] < 86400]
         fails = {}
         for e in day:
             if e["type"] in ("login_fail", "status_fail"):
@@ -761,6 +812,7 @@ class SecurityLog:
                         "device": e.get("device", ""), "detail": e.get("detail", ""),
                         "count": e.get("count", 1)}
                        for e in list(self.events)[-1000:][::-1]],
+            "ban_seconds": 0,
         }
 
 
@@ -889,7 +941,7 @@ class Activity:
         for name in ("X-Emby-Authorization", "Authorization"):
             raw = request.headers.get(name, "")
             if "Token=" in raw or "DeviceId=" in raw or "Client=" in raw:
-                f.update({k.lower(): v for k, v in _AUTH_KV.findall(raw)})
+                f.update({k.lower(): v[:200] for k, v in _AUTH_KV.findall(raw)})
         q = {k.lower(): v for k, v in request.query.items()}
         for src, dst in (("x-emby-client", "client"), ("x-emby-device-name", "device"),
                          ("x-emby-device-id", "deviceid"),
@@ -905,18 +957,27 @@ class Activity:
                        ("X-Emby-Device-Id", "deviceid")):
             if request.headers.get(h) and not f.get(dst):
                 f[dst] = request.headers[h]
-        return f
+        return {k: str(v)[:200] for k, v in f.items()}
 
-    def identify(self, request):
+    def identify(self, request, trusted=True):
+        """trusted = Emby a accepte la requete (jeton valable). Sinon les
+        identifiants annonces (appareil, utilisateur) ne sont que des
+        pretentions : la requete est rangee a part, par adresse IP, sans
+        jamais toucher a la fiche d'un vrai utilisateur."""
         ip = request[CLIENT_IP]
         f = self._auth_fields(request)
-        token = f.get("token", "")
-        if f.get("deviceid"):
-            key = "dev:" + f["deviceid"]
+        token = f.get("token", "") if trusted else ""
+        th = hashlib.sha256(token.encode()).hexdigest()[:12] if token else ""
+        ua = request.headers.get("User-Agent", "")
+        if not trusted:
+            key = "anon:%s:%s" % (ip, hashlib.sha1(ua.encode()).hexdigest()[:8])
+        elif f.get("deviceid"):
+            # appareil + jeton : un autre compte qui reprend le meme
+            # identifiant d'appareil n'arrive pas dans cette fiche
+            key = "dev:%s:%s" % (f["deviceid"], th)
         elif token:
-            key = "tok:" + hashlib.sha1(token.encode()).hexdigest()[:16]
+            key = "tok:" + th
         else:
-            ua = request.headers.get("User-Agent", "")
             key = "ip:%s:%s" % (ip, hashlib.sha1(ua.encode()).hexdigest()[:8])
         c = self.clients.get(key)
         if c is None:
@@ -933,6 +994,8 @@ class Activity:
         c.device = f.get("device") or c.device
         c.device_id = f.get("deviceid") or c.device_id
         c.version = f.get("version") or c.version
+        if not trusted:
+            return c
         if token:
             c.token = token
         uid = f.get("userid", "")
@@ -942,12 +1005,30 @@ class Activity:
         if uid:
             c.user_id = uid.lower()
             if token:
+                if len(self.token_user) > 20000:
+                    self.token_user.clear()
                 self.token_user[token] = c.user_id
         elif token and token in self.token_user:
             c.user_id = self.token_user[token]
         if c.user_id and not c.user_name:
             c.user_name = self.info.users.get(c.user_id, "")
         return c
+
+    def _rekey(self, c, key):
+        if key == c.key:
+            return
+        old = self.clients.pop(c.key, None)
+        if key in self.clients:                   # fiche deja ouverte : on fusionne
+            dst = self.clients[key]
+            for ev in c.events:
+                ev["client"] = key
+                dst.events.append(ev)
+            dst.user_id, dst.user_name = c.user_id, c.user_name
+            return
+        for ev in c.events:
+            ev["client"] = key
+        c.key = key
+        self.clients[key] = old or c
 
     def _forget_old(self, force=False):
         limit = time.time() - self.cfg.activity_keep_hours * 3600
@@ -1183,6 +1264,10 @@ class Activity:
                 if data.get("AccessToken"):
                     self.token_user[data["AccessToken"]] = uid
                     c.token = data["AccessToken"]
+                    if c.device_id:            # la suite de la session arrivera
+                        self._rekey(c, "dev:%s:%s" % (   # avec ce jeton
+                            c.device_id,
+                            hashlib.sha256(c.token.encode()).hexdigest()[:12]))
             return
         if RE_USER.match(p) and isinstance(data, dict) and data.get("Name"):
             uid = RE_USER.match(p).group("uid").lower()
@@ -1203,8 +1288,8 @@ class Activity:
         self._forget_old()
         out = []
         for c in sorted(self.clients.values(), key=lambda x: -x.last_seen):
-            if not c.user_id and not c.client and c.requests < 5:
-                continue                   # robots, sondes : sans interet
+            if not c.user_id and not c.events:
+                continue                   # robots, sondes, pages publiques
             pl = None
             if c.playing and now - c.playing["updated"] < 600:
                 p = c.playing
@@ -1261,6 +1346,29 @@ def npath(request):
         return norm_path(request.path)
 
 
+def _safe(txt, n=200):
+    """Texte venu d'un client, rendu inoffensif pour le journal texte (pas de
+    retour a la ligne qui fabriquerait une fausse ligne de journal)."""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", str(txt))[:n]
+
+
+class TooLarge(Exception):
+    pass
+
+
+async def read_limited(request, limit):
+    """Lit le corps d'une requete sans jamais depasser `limit` octets, meme
+    envoye en morceaux (chunked, sans Content-Length)."""
+    if request.content_length is not None and request.content_length > limit:
+        raise TooLarge()
+    buf = bytearray()
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        buf.extend(chunk)
+        if len(buf) > limit:
+            raise TooLarge()
+    return bytes(buf)
+
+
 def _decode(raw, encoding):
     enc = (encoding or "").lower()
     if enc == "gzip":
@@ -1298,6 +1406,7 @@ class EmbyProxy:
         self.up_host = up.netloc
         self.activity = Activity(cfg, self.guard) if cfg.activity_enabled else None
         self.seclog = SecurityLog(cfg.security_log)
+        self.seclog.restore_bans(self.guard, cfg.ban_seconds)
         self.sessions = {}          # jeton de la page d'etat -> expiration
         self.warnings = {}
         if not cfg.tls_cert and cfg.listen_host not in ("127.0.0.1", "::1", "localhost"):
@@ -1388,11 +1497,32 @@ class EmbyProxy:
             info.pending.pop(i, None)
 
     def build_app(self):
+        """Application des utilisateurs (le proxy vers Emby). La page
+        d'administration n'y est montee que si status.port = 0."""
         app = web.Application(middlewares=[self.security_mw],
                               client_max_size=0)
         app.on_startup.append(self.startup)
         app.on_cleanup.append(self.cleanup)
         app.on_response_prepare.append(self.add_security_headers)
+        if not self.cfg.status_port:
+            self._admin_routes(app)
+        app.router.add_route("*", "/{tail:.*}", self.handle)
+        return app
+
+    def build_admin_app(self):
+        """Page d'administration sur son propre port : autre origine que
+        l'interface web d'Emby, petite taille de requete maximale."""
+        app = web.Application(middlewares=[self.admin_mw],
+                              client_max_size=256 * 1024)
+        app.on_response_prepare.append(self.add_admin_headers)
+
+        async def root(request):
+            raise web.HTTPFound("/__proxy/")
+        app.router.add_get("/", root)
+        self._admin_routes(app)
+        return app
+
+    def _admin_routes(self, app):
         app.router.add_get("/__proxy/", self.status_page)
         app.router.add_get("/__proxy/login", self.login_page)
         app.router.add_post("/__proxy/login", self.login_post)
@@ -1405,8 +1535,6 @@ class EmbyProxy:
         app.router.add_get("/__proxy/config.json", self.config_json)
         app.router.add_post("/__proxy/config", self.config_save)
         app.router.add_post("/__proxy/config/test", self.config_test)
-        app.router.add_route("*", "/{tail:.*}", self.handle)
-        return app
 
     # -- securite ------------------------------------------------------
     @web.middleware
@@ -1425,6 +1553,8 @@ class EmbyProxy:
                 "Sinon tout Internet est vu comme le reseau local et un "
                 "bannissement touche tout le monde." % request.remote)
             log.warning(self.warnings["relay"])
+        if request.path.startswith("/__proxy/") and self.cfg.status_port:
+            raise web.HTTPNotFound()          # administration : autre port
         if request.path.startswith("/__proxy/") and self._session_ok(request) \
                 and (self.guard.is_local(ip) or self.cfg.status_internet):
             # administrateur deja connecte : jamais bloque par un bannissement
@@ -1434,21 +1564,50 @@ class EmbyProxy:
         if refus:
             self.guard.blocked += 1
             if refus[0] != 429:
-                log.info("refuse %s %s %s : %s", ip, request.method,
-                         request.path, refus[1])
+                log.info("refuse %s %s %s : %s", ip, _safe(request.method, 10),
+                         _safe(request.path), refus[1])
                 f = Activity._auth_fields(request)
                 self.seclog.add("refused", ip, self.guard.is_local(ip),
                                 client=f.get("client", ""), device=f.get("device", ""),
                                 detail="%s (%s %s)" % (refus[1], request.method,
                                                        request.path[:80]))
                 if self.activity:
-                    c = self.activity.identify(request)
+                    c = self.activity.identify(request, trusted=False)
                     self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
                         refus[1], request.method, request.path[:80]))
             return web.Response(status=refus[0], text=refus[1])
         if request.path.startswith("/__proxy/"):
             return await self._status_gate(request, handler, ip)
         return await handler(request)
+
+    @web.middleware
+    async def admin_mw(self, request, handler):
+        ip = self.guard.client_ip(request)
+        request[CLIENT_IP] = ip
+        request[NPATH] = norm_path(request.path)
+        if not (self.guard.is_local(ip) or self.cfg.status_internet):
+            raise web.HTTPNotFound()
+        if not request.path.startswith("/__proxy/"):
+            return await handler(request)
+        if not self._session_ok(request):
+            refus = self.guard.check(ip, request[NPATH])
+            if refus:
+                return web.Response(status=refus[0], text=refus[1])
+        return await self._status_gate(request, handler, ip)
+
+    async def add_admin_headers(self, request, response):
+        h = response.headers
+        h["X-Content-Type-Options"] = "nosniff"
+        h["X-Frame-Options"] = "DENY"
+        h["Referrer-Policy"] = "no-referrer"
+        h["Cross-Origin-Opener-Policy"] = "same-origin"
+        h["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'unsafe-inline'; "
+            "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; "
+            "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+        h.pop("Server", None)
+        if self.cfg.tls_cert:
+            h["Strict-Transport-Security"] = "max-age=31536000"
 
     # -- page d'etat : reseau local + mot de passe + anti-site-piege -------
     async def _status_gate(self, request, handler, ip):
@@ -1471,12 +1630,17 @@ class EmbyProxy:
     def _same_origin(self, request):
         """Un site piege ouvert dans le navigateur ne doit pas pouvoir agir
         sur la page d'etat : la demande doit venir de la page elle-meme."""
-        own = "%s://%s" % (request.scheme, request.host)
+        owns = {"%s://%s" % (request.scheme, request.host)}
+        if self.guard._in(request.remote or "", self.cfg.trusted):
+            proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+            host = request.headers.get("X-Forwarded-Host", request.host)
+            owns.add("%s://%s" % (proto.split(",")[0].strip(),
+                                  host.split(",")[0].strip()))
         origin = request.headers.get("Origin")
         if origin:
-            return origin == own
+            return origin in owns
         ref = request.headers.get("Referer", "")
-        return ref == own or ref.startswith(own + "/")
+        return any(ref == o or ref.startswith(o + "/") for o in owns)
 
     def _session_ok(self, request):
         tok = request.cookies.get("epx_session", "")
@@ -1534,28 +1698,35 @@ class EmbyProxy:
         is_login = request.method == "POST" and bool(LOGIN_RE.match(np))
         body_json = None
         if request.method == "POST" and request.body_exists and (
-                is_login or (act and RE_PLAYING.match(np))) \
-                and (request.content_length or 0) < 1_000_000:
-            data = await request.read()              # petit JSON : on le lit
+                is_login or (act and RE_PLAYING.match(np))):
+            try:                                     # petit JSON : on le lit,
+                data = await read_limited(request, 256 * 1024)   # borne
+            except TooLarge:
+                return web.Response(status=413, text="Requete trop grosse.")
             try:
                 body_json = json.loads(data or b"{}")
             except ValueError:
                 body_json = None
-        if act:
-            c = act.identify(request)
-            todo = act.before(c, request, body_json)
-            tee = act.wants_body(request)
-            if tee:
-                headers["Accept-Encoding"] = "gzip, deflate"
+        if act and act.wants_body(request):
+            headers["Accept-Encoding"] = "gzip, deflate"
         try:
             up = await self.session.request(
                 request.method, url, headers=headers,
                 data=data, allow_redirects=False)
         except (ClientError, asyncio.TimeoutError, OSError) as exc:
             self.stats.upstream_errors += 1
-            log.warning("Emby injoignable (%s %s) : %s", request.method,
-                        request.path, exc)
+            log.warning("Emby injoignable (%s %s) : %s", _safe(request.method, 10),
+                        _safe(request.path), exc)
             return web.Response(status=502, text="Serveur Emby injoignable.")
+        if act:
+            # L'activite n'est attribuee a un utilisateur qu'une fois la
+            # requete acceptee par Emby : sinon n'importe qui pourrait, sans
+            # compte, ecrire de fausses actions dans la fiche d'un autre.
+            trusted = up.status < 400
+            c = act.identify(request, trusted=trusted)
+            if trusted or is_login:
+                todo = act.before(c, request, body_json)
+            tee = trusted and act.wants_body(request)
         try:
             if is_login and up.status in (200, 401, 403):
                 self._record_login(request, body_json, up.status == 200)
@@ -1602,16 +1773,19 @@ class EmbyProxy:
         self.seclog.add("login_ok" if ok else "login_fail", ip, local, user,
                         f.get("client", ""), f.get("device", ""))
         if self.guard.login_result(ip, ok):
+            k = self.guard.key(ip)
             self.seclog.add("ban", ip, local, user, f.get("client", ""),
                             f.get("device", ""),
-                            "%d mots de passe faux en %d min : banni %d min" % (
+                            "%d mots de passe faux en %d min : banni %d min%s" % (
                                 self.cfg.login_max, self.cfg.login_window / 60,
-                                self.cfg.ban_seconds / 60))
+                                self.cfg.ban_seconds / 60,
+                                " (bloc %s)" % k if k != ip else ""), ban_key=k)
 
     # -- WebSocket des applications Emby ----------------------------------
     async def proxy_ws(self, request):
         if self.activity:
-            self.activity.identify(request)
+            tok = Activity._auth_fields(request).get("token", "")
+            self.activity.identify(request, trusted=tok in self.activity.token_user)
         ws_url = re.sub(r"^http", "ws", self.cfg.upstream) + request.raw_path
         keep = {"cookie", "authorization", "x-emby-authorization", "x-emby-token",
                 "user-agent", "origin"}
@@ -1657,7 +1831,10 @@ class EmbyProxy:
         etag = meta.get("etag", "")
         headers = {"Content-Type": meta.get("content_type", "image/jpeg"),
                    "ETag": etag, "X-Proxy-Cache": state,
-                   "Cache-Control": "public, max-age=%d" % meta.get("max_age", 86400)}
+                   "Cache-Control": "public, max-age=%d" % meta.get("max_age", 86400),
+                   # une image SVG piegee ouverte directement ne peut rien executer
+                   "Content-Security-Policy": "default-src 'none'; "
+                                              "style-src 'unsafe-inline'; sandbox"}
         if meta.get("last_modified"):
             headers["Last-Modified"] = meta["last_modified"]
         inm = request.headers.get("If-None-Match", "")
@@ -1763,7 +1940,7 @@ class EmbyProxy:
             "cache_max_bytes": c["max_bytes"],
             "warnings": list(self.warnings.values()),
             "active_users": sum(
-                1 for x in self.activity.clients.values()
+                1 for x in list(self.activity.clients.values())
                 if time.time() - x.last_seen < self.cfg.activity_idle_minutes * 60
                 and (x.user_id or x.client)) if self.activity else 0,
         }
@@ -1854,7 +2031,8 @@ class EmbyProxy:
                             "confirmation faux")
             if self.guard.login_result(ip, False):
                 self.seclog.add("ban", ip, local, detail="configuration : %d mots de "
-                                "passe faux" % self.cfg.login_max)
+                                "passe faux" % self.cfg.login_max,
+                                ban_key=self.guard.key(ip))
             return web.json_response({"ok": False, "error": "Mot de passe de "
                                       "confirmation incorrect."}, status=403)
         url = normalize_upstream(str(data.get("upstream", "")))
@@ -1914,8 +2092,8 @@ class EmbyProxy:
         ip = str(data.get("ip", ""))[:64]
         ok = self.guard.unban(ip)
         if ok:
-            self.seclog.add("unban", ip, self.guard.is_local(ip),
-                            detail="par %s" % request[CLIENT_IP])
+            self.seclog.add("unban", ip, False, detail="par %s" % request[CLIENT_IP],
+                            ban_key=self.guard.key(ip) if "/" not in ip else ip)
         return web.json_response({"ok": ok})
 
     async def login_page(self, request, error=""):
@@ -1936,7 +2114,8 @@ class EmbyProxy:
                             client=request.headers.get("User-Agent", "")[:60])
             if self.guard.login_result(ip, False):
                 self.seclog.add("ban", ip, local, detail="page d'etat : %d mots de "
-                                "passe faux" % self.cfg.login_max)
+                                "passe faux" % self.cfg.login_max,
+                                ban_key=self.guard.key(ip))
             return await self.login_page(request, "Mot de passe incorrect.")
         self.guard.login_result(ip, True)
         self.seclog.add("status_ok", ip, local,
@@ -2247,11 +2426,30 @@ def ssl_context(cfg):
 
 async def serve(proxy, stop_event=None):
     """Demarre le serveur et attend stop_event (ou indefiniment)."""
+    ctx = ssl_context(proxy.cfg)
     runner = web.AppRunner(proxy.build_app(), access_log=None)
     await runner.setup()
+    runners = [runner]
     site = web.TCPSite(runner, proxy.cfg.listen_host, proxy.cfg.listen_port,
-                       ssl_context=ssl_context(proxy.cfg))
+                       ssl_context=ctx)
     await site.start()
+    if proxy.cfg.status_port:
+        admin = web.AppRunner(proxy.build_admin_app(), access_log=None)
+        await admin.setup()
+        runners.append(admin)
+        try:
+            await web.TCPSite(admin, proxy.cfg.status_host, proxy.cfg.status_port,
+                              ssl_context=ctx).start()
+        except OSError:
+            for r in runners:
+                await r.cleanup()
+            raise
+        log.info("page d'etat : %s://%s:%d/__proxy/", "https" if ctx else "http",
+                 proxy.cfg.status_host, proxy.cfg.status_port)
+    else:
+        proxy.warnings["same_port"] = (
+            "La page d'etat partage le port des utilisateurs (status.port = 0) : "
+            "mets-la sur un port a part (8098 par defaut).")
     try:
         if stop_event is None:
             await asyncio.Event().wait()
@@ -2259,7 +2457,8 @@ async def serve(proxy, stop_event=None):
             while not stop_event.is_set():
                 await asyncio.sleep(0.3)
     finally:
-        await runner.cleanup()
+        for r in reversed(runners):
+            await r.cleanup()
 
 
 def run_gui(cfg):
@@ -2288,7 +2487,8 @@ def run_gui(cfg):
     threading.Thread(target=worker, daemon=True).start()
 
     scheme = "https" if cfg.tls_cert else "http"
-    status_url = "%s://127.0.0.1:%d/__proxy/" % (scheme, cfg.listen_port)
+    status_url = "%s://127.0.0.1:%d/__proxy/" % (scheme, cfg.status_port
+                                                  or cfg.listen_port)
     root = tk.Tk()
     root.title("Emby Proxy")
     root.configure(bg="#16181f")
@@ -2340,6 +2540,13 @@ def run_gui(cfg):
     root.protocol("WM_DELETE_WINDOW", quit_)
 
     def refresh():
+        try:
+            _refresh()
+        except Exception:                 # jamais d'arret du rafraichissement
+            log.exception("fenetre de suivi")
+        root.after(1500, refresh)
+
+    def _refresh():
         d = proxy.snapshot()
         if errors:
             vals["state"].config(text="ARRETE : %s" % errors[0], fg="#e05555")
@@ -2348,8 +2555,8 @@ def run_gui(cfg):
         head.config(text="%s://%s:%d  ->  %s" % (scheme, cfg.listen_host,
                                                   cfg.listen_port, cfg.upstream))
         vals["users"].config(text=str(d["active_users"]))
-        fails = sum(1 for e in proxy.seclog.events if e["type"] == "login_fail"
-                    and time.time() - e["t"] < 86400)
+        fails = sum(1 for e in list(proxy.seclog.events)
+                    if e["type"] == "login_fail" and time.time() - e["t"] < 86400)
         vals["fails"].config(text=str(fails), fg="#e05555" if fails else fg)
         warn.config(text="\n".join("Attention : " + w for w in d["warnings"]))
         vals["hits"].config(text=str(d["cache_hits"]))
@@ -2362,7 +2569,6 @@ def run_gui(cfg):
         vals["blocked"].config(text=str(d["blocked"]))
         vals["bans"].config(text=", ".join(d["bans"]) or "aucune",
                             fg="#e05555" if d["bans"] else fg)
-        root.after(1500, refresh)
 
     refresh()
     root.mainloop()
@@ -2387,8 +2593,10 @@ def main(argv=None):
     cfg = Settings(cfg_path)
     setup_logging(cfg, to_console=not args.gui)
     if ensure_status_password(cfg_path, cfg):
-        log.warning("mot de passe de la page d'etat cree : %s  (dans %s, section "
-                    "[status])", cfg.status_password, cfg_path)
+        # jamais le mot de passe lui-meme dans le journal (on le partage
+        # parfois pour demander de l'aide)
+        log.warning("mot de passe de la page d'etat cree : voir %s, section [status] "
+                    "(ou bouton Copier le mot de passe de la fenetre)", cfg_path)
     if args.gui:
         return run_gui(cfg)
     proxy = EmbyProxy(cfg)

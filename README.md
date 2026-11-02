@@ -36,7 +36,11 @@ petite fenêtre de suivi) ou **en Docker** sur un NAS ou un serveur.
 |---|---|
 | **Administration bloquée depuis Internet** | Tableau de bord, redémarrage, clés API, plugins, utilisateurs… refusés hors du réseau local, quelle que soit la façon d'écrire l'adresse (`//emby/…`, `/mediabrowser/…`, `%2F`, `;…`, `..`) |
 | **Mots de passe faux** | 5 échecs en 15 min ⇒ adresse IP bannie 1 heure (sous toutes les formes d'adresse) |
-| **Page d'état protégée** | réseau local **et** mot de passe ; protégée contre les sites piégés ; bannissement après mots de passe faux |
+| **Page d'état protégée** | **port à part** (8098) : une faille dans l'interface web d'Emby ne peut pas l'atteindre ; réseau local **et** mot de passe ; protégée contre les sites piégés et l'intégration dans une autre page ; bannissement après mots de passe faux |
+| **Activité non falsifiable** | une action n'est attribuée à un utilisateur que si Emby a accepté sa requête : personne ne peut, sans compte, écrire dans la fiche d'un autre |
+| **IPv6** | bannissement et débit par bloc /64 : changer d'adresse dans son bloc ne sert à rien |
+| **Bannissements conservés** | un redémarrage du proxy ne les lève pas |
+| **Taille des requêtes bornée** | connexions et page d'état : pas de saturation de la mémoire par un envoi géant |
 | **Journal de sécurité** | toutes les tentatives de connexion, bannissements et refus, gardés sur disque |
 | **Avertissements** | HTTP sans chiffrement ; relais placé devant le proxy sans `trusted_proxies` |
 | **Débit limité** | 100 requêtes/s par adresse IP (pointes à 400) |
@@ -154,12 +158,17 @@ Sans fenêtre (console) : `py emby_proxy.py`.
    distance d'Emby utilisent la vraie adresse.
 
 ## Page d'état
-Depuis le réseau local seulement : **`http://ADRESSE-DU-PROXY:8097/__proxy/`**
+Depuis le réseau local seulement : **`http://ADRESSE-DU-PROXY:8098/`**
+
+Elle est sur un **port à part** (8098, réglage `[status] port`), distinct de
+celui des utilisateurs : ainsi, une faille dans l'interface web d'Emby ne
+peut pas l'atteindre. Sur le port des utilisateurs (8097), elle n'existe pas.
+Pour la réserver à la machine du proxy, mets `host = 127.0.0.1` dans la
+section `[status]`.
 
 Elle demande un **mot de passe**. Au premier lancement, le proxy en crée un et
-l'écrit dans `emby_proxy.ini`, section `[status]`. Il apparaît aussi dans le
-journal. Sous Windows, le bouton **Copier le mot de passe** de la fenêtre le
-copie.
+l'écrit dans `emby_proxy.ini`, section `[status]` (jamais dans le journal).
+Sous Windows, le bouton **Copier le mot de passe** de la fenêtre le copie.
 
 - Onglet **Activité** : les utilisateurs et le journal d'activité (voir plus
   haut).
@@ -173,7 +182,7 @@ copie.
 Depuis Internet, cette page n'existe pas (erreur 404).
 
 Les mêmes informations sont disponibles en JSON, après connexion, sur
-`/__proxy/activity.json`, `/__proxy/security.json` et `/__proxy/stats.json`.
+le port de la page d'état : `/__proxy/activity.json`, `/__proxy/security.json` et `/__proxy/stats.json`.
 
 ## Sécurité : à faire de ton côté
 - **HTTPS** si le proxy est ouvert sur Internet. Sans lui, les mots de passe
@@ -184,8 +193,8 @@ Les mêmes informations sont disponibles en JSON, après connexion, sur
   local : la page d'état et l'administration deviennent accessibles depuis
   Internet, et un bannissement bloque tout le monde. Le proxy détecte ce cas
   et l'affiche.
-- **Ne laisse ouvert vers Internet que le port du proxy**, jamais celui
-  d'Emby.
+- **Ne laisse ouvert vers Internet que le port du proxy (8097)**, jamais celui
+  d'Emby (8096) ni celui de la page d'état (8098).
 - **Vie privée** : l'activité (ce que chacun regarde, ses recherches, ses
   adresses IP) est une donnée personnelle. Si d'autres personnes utilisent
   ton serveur, préviens-les qu'elles sont suivies (RGPD). Les journaux
@@ -254,4 +263,9 @@ Les tests font tourner le proxy contre un faux serveur Emby. Ils vérifient :
   journal relu au redémarrage, nettoyage des journaux, avertissements ;
 - la configuration : lecture sans dévoiler la clé, test de connexion, prise
   en compte immédiate, fichier mis à jour, mot de passe de confirmation,
-  refus depuis Internet et depuis un site piégé, adresses invalides.
+  refus depuis Internet et depuis un site piégé, adresses invalides ;
+- le 2e audit : page d'administration absente du port des utilisateurs,
+  en-têtes de protection, envois géants refusés, fausse activité impossible
+  sans compte, une seule fiche après connexion, bannissement IPv6 par bloc,
+  bannissements conservés au redémarrage, journal non falsifiable, images
+  SVG neutralisées.
