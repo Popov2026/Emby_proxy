@@ -935,3 +935,29 @@ def test_preconfiguration_serveur_192_168_1_123(tmp_path):
     assert cfg.require_relay
     p = ep.EmbyProxy(cfg)
     assert "http" not in p.warnings          # HTTPS assure par le relais
+
+
+
+async def test_formulaires_acceptes_avec_les_en_tetes_d_un_vrai_navigateur(env, aiohttp_client):
+    """Regression : avec Referrer-Policy no-referrer, Chrome envoyait
+    "Origin: null" et le formulaire de connexion etait refuse."""
+    make, _, _ = env
+    proxy, _ = await make(status__port="8098")
+    a = await aiohttp_client(proxy.build_admin_app())
+    r = await a.get("/__proxy/login")
+    assert r.headers["Referrer-Policy"] != "no-referrer"
+    pwd = {"password": proxy.cfg.status_password}
+    # navigateur moderne : Sec-Fetch-Site pose par le navigateur
+    r = await a.post("/__proxy/login", data=pwd, allow_redirects=False,
+                     headers={"Origin": "null", "Sec-Fetch-Site": "same-origin"})
+    assert r.status == 303
+    # meme formulaire envoye depuis un site piege
+    r = await a.post("/__proxy/login", data=pwd,
+                     headers={"Origin": "null", "Sec-Fetch-Site": "cross-site"})
+    assert r.status == 403
+    r = await a.post("/__proxy/login", data=pwd,
+                     headers={"Origin": "http://piege.example", "Sec-Fetch-Site": "cross-site"})
+    assert r.status == 403
+    # navigateur ancien sans Sec-Fetch-Site : "Origin: null" reste refuse
+    r = await a.post("/__proxy/login", data=pwd, headers={"Origin": "null"})
+    assert r.status == 403

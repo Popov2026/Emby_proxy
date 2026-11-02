@@ -1613,7 +1613,10 @@ class EmbyProxy:
         h = response.headers
         h["X-Content-Type-Options"] = "nosniff"
         h["X-Frame-Options"] = "DENY"
-        h["Referrer-Policy"] = "no-referrer"
+        # "same-origin" et pas "no-referrer" : avec no-referrer, le navigateur
+        # envoie "Origin: null" sur nos propres formulaires, qui seraient
+        # alors refuses comme venant d'un site piege.
+        h["Referrer-Policy"] = "same-origin"
         h["Cross-Origin-Opener-Policy"] = "same-origin"
         h["Content-Security-Policy"] = (
             "default-src 'none'; script-src 'unsafe-inline'; "
@@ -1650,8 +1653,13 @@ class EmbyProxy:
             host = request.headers.get("X-Forwarded-Host", request.host)
             owns.add("%s://%s" % (proto.split(",")[0].strip(),
                                   host.split(",")[0].strip()))
+        # Sec-Fetch-Site est pose par le navigateur lui-meme (aucune page ne
+        # peut le falsifier) : la reponse la plus sure quand il est present.
+        site = request.headers.get("Sec-Fetch-Site", "")
+        if site:
+            return site == "same-origin"
         origin = request.headers.get("Origin")
-        if origin:
+        if origin and origin != "null":
             return origin in owns
         ref = request.headers.get("Referer", "")
         return any(ref == o or ref.startswith(o + "/") for o in owns)
