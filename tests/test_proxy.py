@@ -961,3 +961,28 @@ async def test_formulaires_acceptes_avec_les_en_tetes_d_un_vrai_navigateur(env, 
     # navigateur ancien sans Sec-Fetch-Site : "Origin: null" reste refuse
     r = await a.post("/__proxy/login", data=pwd, headers={"Origin": "null"})
     assert r.status == 403
+
+
+
+def test_reglages_mal_places_signales(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    ini.write_text("[emby]\napi_key = CLE\nupstream = http://192.168.1.234:8096\n"
+                   "[serveur]\nx = 1\n[proxy]\nurl = http://nas:8096\n",
+                   encoding="utf-8")
+    cfg = ep.Settings(ini)
+    w = " | ".join(cfg.config_warnings)
+    assert cfg.upstream == "http://127.0.0.1:8096"           # rien n'a ete pris
+    assert '"upstream" de la section [emby] ignoree : elle doit etre dans la section [proxy]' in w
+    assert "section [serveur] inconnue" in w
+    assert '"url" de la section [proxy] ignoree' in w and "upstream" in w
+    assert ep.Settings(tmp_path / "absent.ini").config_warnings
+
+
+async def test_emby_injoignable_signale_au_demarrage(env):
+    make, _, _ = env
+    proxy, c = await make(proxy__upstream="http://127.0.0.1:9")
+    await asyncio.sleep(0.5)
+    assert "emby" in proxy.warnings and "upstream" in proxy.warnings["emby"]
+    proxy2, _ = await make()
+    await asyncio.sleep(0.5)
+    assert "emby" not in proxy2.warnings

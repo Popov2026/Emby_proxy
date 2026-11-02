@@ -223,8 +223,13 @@ class Settings:
         cp = configparser.ConfigParser()
         cp.read_dict(DEFAULTS)
         self.path = Path(path) if path else DEFAULT_CONFIG
+        self.config_warnings = []   # reglages mal places, sections inconnues
         if self.path.exists():
             cp.read(self.path, encoding="utf-8")
+            self._check_file()
+        else:
+            self.config_warnings.append(
+                "fichier de reglages %s introuvable : valeurs par defaut" % self.path)
         self.env_locked = set()     # reglages imposes par l'environnement
         for env, (sec, key) in ENV_OVERRIDES.items():
             if os.environ.get(env):
@@ -280,6 +285,34 @@ class Settings:
         self.session_hours = st.getfloat("session_hours")
         self.status_port = st.getint("port")
         self.status_host = st.get("host", "").strip() or self.listen_host
+
+    def _check_file(self):
+        """Signale les lignes ignorees : cle inconnue ou dans la mauvaise
+        section (ex. : l'adresse d'Emby ecrite sous [emby] au lieu de [proxy])."""
+        raw = configparser.ConfigParser()
+        try:
+            raw.read(self.path, encoding="utf-8")
+        except configparser.Error as exc:
+            self.config_warnings.append("fichier %s illisible : %s" % (self.path, exc))
+            return
+        where = {}
+        for sec, keys in DEFAULTS.items():
+            for k in keys:
+                where.setdefault(k, sec)
+        for sec in raw.sections():
+            if sec not in DEFAULTS:
+                self.config_warnings.append("section [%s] inconnue, ignoree" % sec)
+                continue
+            for k in raw[sec]:
+                if k in DEFAULTS[sec]:
+                    continue
+                hint = ""
+                if k in where:
+                    hint = " : elle doit etre dans la section [%s]" % where[k]
+                elif k in ("url", "emby_url", "server", "serveur", "adresse", "ip"):
+                    hint = " : l'adresse d'Emby se regle par upstream = ... dans [proxy]"
+                self.config_warnings.append("ligne \"%s\" de la section [%s] "
+                                            "ignoree%s" % (k, sec, hint))
 
     @staticmethod
     def _path(base, value):
@@ -1439,8 +1472,29 @@ class EmbyProxy:
         if self.activity:
             self._tasks.append(asyncio.create_task(self._resolve_loop()))
         self._tasks.append(asyncio.create_task(self._prune_loop()))
+        log.info("reglages lus dans %s", self.cfg.path)
+        for i, w in enumerate(self.cfg.config_warnings):
+            self.warnings["config%d" % i] = "Reglages : " + w
         for w in self.warnings.values():
             log.warning(w)
+        self._tasks.append(asyncio.create_task(self._startup_probe()))
+
+    async def _startup_probe(self):
+        """Des le demarrage : Emby repond-il a l'adresse configuree ?"""
+        p = await self._probe_emby(self.cfg.upstream, self.cfg.api_key)
+        if p["ok"]:
+            self.warnings.pop("emby", None)
+            log.info("Emby joignable : \"%s\", version %s", p.get("server_name", "?"),
+                     p.get("version", "?"))
+            if p.get("key_ok") is False:
+                log.warning("cle API Emby refusee : %s", p.get("key_error", ""))
+        else:
+            self.warnings["emby"] = (
+                "Emby ne repond pas a l'adresse %s (%s). Regle l'adresse dans la page "
+                "d'etat, onglet Configuration, ou dans %s : ligne upstream = ... de "
+                "la section [proxy], puis relance le proxy."
+                % (self.cfg.upstream, p.get("error", "?"), self.cfg.path))
+            log.warning(self.warnings["emby"])
 
     async def _prune_loop(self):
         """Journaux : on efface regulierement ce qui depasse log_days."""
@@ -2114,6 +2168,7 @@ class EmbyProxy:
                              "(docker-compose) : c'est elle qui reprendra le dessus "
                              "au redemarrage" % what)
         self.seclog.add("config", ip, local, detail="; ".join(changes))
+        self.warnings.pop("emby", None)
         log.warning("configuration modifiee par %s : %s", ip, "; ".join(changes))
         return web.json_response({"ok": True, "changed": True, "changes": changes,
                                   "notes": notes, "config": self._config_view(),
