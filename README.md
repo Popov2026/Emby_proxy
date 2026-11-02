@@ -34,8 +34,11 @@ petite fenêtre de suivi) ou **en Docker** sur un NAS ou un serveur.
 ### Sécurité
 | Protection | Détail |
 |---|---|
-| **Administration bloquée depuis Internet** | Tableau de bord, redémarrage, clés API, plugins, utilisateurs… refusés hors du réseau local |
-| **Mots de passe faux** | 5 échecs en 15 min ⇒ adresse IP bannie 1 heure |
+| **Administration bloquée depuis Internet** | Tableau de bord, redémarrage, clés API, plugins, utilisateurs… refusés hors du réseau local, quelle que soit la façon d'écrire l'adresse (`//emby/…`, `/mediabrowser/…`, `%2F`, `;…`, `..`) |
+| **Mots de passe faux** | 5 échecs en 15 min ⇒ adresse IP bannie 1 heure (sous toutes les formes d'adresse) |
+| **Page d'état protégée** | réseau local **et** mot de passe ; protégée contre les sites piégés ; bannissement après mots de passe faux |
+| **Journal de sécurité** | toutes les tentatives de connexion, bannissements et refus, gardés sur disque |
+| **Avertissements** | HTTP sans chiffrement ; relais placé devant le proxy sans `trusted_proxies` |
 | **Débit limité** | 100 requêtes/s par adresse IP (pointes à 400) |
 | **Listes d'adresses** | autorisées seules (`allowed_networks`) ou refusées (`denied_networks`) |
 | **HTTPS** | possible directement (certificat + clef), avec HSTS |
@@ -71,6 +74,19 @@ Les noms des films sont lus dans les réponses d'Emby elles-mêmes. Pour un
 élément jamais ouvert avant, le proxy demande son nom à Emby, avec la clé API
 des réglages (`[emby] api_key`, facultative) ou, à défaut, avec le jeton de
 l'utilisateur.
+
+### Onglet Sécurité
+- **Toutes les tentatives de connexion** à Emby, réussies ou non. Pour
+  chacune : date, nom tapé, adresse IP (réseau local ou Internet),
+  application et appareil. Le mot de passe tapé n'est **jamais** enregistré.
+- **Bannissements**, avec la raison, le temps restant et un bouton
+  **Débannir**.
+- **Accès refusés** : administration depuis Internet, adresse interdite ou
+  bannie. Une rafale est regroupée sur une ligne (« ×3 »).
+- Connexions et mots de passe faux de la **page d'état** elle-même.
+- Compteurs sur 24 h et adresses qui cumulent le plus de mots de passe faux.
+- Filtres par type, par origine (Internet ou réseau local) et par texte.
+- Journal sur disque `emby_security.log`, relu au redémarrage.
 
 ### Tout le reste passe tel quel
 API, lecture vidéo (avec avance rapide / reprise), WebSocket des applications
@@ -120,16 +136,40 @@ Sans fenêtre (console) : `py emby_proxy.py`.
 ## Page d'état
 Depuis le réseau local seulement : **`http://ADRESSE-DU-PROXY:8097/__proxy/`**
 
+Elle demande un **mot de passe**. Au premier lancement, le proxy en crée un et
+l'écrit dans `emby_proxy.ini`, section `[status]`. Il apparaît aussi dans le
+journal. Sous Windows, le bouton **Copier le mot de passe** de la fenêtre le
+copie.
+
 - Onglet **Activité** : les utilisateurs et le journal d'activité (voir plus
   haut).
-- Onglet **Cache & sécurité** : vignettes servies du cache, taux de cache,
-  volume économisé sur Emby, taille du cache, requêtes bloquées, adresses
-  bannies, et un bouton pour vider le cache.
+- Onglet **Sécurité** : connexions, mots de passe faux, bannissements, refus
+  (voir plus haut).
+- Onglet **Cache** : vignettes servies du cache, taux de cache, volume
+  économisé sur Emby, taille du cache, et un bouton pour vider le cache.
 
 Depuis Internet, cette page n'existe pas (erreur 404).
 
-Les mêmes informations sont disponibles en JSON sur `/__proxy/activity.json`
-et `/__proxy/stats.json`.
+Les mêmes informations sont disponibles en JSON, après connexion, sur
+`/__proxy/activity.json`, `/__proxy/security.json` et `/__proxy/stats.json`.
+
+## Sécurité : à faire de ton côté
+- **HTTPS** si le proxy est ouvert sur Internet. Sans lui, les mots de passe
+  circulent en clair. Renseigne `tls_cert` / `tls_key`, ou place un relais
+  HTTPS devant. Tant que ce n'est pas fait, le proxy affiche un avertissement.
+- **Relais devant le proxy** (proxy inverse du NAS, Nginx…) : mets son
+  adresse dans `trusted_proxies`. Sinon tout Internet est vu comme le réseau
+  local : la page d'état et l'administration deviennent accessibles depuis
+  Internet, et un bannissement bloque tout le monde. Le proxy détecte ce cas
+  et l'affiche.
+- **Ne laisse ouvert vers Internet que le port du proxy**, jamais celui
+  d'Emby.
+- **Vie privée** : l'activité (ce que chacun regarde, ses recherches, ses
+  adresses IP) est une donnée personnelle. Si d'autres personnes utilisent
+  ton serveur, préviens-les qu'elles sont suivies (RGPD). Les journaux
+  s'effacent seuls après `log_days` jours (30 par défaut).
+  `record_searches = false` n'enregistre pas les recherches, et
+  `enabled = false` (section `[activity]`) coupe tout le suivi.
 
 ## Réglages (`emby_proxy.ini`)
 Le fichier est commenté ; voir aussi `emby_proxy.example.ini`.
@@ -156,11 +196,17 @@ Le fichier est commenté ; voir aussi `emby_proxy.example.ini`.
 | activity | `idle_minutes` | 15 | délai avant d'afficher un utilisateur inactif |
 | activity | `keep_hours` | 48 | durée de conservation d'un utilisateur parti |
 | activity | `log_file` | `emby_activity.log` | journal d'activité sur disque (vide = aucun) |
+| activity | `log_days` | 30 | effacement des lignes plus anciennes (activité et sécurité) |
+| activity | `record_searches` | true | enregistrer les recherches tapées |
+| activity | `security_log_file` | `emby_security.log` | journal de sécurité |
+| status | `password` | créé au 1er lancement | mot de passe de la page d'état |
+| status | `allow_internet` | false | page d'état accessible depuis Internet (déconseillé) |
 
 Sous Docker, des variables d'environnement remplacent le fichier :
 `EMBY_PROXY_UPSTREAM`, `EMBY_PROXY_PORT`, `EMBY_PROXY_CACHE_MB`,
 `EMBY_PROXY_CACHE_DIR`, `EMBY_PROXY_TLS_CERT`, `EMBY_PROXY_TLS_KEY`,
-`EMBY_PROXY_API_KEY`, `EMBY_PROXY_ACTIVITY_LOG`.
+`EMBY_PROXY_API_KEY`, `EMBY_PROXY_ACTIVITY_LOG`, `EMBY_PROXY_SECURITY_LOG`,
+`EMBY_PROXY_STATUS_PASSWORD`.
 
 ## Tests
 ```
@@ -179,4 +225,8 @@ Les tests font tourner le proxy contre un faux serveur Emby. Ils vérifient :
 - l'éviction du cache ;
 - l'activité : connexion, accueil, bibliothèque, recherche, fiches, lecture,
   pause, arrêt, favoris, suppression, déconnexion, mots de passe faux, refus,
-  noms demandés à Emby, journal sur disque.
+  noms demandés à Emby, journal sur disque ;
+- la sécurité : 14 façons de contourner le blocage de l'administration,
+  mots de passe faux comptés sous toutes les formes d'adresse, page d'état
+  (mot de passe, sites piégés, déconnexion, bannissement), onglet Sécurité,
+  journal relu au redémarrage, nettoyage des journaux, avertissements.

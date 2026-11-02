@@ -7,6 +7,7 @@ import asyncio
 import gzip
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,8 @@ def fake_emby():
     app.router.add_get("/emby/Videos/{id}/stream", video)
     app.router.add_get("/go", redirect)
     app.router.add_post("/emby/Users/AuthenticateByName", login)
+    # Emby accepte aussi l'ancien prefixe et les barres doublees
+    app.router.add_post(r"/{tail:.*AuthenticateByName/?}", login)
     app.router.add_get("/emby/System/Configuration", admin)
     app.router.add_get("/embywebsocket", ws)
     app.router.add_get("/emby/Users/{uid}", user)
@@ -148,6 +151,15 @@ async def env(aiohttp_server, aiohttp_client, tmp_path):
         return proxy, client
 
     return make, emby_app, calls
+
+
+async def login(c, proxy):
+    """Connexion a la page d'etat (comme le ferait le navigateur)."""
+    r = await c.post("/__proxy/login", data={"password": proxy.cfg.status_password},
+                     headers={"Origin": str(c.make_url("")).rstrip("/")},
+                     allow_redirects=False)
+    assert r.status == 303
+    return r
 
 
 async def test_image_cachee_une_seule_fois(env):
@@ -281,11 +293,13 @@ async def test_page_etat_et_purge(env):
     proxy, c = await make()
     await c.get("/Items/1/Images/Primary?tag=a")
     await c.get("/Items/1/Images/Primary?tag=a")
+    await login(c, proxy)
     d = await (await c.get("/__proxy/stats.json")).json()
     assert d["cache_hits"] == 1 and d["cache_misses"] == 1
     assert d["cache_entries"] == 1
     assert (await c.get("/__proxy/")).status == 200
-    assert (await c.post("/__proxy/purge")).status == 200
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    assert (await c.post("/__proxy/purge", headers=own)).status == 200
     assert proxy.cache.stats()["entries"] == 0
 
 
@@ -303,8 +317,8 @@ def test_clef_de_cache():
                      "tag=x&maxWidth=200&api_key=SECRET")
     b = ep.cache_key("/Items/1/Images/Primary", "maxWidth=200&tag=x")
     assert a == b and "secret" not in a.lower()
-    assert ep.IMAGE_RE.match("/emby/Items/1/Images/Backdrop/0")
-    assert not ep.IMAGE_RE.match("/emby/Items/1/Images")      # liste JSON
+    assert ep.IMAGE_RE.match(ep.norm_path("/emby/Items/1/Images/Backdrop/0"))
+    assert not ep.IMAGE_RE.match(ep.norm_path("/emby/Items/1/Images"))  # liste JSON
 
 
 # ---------------------------------------------------------------------
@@ -389,6 +403,7 @@ async def test_activite_cle_api_journal_et_page(env, tmp_path):
                  json={"ItemId": "333", "PlayMethod": "DirectPlay"})
     await asyncio.sleep(1.8)
     assert calls["resolve"] == ["CLEADMIN"]
+    await login(c, proxy)
     d = await (await c.get("/__proxy/activity.json")).json()
     assert d["clients"][0]["playing"]["title"] == "Oppenheimer (2023)"
     assert d["feed"][0]["text"] == "Lecture : Oppenheimer (2023) (lecture directe)"
@@ -415,5 +430,181 @@ async def test_activite_desactivable(env):
     proxy, c = await make(activity__enabled="false")
     assert proxy.activity is None
     assert (await c.get("/emby/Users/u1/Items")).status == 200
+    await login(c, proxy)
     d = await (await c.get("/__proxy/activity.json")).json()
     assert d["disabled"] is True
+
+
+
+# ---------------------------------------------------------------------
+#  Corrections de securite
+# ---------------------------------------------------------------------
+@pytest.mark.parametrize("path", [
+    "/emby/System/Configuration", "//emby/System/Configuration",
+    "/emby//System/Configuration", "/mediabrowser/System/Configuration",
+    "/EMBY/system/configuration", "/emby/System/Configuration;x=1",
+    "/emby/System/Configuration%20", "/emby/./System/Configuration",
+    "/emby/Items/../System/Configuration", "/emby\\System\\Configuration",
+    "/emby/System%2FConfiguration", "/System/Configuration/",
+    "/emby/emby/System/Restart", "/emby/System/Configuration.json",
+])
+def test_admin_non_contournable(path, tmp_path):
+    from urllib.parse import unquote
+    cfg = ep.Settings(tmp_path / "x.ini",
+                      overrides={("security", "local_networks"): "10.0.0.0/8"})
+    g = ep.Guard(cfg)
+    assert g.check("1.2.3.4", ep.norm_path(unquote(path))) is not None, path
+
+
+def test_navigation_normale_non_bloquee(tmp_path):
+    cfg = ep.Settings(tmp_path / "x.ini",
+                      overrides={("security", "local_networks"): "10.0.0.0/8"})
+    g = ep.Guard(cfg)
+    for path in ("/emby/Users/%s/Items" % UID, "/emby/System/Info/Public",
+                 "/emby/Users/%s/Configuration" % UID, "/web/index.html",
+                 "/emby/Sessions/Playing", "/emby/Users/%s/Password" % UID):
+        assert g.check("1.2.3.4", ep.norm_path(path)) is None, path
+
+
+@pytest.mark.parametrize("path", ["//emby/Users/AuthenticateByName",
+                                  "/mediabrowser/Users/AuthenticateByName",
+                                  "/emby//Users/AuthenticateByName/"])
+async def test_mots_de_passe_faux_comptes_sous_toute_forme(env, path):
+    make, _, calls = env
+    from yarl import URL
+    proxy, c = await make(security__login_max_failures="2")
+    raw = URL(str(c.make_url("")).rstrip("/") + path, encoded=True)
+    for _ in range(2):
+        r = await c.session.post(raw, json={"Username": "Paul", "Pw": "faux"})
+        assert r.status == 401
+    r = await c.post("/emby/Users/AuthenticateByName", json={"Pw": "bon"})
+    assert r.status == 403                                   # banni
+
+
+async def test_page_etat_protegee(env):
+    make, _, _ = env
+    proxy, c = await make()
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    r = await c.get("/__proxy/", allow_redirects=False)
+    assert r.status == 303 and r.headers["Location"] == "/__proxy/login"
+    assert (await c.get("/__proxy/activity.json")).status == 401
+    assert (await c.get("/__proxy/security.json")).status == 401
+    assert (await c.post("/__proxy/purge", headers=own)).status == 401
+    r = await c.post("/__proxy/login", data={"password": "faux"}, headers=own)
+    assert r.status == 401
+    assert proxy.seclog.events[-1]["type"] == "status_fail"
+    # formulaire de connexion envoye par un autre site : refuse
+    r = await c.post("/__proxy/login", data={"password": proxy.cfg.status_password},
+                     headers={"Origin": "http://site-piege.example"})
+    assert r.status == 403
+    await login(c, proxy)
+    assert (await c.get("/__proxy/stats.json")).status == 200
+    assert "no-store" in (await c.get("/__proxy/stats.json")).headers["Cache-Control"]
+    # action declenchee par un site piege (cookie envoye, mais autre origine)
+    r = await c.post("/__proxy/purge", headers={"Origin": "http://site-piege.example"})
+    assert r.status == 403
+    assert (await c.post("/__proxy/purge")).status == 403     # sans origine
+    assert (await c.post("/__proxy/purge", headers=own)).status == 200
+    r = await c.post("/__proxy/logout", headers=own, allow_redirects=False)
+    assert r.status == 303
+    assert (await c.get("/__proxy/stats.json")).status == 401
+
+
+async def test_page_etat_bannit_aussi(env):
+    make, _, _ = env
+    proxy, c = await make(security__login_max_failures="3")
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    for _ in range(3):
+        await c.post("/__proxy/login", data={"password": "x"}, headers=own)
+    r = await c.post("/__proxy/login", data={"password": proxy.cfg.status_password},
+                     headers=own, allow_redirects=False)
+    assert r.status == 403
+    assert any(e["type"] == "ban" for e in proxy.seclog.events)
+
+
+async def test_onglet_securite_tentatives_de_connexion(env, tmp_path):
+    make, _, _ = env
+    log_file = tmp_path / "secu.log"
+    proxy, c = await make(security__login_max_failures="3",
+                          activity__security_log_file=str(log_file))
+    await login(c, proxy)               # l'administrateur est deja connecte
+    android = {"X-Emby-Authorization": 'Emby Client="Emby for Android", '
+               'Device="Pixel 8", DeviceId="px", Version="3.4"'}
+    await c.post("/emby/Users/AuthenticateByName",
+                 json={"Username": "Paul", "Pw": "bon"}, headers=android)
+    for _ in range(3):
+        await c.post("/emby/Users/AuthenticateByName",
+                     json={"Username": "admin", "Pw": "1234"}, headers=android)
+    # adresse bannie, mais la page d'etat reste utilisable pour debannir
+    d = await (await c.get("/__proxy/security.json")).json()
+    types = [e["type"] for e in d["events"]]
+    assert types[:4] == ["ban", "login_fail", "login_fail", "login_fail"]
+    assert types[-1] == "status_ok"
+    ok = [e for e in d["events"] if e["type"] == "login_ok"][0]
+    assert ok["user"] == "Paul" and ok["client"] == "Emby for Android"
+    assert ok["device"] == "Pixel 8" and ok["ip"] == "127.0.0.1" and ok["local"]
+    fail = [e for e in d["events"] if e["type"] == "login_fail"][0]
+    assert fail["user"] == "admin" and fail["label"] == "Mot de passe faux"
+    assert d["counts"]["login_fail"] == 3 and d["counts"]["login_ok"] == 1
+    assert d["bans"][0]["ip"] == "127.0.0.1"
+    assert d["top_fail_ips"][0] == ["127.0.0.1", 3]
+    # le mot de passe tape n'est jamais enregistre
+    assert "1234" not in log_file.read_text(encoding="utf-8")
+    # debannir depuis la page
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    r = await c.post("/__proxy/unban", data={"ip": "127.0.0.1"}, headers=own)
+    assert (await r.json())["ok"] is True
+    assert (await c.get("/emby/Users/u1/Items")).status == 200
+    # journal relu au redemarrage
+    proxy2, _ = await make(activity__security_log_file=str(log_file))
+    assert [e["type"] for e in proxy2.seclog.events][-1] == "unban"
+    assert len(proxy2.seclog.events) == len(proxy.seclog.events)
+
+
+async def test_refus_dans_onglet_securite(env):
+    make, _, _ = env
+    proxy, c = await make(security__denied_networks="127.0.0.1/32")
+    for _ in range(4):
+        await c.get("/emby/Users/u1/Items")
+    refus = [e for e in proxy.seclog.events if e["type"] == "refused"]
+    assert len(refus) == 1 and refus[0]["count"] == 4      # rafale fusionnee
+
+
+async def test_avertissement_relais(env):
+    make, _, _ = env
+    proxy, c = await make()
+    assert "relay" not in proxy.warnings
+    await c.get("/emby/Users/u1/Items", headers={"X-Forwarded-For": "8.8.8.8"})
+    assert "relay" in proxy.warnings and "trusted_proxies" in proxy.warnings["relay"]
+    assert "http" in proxy.warnings                           # pas de HTTPS
+
+
+async def test_recherches_non_enregistrees(env):
+    make, _, _ = env
+    proxy, c = await make(activity__record_searches="false")
+    await c.get("/emby/Users/%s/Items?SearchTerm=secret&%s" % (UID, q()))
+    texts = [e["text"] for e in proxy.activity.snapshot()["clients"][0]["events"]]
+    assert not any("secret" in t for t in texts)
+
+
+def test_nettoyage_des_journaux(tmp_path):
+    p = tmp_path / "j.log"
+    old = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 40 * 86400))
+    new = time.strftime("%Y-%m-%d %H:%M:%S")
+    p.write_text("\n".join(json.dumps({"date": d, "x": i})
+                           for i, d in enumerate([old, old, new])) + "\n",
+                 encoding="utf-8")
+    assert ep.prune_jsonl(p, 30) == 2
+    assert [json.loads(x)["x"] for x in p.read_text().splitlines()] == [2]
+
+
+def test_mot_de_passe_cree_au_premier_lancement(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    cfg = ep.Settings(ini)
+    assert cfg.status_password == ""
+    assert ep.ensure_status_password(ini, cfg) is True
+    pwd = cfg.status_password
+    assert len(pwd) >= 12
+    assert ep.Settings(ini).status_password == pwd            # bien ecrit
+    assert ep.ensure_status_password(ini, ep.Settings(ini)) is False

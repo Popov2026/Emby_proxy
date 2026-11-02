@@ -31,7 +31,7 @@ Lancement :
     pythonw emby_proxy.py --gui              petite fenetre de suivi (Windows)
     python emby_proxy.py --config autre.ini  autre fichier de reglages
 
-Page d'etat (depuis le reseau local) : http://<proxy>:8097/__proxy/
+Page d'etat (reseau local + mot de passe) : http://<proxy>:8097/__proxy/
 """
 
 import argparse
@@ -39,11 +39,14 @@ import asyncio
 import configparser
 import gzip
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
 import os
+import posixpath
 import re
+import secrets
 import ssl
 import sys
 import threading
@@ -106,12 +109,20 @@ DEFAULTS = {
     "emby": {
         "api_key": "",
     },
+    "status": {
+        "password": "",
+        "allow_internet": "false",
+        "session_hours": "12",
+    },
     "activity": {
         "enabled": "true",
         "idle_minutes": "15",
         "keep_hours": "48",
         "log_file": "emby_activity.log",
         "log_max_mb": "20",
+        "log_days": "30",
+        "record_searches": "true",
+        "security_log_file": "emby_security.log",
     },
 }
 
@@ -127,6 +138,8 @@ ENV_OVERRIDES = {
     "EMBY_PROXY_LOG_FILE": ("log", "file"),
     "EMBY_PROXY_API_KEY": ("emby", "api_key"),
     "EMBY_PROXY_ACTIVITY_LOG": ("activity", "log_file"),
+    "EMBY_PROXY_SECURITY_LOG": ("activity", "security_log_file"),
+    "EMBY_PROXY_STATUS_PASSWORD": ("status", "password"),
 }
 
 
@@ -191,6 +204,14 @@ class Settings:
         self.activity_keep_hours = a.getfloat("keep_hours")
         self.activity_log = self._path(base, a.get("log_file"))
         self.activity_log_max = int(a.getfloat("log_max_mb") * 1024 * 1024)
+        self.log_days = a.getfloat("log_days")
+        self.record_searches = a.getboolean("record_searches")
+        self.security_log = self._path(base, a.get("security_log_file"))
+
+        st = cp["status"]
+        self.status_password = st.get("password", "").strip()
+        self.status_internet = st.getboolean("allow_internet")
+        self.session_hours = st.getfloat("session_hours")
 
     @staticmethod
     def _path(base, value):
@@ -264,6 +285,15 @@ level = INFO
 # depuis l'accueil...) est demande a Emby avec le jeton de cet utilisateur.
 api_key =
 
+[status]
+# Mot de passe de la page d'etat (/__proxy/). Vide au premier lancement :
+# un mot de passe est alors cree et ecrit ici.
+password =
+# Page d'etat accessible aussi depuis Internet (deconseille).
+allow_internet = false
+# Duree d'une connexion a la page d'etat.
+session_hours = 12
+
 [activity]
 # Suivi de ce que font les utilisateurs (page d'etat, onglet Activite).
 enabled = true
@@ -274,16 +304,65 @@ keep_hours = 48
 # Journal de toute l'activite (une ligne JSON par action), vide = aucun.
 log_file = emby_activity.log
 log_max_mb = 20
+# Les lignes plus anciennes sont effacees des journaux (activite, securite).
+log_days = 30
+# false = les recherches tapees par les utilisateurs ne sont pas enregistrees.
+record_searches = true
+# Journal des connexions, mots de passe faux, bannissements et refus.
+security_log_file = emby_security.log
 """ % PRIVATE_NETS
     Path(path).write_text(text, encoding="utf-8")
+
+
+def ensure_status_password(path, cfg):
+    """Pas de mot de passe pour la page d'etat : on en cree un et on l'ecrit
+    dans le fichier de reglages (section [status])."""
+    if cfg.status_password:
+        return False
+    pwd = secrets.token_urlsafe(12)
+    cfg.status_password = pwd
+    try:
+        path = Path(path)
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if re.search(r"(?m)^\[status\]\s*$", text):
+            if re.search(r"(?ms)^\[status\].*?^password\s*=", text):
+                text = re.sub(r"(?ms)(^\[status\].*?^password\s*=)[^\n]*",
+                              lambda m: m.group(1) + " " + pwd, text, count=1)
+            else:
+                text = re.sub(r"(?m)^\[status\]\s*$", "[status]\npassword = " + pwd,
+                              text, count=1)
+        else:
+            text += "\n[status]\npassword = %s\n" % pwd
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        log.warning("mot de passe de la page d'etat non enregistre : %s", exc)
+    return True
 
 
 # =====================================================================
 #  CACHE DISQUE DES VIGNETTES
 # =====================================================================
 # /Items/123/Images/Primary, /emby/Users/x/Images/Primary/0, /Persons/Nom/Images/...
-IMAGE_RE = re.compile(r"^/(?:emby/)?[A-Za-z]+/[^/]+/Images/[A-Za-z]+(?:/\d+)?/?$",
-                      re.I)
+IMAGE_RE = re.compile(r"^/[A-Za-z]+/[^/]+/Images/[A-Za-z]+(?:/\d+)?/?$", re.I)
+_PREFIX_RE = re.compile(r"^/(?:emby|mediabrowser)(?=/|$)", re.I)
+
+
+def norm_path(path):
+    """Forme canonique d'une adresse, telle qu'Emby la comprendra : barres
+    doublees ou inversees, segments "." et "..", ";parametres", espaces en
+    fin de segment et prefixes /emby ou /mediabrowser retires. Toutes les
+    regles de securite et de suivi portent sur cette forme : on ne peut pas
+    les contourner en ecrivant //emby/System/... ou /mediabrowser/...."""
+    p = (path or "/").replace("\\", "/")
+    segs = [seg.split(";", 1)[0].strip() for seg in p.split("/")]
+    p = posixpath.normpath("/" + "/".join(x for x in segs if x))
+    if p.startswith("//"):
+        p = "/" + p.lstrip("/")
+    while True:
+        q = _PREFIX_RE.sub("", p, count=1) or "/"
+        if q == p:
+            return p
+        p = q
 # Parametres qui identifient l'utilisateur, pas l'image : hors de la clef.
 _AUTH_PARAMS = {"api_key", "apikey", "x-emby-token", "x-mediabrowser-token",
                 "x-emby-authorization", "x-emby-client", "x-emby-device-name",
@@ -418,15 +497,14 @@ class DiskCache:
 # =====================================================================
 # Administration d'Emby : refusee hors du reseau local.
 ADMIN_RE = re.compile(
-    r"^/(?:emby/)?(?:"
+    r"^/(?:"
     r"System/(?:Configuration|Restart|Shutdown|Logs|ActivityLog|WakeOnLanInfo)|"
     r"Startup|Plugins|Packages|ScheduledTasks|Environment|Auth/Keys|Devices|"
     r"Library/(?:VirtualFolders|Refresh|Media/Updated)|Notifications/Admin|"
     r"LiveTv/(?:TunerHosts|ListingProviders)|Users/New|Users/[^/]+/Policy|"
     r"Encoding|Branding/Configuration|Backup"
-    r")(?:/|$|\?)", re.I)
-LOGIN_RE = re.compile(r"^/(?:emby/)?Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$",
-                      re.I)
+    r")(?![A-Za-z0-9])", re.I)
+LOGIN_RE = re.compile(r"^/Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$", re.I)
 
 
 class Guard:
@@ -488,9 +566,10 @@ class Guard:
         return None
 
     def login_result(self, ip, ok):
+        """-> True si cet echec vient de declencher un bannissement."""
         if ok:
             self.failures.pop(ip, None)
-            return
+            return False
         now = time.time()
         q = self.failures.setdefault(ip, deque())
         q.append(now)
@@ -501,10 +580,125 @@ class Guard:
             self.failures.pop(ip, None)
             log.warning("bannissement de %s pour %d min (%d mots de passe faux)",
                         ip, self.cfg.ban_seconds / 60, self.cfg.login_max)
+            return True
+        return False
+
+    def unban(self, ip):
+        self.failures.pop(ip, None)
+        return self.banned.pop(ip, None) is not None
 
     def active_bans(self):
         now = time.time()
         return {ip: int(t - now) for ip, t in self.banned.items() if t > now}
+
+
+def prune_jsonl(path, days):
+    """Efface d'un journal JSON (une ligne par evenement, clef "date") les
+    lignes de plus de `days` jours ; fait de meme pour sa copie .1."""
+    if not path or days <= 0:
+        return 0
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - days * 86400))
+    removed = 0
+    for p in (Path(path), Path(str(path) + ".1")):
+        if not p.exists():
+            continue
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+            keep = []
+            for ln in lines:
+                try:
+                    if json.loads(ln).get("date", "") >= cutoff:
+                        keep.append(ln)
+                except ValueError:
+                    continue
+            removed += len(lines) - len(keep)
+            if not keep:
+                p.unlink()
+            elif len(keep) != len(lines):
+                tmp = p.with_suffix(p.suffix + ".tmp")
+                tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+                os.replace(tmp, p)
+        except OSError as exc:
+            log.warning("nettoyage de %s impossible : %s", p, exc)
+    return removed
+
+
+class SecurityLog:
+    """Connexions (reussies ou non), bannissements et refus. Garde en memoire
+    les derniers evenements, les ecrit sur disque et les relit au demarrage."""
+    LABELS = {"login_ok": "Connexion reussie", "login_fail": "Mot de passe faux",
+              "ban": "Adresse bannie", "unban": "Adresse debannie",
+              "refused": "Acces refuse", "status_ok": "Connexion a la page d'etat",
+              "status_fail": "Mot de passe faux (page d'etat)"}
+
+    def __init__(self, path, max_mb=20):
+        self.path = path
+        self.max_bytes = int(max_mb * 1024 * 1024)
+        self.events = deque(maxlen=3000)
+        self._lock = threading.Lock()
+        if path and Path(path).exists():
+            try:
+                for ln in Path(path).read_text(encoding="utf-8").splitlines()[-3000:]:
+                    try:
+                        e = json.loads(ln)
+                        e["t"] = time.mktime(time.strptime(e["date"], "%Y-%m-%d %H:%M:%S"))
+                        self.events.append(e)
+                    except (ValueError, KeyError):
+                        continue
+            except OSError:
+                pass
+
+    def add(self, kind, ip, local=False, user="", client="", device="", detail=""):
+        now = time.time()
+        e = {"date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+             "type": kind, "ip": ip, "local": bool(local), "user": user or "",
+             "client": client or "", "device": device or "", "detail": detail or ""}
+        if kind == "refused" and self.events:
+            last = self.events[-1]          # rafales de refus : une seule ligne
+            if last["type"] == "refused" and last["ip"] == ip and \
+                    last["detail"] == e["detail"] and now - last["t"] < 60:
+                last["count"] = last.get("count", 1) + 1
+                last["t"] = now
+                return last
+        line = json.dumps(e, ensure_ascii=False)
+        e["t"] = now
+        self.events.append(e)
+        if self.path:
+            try:
+                with self._lock:
+                    p = Path(self.path)
+                    if p.exists() and p.stat().st_size > self.max_bytes:
+                        os.replace(p, p.with_suffix(p.suffix + ".1"))
+                    with open(p, "a", encoding="utf-8") as fh:
+                        fh.write(line + "\n")
+            except OSError:
+                pass
+        return e
+
+    def snapshot(self, guard):
+        now = time.time()
+        day = [e for e in self.events if now - e["t"] < 86400]
+        fails = {}
+        for e in day:
+            if e["type"] in ("login_fail", "status_fail"):
+                fails[e["ip"]] = fails.get(e["ip"], 0) + 1
+        return {
+            "counts": {"login_ok": sum(e["type"] == "login_ok" for e in day),
+                       "login_fail": sum(e["type"] == "login_fail" for e in day),
+                       "ban": sum(e["type"] == "ban" for e in day),
+                       "refused": sum(e.get("count", 1) for e in day
+                                      if e["type"] == "refused")},
+            "top_fail_ips": sorted(fails.items(), key=lambda kv: -kv[1])[:10],
+            "bans": [{"ip": ip, "remaining_s": r} for ip, r in
+                     sorted(guard.active_bans().items(), key=lambda kv: -kv[1])],
+            "events": [{"t": int(e["t"]), "type": e["type"],
+                        "label": self.LABELS.get(e["type"], e["type"]),
+                        "ip": e["ip"], "local": e.get("local", False),
+                        "user": e.get("user", ""), "client": e.get("client", ""),
+                        "device": e.get("device", ""), "detail": e.get("detail", ""),
+                        "count": e.get("count", 1)}
+                       for e in list(self.events)[-1000:][::-1]],
+        }
 
 
 # =====================================================================
@@ -516,7 +710,7 @@ class Guard:
 # bibliotheques) et, au besoin, demandes a Emby avec la cle API des reglages
 # ou le jeton de l'utilisateur.
 _HEX = r"[0-9a-fA-F]{32}|\d+"
-_P = r"^/(?:emby/)?"
+_P = r"^/"                 # adresses deja normalisees (norm_path)
 RE_ITEM = re.compile(_P + r"Users/(?P<uid>%s)/Items/(?P<item>%s)/?$" % (_HEX, _HEX), re.I)
 RE_ITEMS = re.compile(_P + r"(?:Users/(?P<uid>%s)/)?Items/?$" % _HEX, re.I)
 RE_VIEWS = re.compile(_P + r"Users/(?P<uid>%s)/Views/?$" % _HEX, re.I)
@@ -679,7 +873,7 @@ class Activity:
         if token:
             c.token = token
         uid = f.get("userid", "")
-        m = RE_ANYUID.match(request.path)
+        m = RE_ANYUID.match(npath(request))
         if m:
             uid = m.group("uid")
         if uid:
@@ -756,10 +950,12 @@ class Activity:
     def before(self, c, request, body_json):
         """Ce que la requete dit, avant meme la reponse d'Emby.
         -> liste d'actions a confirmer selon le statut de la reponse."""
-        p, m, q = request.path, request.method, request.query
+        p, m, q = npath(request), request.method, request.query
         todo = []
         term = q.get("SearchTerm") or q.get("searchTerm")
         if term and m == "GET" and (RE_ITEMS.match(p) or RE_HINTS.match(p)):
+            if not self.cfg.record_searches:
+                return todo
             term = term.strip()[:120]
             self.event(c, "search", "Recherche : \u00ab %s \u00bb" % term, term=term)
             return todo
@@ -907,14 +1103,14 @@ class Activity:
 
     # -- noms appris dans les reponses d'Emby ----------------------------
     def wants_body(self, request):
-        p = request.path
+        p = npath(request)
         return request.method == "GET" and bool(
             RE_ITEM.match(p) or RE_VIEWS.match(p) or RE_USER.match(p)
             or RE_SEASONS.match(p)) or (request.method == "POST"
                                          and bool(LOGIN_RE.match(p)))
 
     def learn_response(self, c, request, data):
-        p = request.path
+        p = npath(request)
         if LOGIN_RE.match(p) and isinstance(data, dict):
             u = data.get("User") or {}
             if u.get("Id"):
@@ -988,8 +1184,18 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 CHUNK = 256 * 1024
 try:                                     # aiohttp >= 3.11
     CLIENT_IP = web.RequestKey("client_ip", str)
+    NPATH = web.RequestKey("npath", str)
 except AttributeError:
     CLIENT_IP = "client_ip"
+    NPATH = "npath"
+
+
+def npath(request):
+    """Adresse normalisee de la requete (calculee une seule fois)."""
+    try:
+        return request[NPATH]
+    except KeyError:
+        return norm_path(request.path)
 
 
 def _decode(raw, encoding):
@@ -1028,6 +1234,16 @@ class EmbyProxy:
         up = urlsplit(cfg.upstream)
         self.up_host = up.netloc
         self.activity = Activity(cfg, self.guard) if cfg.activity_enabled else None
+        self.seclog = SecurityLog(cfg.security_log)
+        self.sessions = {}          # jeton de la page d'etat -> expiration
+        self.warnings = {}
+        if not cfg.tls_cert and cfg.listen_host not in ("127.0.0.1", "::1", "localhost"):
+            self.warnings["http"] = (
+                "HTTP sans chiffrement : si le proxy est ouvert sur Internet, les "
+                "mots de passe circulent en clair. Configure tls_cert / tls_key, "
+                "ou place un relais HTTPS devant (et renseigne trusted_proxies).")
+        if not cfg.status_password:
+            cfg.status_password = secrets.token_urlsafe(12)   # jamais sans mot de passe
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
@@ -1041,6 +1257,20 @@ class EmbyProxy:
                  self.cache.total / 1048576)
         if self.activity:
             self._tasks.append(asyncio.create_task(self._resolve_loop()))
+        self._tasks.append(asyncio.create_task(self._prune_loop()))
+        for w in self.warnings.values():
+            log.warning(w)
+
+    async def _prune_loop(self):
+        """Journaux : on efface regulierement ce qui depasse log_days."""
+        loop = asyncio.get_running_loop()
+        while True:
+            for path in (self.cfg.activity_log, self.cfg.security_log):
+                n = await loop.run_in_executor(None, prune_jsonl, path,
+                                               self.cfg.log_days)
+                if n:
+                    log.info("journal %s : %d lignes anciennes effacees", path, n)
+            await asyncio.sleep(6 * 3600)
 
     async def cleanup(self, app):
         for t in self._tasks:
@@ -1101,9 +1331,14 @@ class EmbyProxy:
         app.on_cleanup.append(self.cleanup)
         app.on_response_prepare.append(self.add_security_headers)
         app.router.add_get("/__proxy/", self.status_page)
+        app.router.add_get("/__proxy/login", self.login_page)
+        app.router.add_post("/__proxy/login", self.login_post)
+        app.router.add_post("/__proxy/logout", self.logout_post)
         app.router.add_get("/__proxy/stats.json", self.status_json)
         app.router.add_get("/__proxy/activity.json", self.activity_json)
+        app.router.add_get("/__proxy/security.json", self.security_json)
         app.router.add_post("/__proxy/purge", self.purge)
+        app.router.add_post("/__proxy/unban", self.unban)
         app.router.add_route("*", "/{tail:.*}", self.handle)
         return app
 
@@ -1112,23 +1347,79 @@ class EmbyProxy:
     async def security_mw(self, request, handler):
         ip = self.guard.client_ip(request)
         request[CLIENT_IP] = ip
+        np = norm_path(request.path)
+        request[NPATH] = np
         self.stats.requests += 1
-        if request.path.startswith("/__proxy/"):
-            if not self.guard.is_local(ip):
-                raise web.HTTPNotFound()
-            return await handler(request)
-        refus = self.guard.check(ip, request.path)
+        if "X-Forwarded-For" in request.headers and "relay" not in self.warnings \
+                and not self.guard._in(request.remote or "", self.cfg.trusted) \
+                and self.guard.is_local(request.remote or ""):
+            self.warnings["relay"] = (
+                "Des requetes arrivent par un autre relais (%s, en-tete "
+                "X-Forwarded-For) : renseigne son adresse dans trusted_proxies. "
+                "Sinon tout Internet est vu comme le reseau local et un "
+                "bannissement touche tout le monde." % request.remote)
+            log.warning(self.warnings["relay"])
+        if request.path.startswith("/__proxy/") and self._session_ok(request) \
+                and (self.guard.is_local(ip) or self.cfg.status_internet):
+            # administrateur deja connecte : jamais bloque par un bannissement
+            # (sinon impossible de debannir sa propre adresse)
+            return await self._status_gate(request, handler, ip)
+        refus = self.guard.check(ip, np)
         if refus:
             self.guard.blocked += 1
             if refus[0] != 429:
                 log.info("refuse %s %s %s : %s", ip, request.method,
                          request.path, refus[1])
+                f = Activity._auth_fields(request)
+                self.seclog.add("refused", ip, self.guard.is_local(ip),
+                                client=f.get("client", ""), device=f.get("device", ""),
+                                detail="%s (%s %s)" % (refus[1], request.method,
+                                                       request.path[:80]))
                 if self.activity:
                     c = self.activity.identify(request)
                     self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
                         refus[1], request.method, request.path[:80]))
             return web.Response(status=refus[0], text=refus[1])
+        if request.path.startswith("/__proxy/"):
+            return await self._status_gate(request, handler, ip)
         return await handler(request)
+
+    # -- page d'etat : reseau local + mot de passe + anti-site-piege -------
+    async def _status_gate(self, request, handler, ip):
+        if not (self.guard.is_local(ip) or self.cfg.status_internet):
+            raise web.HTTPNotFound()
+        if request.path == "/__proxy/login":
+            if request.method == "POST" and not self._same_origin(request):
+                return web.Response(status=403, text="Origine refusee.")
+            return await handler(request)
+        if not self._session_ok(request):
+            if request.method == "GET" and request.path == "/__proxy/":
+                raise web.HTTPSeeOther("/__proxy/login")
+            return web.json_response({"error": "connexion requise"}, status=401)
+        if request.method == "POST" and not self._same_origin(request):
+            return web.Response(status=403, text="Origine refusee.")
+        resp = await handler(request)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    def _same_origin(self, request):
+        """Un site piege ouvert dans le navigateur ne doit pas pouvoir agir
+        sur la page d'etat : la demande doit venir de la page elle-meme."""
+        own = "%s://%s" % (request.scheme, request.host)
+        origin = request.headers.get("Origin")
+        if origin:
+            return origin == own
+        ref = request.headers.get("Referer", "")
+        return ref == own or ref.startswith(own + "/")
+
+    def _session_ok(self, request):
+        tok = request.cookies.get("epx_session", "")
+        exp = self.sessions.get(tok) if tok else None
+        if exp and exp > time.time():
+            return True
+        if tok:
+            self.sessions.pop(tok, None)
+        return False
 
     async def add_security_headers(self, request, response):
         h = response.headers
@@ -1145,7 +1436,7 @@ class EmbyProxy:
         if (request.headers.get("Upgrade", "").lower() == "websocket"
                 and request.method == "GET"):
             return await self.proxy_ws(request)
-        if request.method in ("GET", "HEAD") and IMAGE_RE.match(request.path):
+        if request.method in ("GET", "HEAD") and IMAGE_RE.match(npath(request)):
             return await self.proxy_image(request)
         return await self.proxy_http(request)
 
@@ -1173,17 +1464,19 @@ class EmbyProxy:
         data = request.content if request.body_exists else None
         act, c, todo, tee = self.activity, None, [], False
         headers = self._up_headers(request)
+        np = npath(request)
+        is_login = request.method == "POST" and bool(LOGIN_RE.match(np))
+        body_json = None
+        if request.method == "POST" and request.body_exists and (
+                is_login or (act and RE_PLAYING.match(np))) \
+                and (request.content_length or 0) < 1_000_000:
+            data = await request.read()              # petit JSON : on le lit
+            try:
+                body_json = json.loads(data or b"{}")
+            except ValueError:
+                body_json = None
         if act:
             c = act.identify(request)
-            body_json = None
-            if request.method == "POST" and request.body_exists and (
-                    RE_PLAYING.match(request.path) or LOGIN_RE.match(request.path)) \
-                    and (request.content_length or 0) < 1_000_000:
-                data = await request.read()          # petit JSON : on le lit
-                try:
-                    body_json = json.loads(data or b"{}")
-                except ValueError:
-                    body_json = None
             todo = act.before(c, request, body_json)
             tee = act.wants_body(request)
             if tee:
@@ -1198,9 +1491,8 @@ class EmbyProxy:
                         request.path, exc)
             return web.Response(status=502, text="Serveur Emby injoignable.")
         try:
-            if LOGIN_RE.match(request.path) and request.method == "POST":
-                if up.status in (200, 401, 403):
-                    self.guard.login_result(request[CLIENT_IP], up.status == 200)
+            if is_login and up.status in (200, 401, 403):
+                self._record_login(request, body_json, up.status == 200)
             resp = web.StreamResponse(status=up.status, reason=up.reason)
             for k, v in up.headers.items():
                 lk = k.lower()
@@ -1233,6 +1525,22 @@ class EmbyProxy:
             if act and todo:
                 act.after(c, todo, up.status)
             up.release()
+
+    def _record_login(self, request, body, ok):
+        ip = request[CLIENT_IP]
+        f = Activity._auth_fields(request)
+        user = ""
+        if isinstance(body, dict):
+            user = str(body.get("Username") or body.get("Name") or "")[:80]
+        local = self.guard.is_local(ip)
+        self.seclog.add("login_ok" if ok else "login_fail", ip, local, user,
+                        f.get("client", ""), f.get("device", ""))
+        if self.guard.login_result(ip, ok):
+            self.seclog.add("ban", ip, local, user, f.get("client", ""),
+                            f.get("device", ""),
+                            "%d mots de passe faux en %d min : banni %d min" % (
+                                self.cfg.login_max, self.cfg.login_window / 60,
+                                self.cfg.ban_seconds / 60))
 
     # -- WebSocket des applications Emby ----------------------------------
     async def proxy_ws(self, request):
@@ -1297,7 +1605,7 @@ class EmbyProxy:
     async def proxy_image(self, request):
         loop = asyncio.get_running_loop()
         qs = request.query_string
-        key = cache_key(request.path, qs)
+        key = cache_key(npath(request), qs)
         got = await loop.run_in_executor(None, self.cache.get, key)
         now = time.time()
         if got and got[0].get("expires", 0) > now:
@@ -1387,6 +1695,7 @@ class EmbyProxy:
             "bans": self.guard.active_bans(),
             "cache_entries": c["entries"], "cache_bytes": c["bytes"],
             "cache_max_bytes": c["max_bytes"],
+            "warnings": list(self.warnings.values()),
             "active_users": sum(
                 1 for x in self.activity.clients.values()
                 if time.time() - x.last_seen < self.cfg.activity_idle_minutes * 60
@@ -1401,6 +1710,58 @@ class EmbyProxy:
             return web.json_response({"clients": [], "feed": [], "disabled": True})
         return web.json_response(self.activity.snapshot())
 
+    async def security_json(self, request):
+        return web.json_response(self.seclog.snapshot(self.guard))
+
+    async def unban(self, request):
+        data = await request.post()
+        ip = str(data.get("ip", ""))[:64]
+        ok = self.guard.unban(ip)
+        if ok:
+            self.seclog.add("unban", ip, self.guard.is_local(ip),
+                            detail="par %s" % request[CLIENT_IP])
+        return web.json_response({"ok": ok})
+
+    async def login_page(self, request, error=""):
+        html = LOGIN_HTML.replace("@@ERR@@", error)
+        return web.Response(text=html, content_type="text/html",
+                            status=401 if error else 200,
+                            headers={"Cache-Control": "no-store"})
+
+    async def login_post(self, request):
+        ip = request[CLIENT_IP]
+        data = await request.post()
+        given = str(data.get("password", ""))
+        ok = hmac.compare_digest(given.encode("utf-8"),
+                                 self.cfg.status_password.encode("utf-8"))
+        local = self.guard.is_local(ip)
+        if not ok:
+            self.seclog.add("status_fail", ip, local,
+                            client=request.headers.get("User-Agent", "")[:60])
+            if self.guard.login_result(ip, False):
+                self.seclog.add("ban", ip, local, detail="page d'etat : %d mots de "
+                                "passe faux" % self.cfg.login_max)
+            return await self.login_page(request, "Mot de passe incorrect.")
+        self.guard.login_result(ip, True)
+        self.seclog.add("status_ok", ip, local,
+                        client=request.headers.get("User-Agent", "")[:60])
+        now = time.time()
+        for k in [k for k, v in self.sessions.items() if v < now]:
+            del self.sessions[k]
+        tok = secrets.token_urlsafe(32)
+        self.sessions[tok] = now + self.cfg.session_hours * 3600
+        resp = web.Response(status=303, headers={"Location": "/__proxy/"})
+        resp.set_cookie("epx_session", tok, path="/__proxy/", httponly=True,
+                        samesite="Strict", secure=bool(self.cfg.tls_cert),
+                        max_age=int(self.cfg.session_hours * 3600))
+        return resp
+
+    async def logout_post(self, request):
+        self.sessions.pop(request.cookies.get("epx_session", ""), None)
+        resp = web.Response(status=303, headers={"Location": "/__proxy/login"})
+        resp.del_cookie("epx_session", path="/__proxy/")
+        return resp
+
     async def purge(self, request):
         await asyncio.get_running_loop().run_in_executor(None, self.cache.clear)
         log.info("cache vide par %s", request[CLIENT_IP])
@@ -1409,6 +1770,21 @@ class EmbyProxy:
     async def status_page(self, request):
         return web.Response(text=STATUS_HTML, content_type="text/html")
 
+
+LOGIN_HTML = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy</title>
+<style>body{font:15px system-ui,Segoe UI,sans-serif;background:#16181f;color:#e4e6ec;
+display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px}
+form{background:#1f222b;border:1px solid #2e323d;border-radius:10px;padding:24px;width:100%;max-width:340px}
+h1{font-size:19px;margin:0 0 14px}input{width:100%;box-sizing:border-box;padding:9px;border-radius:6px;
+border:1px solid #2e323d;background:#16181f;color:#e4e6ec;font:inherit}button{margin-top:12px;width:100%;
+padding:9px;border:0;border-radius:6px;background:#e94560;color:#fff;font:inherit;cursor:pointer}
+.err{color:#e05555;margin-top:10px;min-height:1em}.sub{color:#9aa0aa;font-size:12px;margin-top:12px}</style>
+</head><body><form method="post" action="/__proxy/login"><h1>Emby Proxy</h1>
+<input type="password" name="password" placeholder="Mot de passe" autofocus autocomplete="current-password">
+<button type="submit">Se connecter</button><div class="err">@@ERR@@</div>
+<div class="sub">Mot de passe : section [status] du fichier emby_proxy.ini, ou bouton
+\u00ab Copier le mot de passe \u00bb de la fenetre du proxy.</div></form></body></html>"""
 
 STATUS_HTML = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1434,9 +1810,15 @@ td,th{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;font-s
 .bar2{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
 button.red{margin-top:16px;background:var(--acc);color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer}
 pre{background:var(--card);padding:10px;border-radius:8px;white-space:pre-wrap}.empty{color:var(--mut);padding:10px}
+button.ghost{background:none;border:1px solid var(--line);color:var(--mut);border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
+button.small{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font:inherit}
+.w{background:#3a2a12;border:1px solid var(--warn);color:#ffd9a0;border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:13px}
+.t-login_fail,.t-status_fail,.t-ban{color:var(--bad)}.t-login_ok,.t-status_ok,.t-unban{color:var(--ok)}.t-refused{color:var(--warn)}
 </style></head><body>
-<h1>Emby Proxy</h1>
-<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="cache">Cache &amp; sécurité</button></div>
+<div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+<h1>Emby Proxy</h1><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div>
+<div id="warn"></div>
+<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="cache">Cache</button></div>
 
 <section id="act">
   <div class="sub" id="summary"></div>
@@ -1456,9 +1838,27 @@ pre{background:var(--card);padding:10px;border-radius:8px;white-space:pre-wrap}.
   <div class="tw"><table><thead><tr><th>Heure</th><th>Utilisateur</th><th>Appareil</th><th>Action</th></tr></thead><tbody id="feed"></tbody></table></div>
 </section>
 
+<section id="sec" hidden>
+  <div class="g" id="secg"></div>
+  <h2>Adresses bannies</h2>
+  <div class="tw"><table><thead><tr><th>Adresse IP</th><th>Encore</th><th></th></tr></thead><tbody id="bans"></tbody></table></div>
+  <h2>Adresses avec le plus de mots de passe faux (24 h)</h2>
+  <div class="sub" id="topfail">-</div>
+  <h2>Tentatives de connexion et accès refusés</h2>
+  <div class="bar2">
+    <select id="sKind"><option value="">Tout</option>
+      <option value="login_fail,status_fail">Mots de passe faux</option>
+      <option value="login_ok,status_ok">Connexions réussies</option>
+      <option value="ban,unban">Bannissements</option>
+      <option value="refused">Accès refusés</option></select>
+    <select id="sNet"><option value="">Toutes origines</option><option value="net">Internet seulement</option><option value="local">Réseau local seulement</option></select>
+    <input id="sText" placeholder="Filtrer (nom, IP, appareil...)">
+  </div>
+  <div class="tw"><table><thead><tr><th>Date</th><th>Événement</th><th>Nom tapé</th><th>Adresse IP</th><th>Application / appareil</th><th>Détail</th></tr></thead><tbody id="sfeed"></tbody></table></div>
+</section>
+
 <section id="cache" hidden>
   <div class="g" id="g"></div>
-  <h2>Adresses bannies</h2><pre id="b">-</pre>
   <button class="red" id="purge">Vider le cache</button>
 </section>
 
@@ -1471,7 +1871,7 @@ const hm=t=>new Date(t*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'
 const day=t=>new Date(t*1000).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
-  $('act').hidden=b.dataset.t!=='act';$('cache').hidden=b.dataset.t!=='cache';});
+  ['act','sec','cache'].forEach(t=>$(t).hidden=b.dataset.t!==t);});
 
 function userCard(u){
   const c=el('div','c');
@@ -1515,16 +1915,43 @@ const F=[['Vignettes servies du cache','cache_hits'],['Demandées à Emby','cach
 ['Taux de cache','hit_ratio',v=>v+' %'],['Économisé sur Emby','bytes_saved',mo],
 ['Vignettes en cache','cache_entries'],['Taille du cache','cache_bytes',mo],
 ['Périmées servies (Emby HS)','stale_served'],['Requêtes','requests'],
-['Requêtes bloquées','blocked'],['Erreurs Emby','upstream_errors'],['WebSocket ouverts','websockets'],
+['Erreurs Emby','upstream_errors'],['WebSocket ouverts','websockets'],
 ['Utilisateurs actifs','active_users'],
 ['En service depuis','uptime_s',v=>Math.floor(v/3600)+' h '+Math.floor(v%3600/60)+' min']];
 function renderStats(d){
   $('g').replaceChildren(...F.map(([l,k,f])=>{const c=el('div','c');c.append(el('div','l',l),el('div','v',f?f(d[k]):String(d[k])));return c}));
-  const b=Object.entries(d.bans);$('b').textContent=b.length?b.map(([ip,s])=>ip+'  encore '+Math.ceil(s/60)+' min').join('\n'):'aucune'}
+  $('warn').replaceChildren(...(d.warnings||[]).map(w=>el('div','w','⚠ '+w)))}
 $('purge').onclick=()=>{if(confirm('Vider le cache des vignettes ?'))fetch('purge',{method:'POST'}).then(tick)};
+
+let lastSec=null;
+function card(l,v,col){const c=el('div','c'),x=el('div','v',String(v));if(col)x.style.color=col;c.append(el('div','l',l),x);return c}
+function renderSec(d){
+  lastSec=d;const n=d.counts;
+  $('secg').replaceChildren(card('Mots de passe faux (24 h)',n.login_fail,n.login_fail?'var(--bad)':''),
+    card('Connexions réussies (24 h)',n.login_ok),card('Bannissements (24 h)',n.ban,n.ban?'var(--bad)':''),
+    card('Accès refusés (24 h)',n.refused),card('Adresses bannies en ce moment',d.bans.length,d.bans.length?'var(--bad)':''));
+  $('bans').replaceChildren(...(d.bans.length?d.bans.map(b=>{const tr=el('tr'),bt=el('button','small','Débannir');
+    bt.onclick=()=>{if(confirm('Débannir '+b.ip+' ?'))fetch('unban',{method:'POST',body:new URLSearchParams({ip:b.ip})}).then(tick)};
+    const td=el('td');td.append(bt);tr.append(el('td',null,b.ip),el('td',null,Math.ceil(b.remaining_s/60)+' min'),td);return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune adresse bannie.');td.colSpan=3;tr.append(td);return tr})()]));
+  $('topfail').textContent=d.top_fail_ips.length?d.top_fail_ips.map(([ip,c])=>ip+' : '+c).join('   ·   '):'aucune';
+  renderSecFeed()}
+function renderSecFeed(){
+  if(!lastSec)return;const k=$('sKind').value.split(',').filter(Boolean),nt=$('sNet').value,q=$('sText').value.toLowerCase();
+  const rows=lastSec.events.filter(e=>(!k.length||k.includes(e.type))&&(!nt||(nt==='local')===e.local)&&
+    (!q||[e.user,e.ip,e.client,e.device,e.detail].join(' ').toLowerCase().includes(q)));
+  $('sfeed').replaceChildren(...(rows.length?rows.slice(0,500).map(e=>{const tr=el('tr','t-'+e.type);
+    const ip=el('td',null,e.ip);ip.append(el('span','tag',e.local?'local':'Internet'));
+    tr.append(el('td',null,day(e.t)),el('td',null,e.label+(e.count>1?' ×'+e.count:'')),el('td',null,e.user||'-'),ip,
+      el('td','sub',[e.client,e.device].filter(Boolean).join(' · ')||'-'),el('td','sub',e.detail||''));return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun événement.');td.colSpan=6;tr.append(td);return tr})()]))}
+['sKind','sNet'].forEach(i=>$(i).onchange=renderSecFeed);$('sText').oninput=renderSecFeed;
+
 function tick(){
-  fetch('activity.json').then(r=>r.json()).then(renderAct).catch(()=>{});
-  fetch('stats.json').then(r=>r.json()).then(renderStats).catch(()=>{})}
+  const j=u=>fetch(u).then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()});
+  j('activity.json').then(renderAct).catch(()=>{});
+  j('security.json').then(renderSec).catch(()=>{});
+  j('stats.json').then(renderStats).catch(()=>{})}
 tick();setInterval(tick,3000);
 </script></body></html>
 """
@@ -1616,10 +2043,11 @@ def run_gui(cfg):
                                                  cfg.listen_port, cfg.upstream),
              fg=mut, bg=bg).grid(row=1, column=0, columnspan=2, sticky="w", padx=14)
     rows = [("Etat", "state"), ("Utilisateurs actifs", "users"),
+            ("Mots de passe faux (24 h)", "fails"), ("Adresses bannies", "bans"),
             ("Vignettes servies du cache", "hits"),
             ("Demandees a Emby", "misses"), ("Taux de cache", "ratio"),
             ("Economise sur Emby", "saved"), ("Cache sur disque", "cache"),
-            ("Requetes bloquees", "blocked"), ("Adresses bannies", "bans")]
+            ("Requetes bloquees", "blocked")]
     vals = {}
     for i, (lbl, k) in enumerate(rows):
         tk.Label(root, text=lbl, fg=mut, bg=bg).grid(row=2 + i, column=0,
@@ -1627,8 +2055,16 @@ def run_gui(cfg):
         vals[k] = tk.Label(root, text="-", fg=fg, bg=bg, font=("Segoe UI", 10, "bold"),
                            wraplength=330, justify="left")
         vals[k].grid(row=2 + i, column=1, sticky="w", padx=(10, 14))
+    warn = tk.Label(root, text="", fg="#ffb347", bg=bg, wraplength=470, justify="left")
+    warn.grid(row=19, column=0, columnspan=2, sticky="w", padx=14, pady=(8, 0))
     bar = tk.Frame(root, bg=bg)
     bar.grid(row=20, column=0, columnspan=2, pady=12, padx=14, sticky="w")
+
+    def copy_pwd():
+        root.clipboard_clear()
+        root.clipboard_append(cfg.status_password)
+        messagebox.showinfo("Emby Proxy", "Mot de passe de la page d'etat copie.\n"
+                            "Colle-le dans la page qui s'ouvre.")
 
     def purge():
         if messagebox.askyesno("Emby Proxy", "Vider le cache des vignettes ?"):
@@ -1640,6 +2076,8 @@ def run_gui(cfg):
 
     tk.Button(bar, text="Activite / page d'etat",
               command=lambda: webbrowser.open(status_url)).pack(side="left")
+    tk.Button(bar, text="Copier le mot de passe", command=copy_pwd).pack(side="left",
+                                                                         padx=(8, 0))
     tk.Button(bar, text="Vider le cache", command=purge).pack(side="left", padx=8)
     tk.Button(bar, text="Arreter", command=quit_).pack(side="left")
     root.protocol("WM_DELETE_WINDOW", quit_)
@@ -1651,6 +2089,10 @@ def run_gui(cfg):
         else:
             vals["state"].config(text="en service", fg="#2ecc71")
         vals["users"].config(text=str(d["active_users"]))
+        fails = sum(1 for e in proxy.seclog.events if e["type"] == "login_fail"
+                    and time.time() - e["t"] < 86400)
+        vals["fails"].config(text=str(fails), fg="#e05555" if fails else fg)
+        warn.config(text="\n".join("Attention : " + w for w in d["warnings"]))
         vals["hits"].config(text=str(d["cache_hits"]))
         vals["misses"].config(text=str(d["cache_misses"]))
         vals["ratio"].config(text="%s %%" % d["hit_ratio"])
@@ -1659,7 +2101,8 @@ def run_gui(cfg):
             d["cache_entries"], d["cache_bytes"] / 1048576,
             d["cache_max_bytes"] / 1048576))
         vals["blocked"].config(text=str(d["blocked"]))
-        vals["bans"].config(text=", ".join(d["bans"]) or "aucune")
+        vals["bans"].config(text=", ".join(d["bans"]) or "aucune",
+                            fg="#e05555" if d["bans"] else fg)
         root.after(1500, refresh)
 
     refresh()
@@ -1684,6 +2127,9 @@ def main(argv=None):
             pass
     cfg = Settings(cfg_path)
     setup_logging(cfg, to_console=not args.gui)
+    if ensure_status_password(cfg_path, cfg):
+        log.warning("mot de passe de la page d'etat cree : %s  (dans %s, section "
+                    "[status])", cfg.status_password, cfg_path)
     if args.gui:
         return run_gui(cfg)
     proxy = EmbyProxy(cfg)

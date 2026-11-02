@@ -7,3 +7,4 @@ cache_images/
 data/
 *.pem
 emby_activity.log*
+emby_security.log*
