@@ -1508,10 +1508,12 @@ class EmbyProxy:
                 log.warning("cle API Emby refusee : %s", p.get("key_error", ""))
         else:
             self.warnings["emby"] = (
-                "Emby ne repond pas a l'adresse %s (%s). Regle l'adresse dans la page "
-                "d'etat, onglet Configuration, ou dans %s : ligne upstream = ... de "
-                "la section [proxy], puis relance le proxy."
-                % (self.cfg.upstream, p.get("error", "?"), self.cfg.path))
+                "Emby ne repond pas a l'adresse %s (%s). Pour la changer : "
+                "python emby_proxy.py --emby http://ADRESSE-EMBY:8096 , ou page "
+                "d'administration http://<ce serveur>:%d/ onglet Configuration, ou "
+                "ligne upstream = ... de la section [proxy] de %s."
+                % (self.cfg.upstream, p.get("error", "?"),
+                   self.cfg.status_port or self.cfg.listen_port, self.cfg.path))
             log.warning(self.warnings["emby"])
 
     async def _prune_loop(self):
@@ -1779,6 +1781,27 @@ class EmbyProxy:
         h["X-Forwarded-Host"] = host
         return h
 
+    def _emby_down(self, request):
+        """Emby injoignable. Sur le reseau local, on explique ou le regler."""
+        ip = request.get(CLIENT_IP, "")
+        if not self.guard.is_local(ip):
+            return web.Response(status=502, text="Serveur Emby injoignable.")
+        admin = "http://%s:%d/" % ((request.host or "").rsplit(":", 1)[0] or "127.0.0.1",
+                                    self.cfg.status_port or self.cfg.listen_port)
+        if request.path.startswith(("/emby/", "/mediabrowser/", "/Users", "/Items")):
+            return web.Response(status=502, text="Serveur Emby injoignable (%s)."
+                                % self.cfg.upstream)
+        html = ("<!doctype html><meta charset=utf-8><title>Emby injoignable</title>"
+                "<body style='font:16px system-ui;background:#16181f;color:#e4e6ec;"
+                "padding:30px'><h2>Le proxy fonctionne, mais Emby ne repond pas</h2>"
+                "<p>Adresse d'Emby utilisee : <b>%s</b></p><p>Pour la changer : page "
+                "d'administration <a style='color:#5aaaeb' href='%s'>%s</a>, onglet "
+                "<b>Configuration</b>.</p><p>Ou en ligne de commande, dans le dossier "
+                "du proxy :<br><code>python emby_proxy.py --emby "
+                "http://ADRESSE-EMBY:8096</code></p>"
+                % (self.cfg.upstream, admin, admin))
+        return web.Response(status=502, text=html, content_type="text/html")
+
     def _public_origin(self, request):
         """Schema et nom vus par l'utilisateur : ceux du relais HTTPS s'il est
         de confiance (sinon Emby croirait etre en HTTP)."""
@@ -1823,7 +1846,7 @@ class EmbyProxy:
             self.stats.upstream_errors += 1
             log.warning("Emby injoignable (%s %s) : %s", _safe(request.method, 10),
                         _safe(request.path), exc)
-            return web.Response(status=502, text="Serveur Emby injoignable.")
+            return self._emby_down(request)
         if act:
             # L'activite n'est attribuee a un utilisateur qu'une fois la
             # requete acceptee par Emby : sinon n'importe qui pourrait, sans
@@ -2732,14 +2755,36 @@ def main(argv=None):
                                                        str(DEFAULT_CONFIG)))
     ap.add_argument("--gui", action="store_true",
                     help="petite fenetre de suivi (Windows)")
+    ap.add_argument("--emby", metavar="ADRESSE",
+                    help="adresse du serveur Emby a enregistrer dans les reglages, "
+                         "ex. --emby http://192.168.1.234:8096")
     args = ap.parse_args(argv)
 
     cfg_path = Path(args.config)
+    created = False
     if not cfg_path.exists():
         try:
             write_example_config(cfg_path)
+            created = True
         except OSError:
             pass
+    emby = args.emby
+    if not emby and created and not args.gui and sys.stdin and sys.stdin.isatty():
+        # premier lancement en console : on demande tout de suite l'adresse
+        try:
+            emby = input("Adresse de ton serveur Emby (ex. http://192.168.1.234:8096), "
+                         "Entree = plus tard : ").strip()
+        except (EOFError, KeyboardInterrupt):
+            emby = ""
+    if emby:
+        url = normalize_upstream(emby)
+        if not url:
+            print("Adresse invalide : %s  (exemple : http://192.168.1.234:8096)" % emby)
+            return 2
+        update_ini(cfg_path, "proxy", "upstream", url)
+        check = Settings(cfg_path).upstream
+        print("Adresse d'Emby enregistree dans %s : upstream = %s%s" % (
+            cfg_path, check, "" if check == url else "  /!\\ relue differente"))
     cfg = Settings(cfg_path)
     setup_logging(cfg, to_console=not args.gui)
     if ensure_status_password(cfg_path, cfg):

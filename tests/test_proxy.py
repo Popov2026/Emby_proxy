@@ -1011,3 +1011,23 @@ async def test_config_lecture_affiche_le_fichier(env, tmp_path):
     await login(c, proxy)
     d = await (await c.get("/__proxy/config.json")).json()
     assert "file_upstream" in d and "file_warnings" in d
+
+
+
+def test_option_emby_enregistre_l_adresse(tmp_path, monkeypatch):
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    # main() s'arrete apres l'enregistrement si on simule un serveur qui echoue
+    monkeypatch.setattr(ep, "serve", lambda proxy: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(ep.asyncio, "run", lambda coro: None)
+    ep.main(["--config", str(ini), "--emby", "192.168.1.234:8096"])
+    assert ep.Settings(ini).upstream == "http://192.168.1.234:8096"
+    assert ep.main(["--config", str(ini), "--emby", "pas valable"]) == 2
+
+
+async def test_page_explicative_si_emby_injoignable(env):
+    make, _, _ = env
+    _, c = await make(proxy__upstream="http://127.0.0.1:9", status__port="8098")
+    r = await c.get("/")
+    t = await r.text()
+    assert r.status == 502 and "Configuration" in t and "--emby" in t and ":8098/" in t
