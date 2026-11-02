@@ -103,6 +103,8 @@ jobs:
           if ($r.StatusCode -ne 200) { throw "page d'administration injoignable" }
           $u = Invoke-WebRequest http://127.0.0.1:8097/ -UseBasicParsing -SkipHttpErrorCheck
           Write-Host "Port utilisateurs : $($u.StatusCode)"
+          Write-Host "--- emby_proxy.ini ---"; Get-Content emby_proxy.ini | Select-String -Pattern "password|^\[" | ForEach-Object { $_.Line -replace '(password = ).+', '$1***' }
+          Write-Host "--- journaux ---"; Get-ChildItem *.log | ForEach-Object { Write-Host "## $($_.Name)"; Get-Content $_ -Tail 30 }
           if ((Get-Content emby_proxy.ini -Raw) -notmatch "(?m)^password = \S+") { throw "mot de passe non cree" }
           .\EmbyProxy-service.exe restart
           Start-Sleep 8
