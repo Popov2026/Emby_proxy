@@ -62,7 +62,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
 from aiohttp import ClientError
 
-__version__ = "1.0"
+__version__ = "2.0.0"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -178,7 +178,8 @@ ENV_OVERRIDES = {
 # Cle API Emby et mot de passe du compte mail : jamais en clair dans
 # emby_proxy.ini. (Le mot de passe de la page d'administration, lui, reste
 # lisible dans le fichier : c'est la qu'on le retrouve pour se connecter.)
-#   Windows : DPAPI (chiffre pour le compte Windows qui lance le proxy) ;
+#   Windows : DPAPI, portee "machine" : lisible sur ce PC seulement, par le
+#             service (compte Systeme) comme par l'utilisateur ;
 #   ailleurs : Fernet (AES) avec la cle emby_proxy_secret.key, creee a cote
 #   du fichier de reglages (module cryptography).
 # Format ecrit : enc:dpapi:<base64> ou enc:fernet:<jeton>.
@@ -195,7 +196,9 @@ def _dpapi(data, encrypt):
     src, dst = BLOB(len(data), buf), BLOB()
     fn = ctypes.windll.crypt32.CryptProtectData if encrypt \
         else ctypes.windll.crypt32.CryptUnprotectData
-    ok = fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(dst))
+    # 0x1 = sans fenetre ; 0x4 = portee machine (service + utilisateur)
+    flags = 0x1 | (0x4 if encrypt else 0)
+    ok = fn(ctypes.byref(src), None, None, None, None, flags, ctypes.byref(dst))
     if not ok:
         raise OSError("DPAPI : %s" % ctypes.FormatError())
     try:
@@ -4408,6 +4411,7 @@ def run_gui(cfg):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Proxy securise pour Emby, "
                                              "avec cache des vignettes.")
+    ap.add_argument("--version", action="version", version="Emby Proxy " + __version__)
     ap.add_argument("--config", default=os.environ.get("EMBY_PROXY_CONFIG",
                                                        str(DEFAULT_CONFIG)))
     ap.add_argument("--gui", action="store_true",

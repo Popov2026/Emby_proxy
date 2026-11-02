@@ -16,3 +16,8 @@ emby_quota.ini.*
 *.db-shm
 emby_proxy_secret.key
 *.avant-import
+
+# compilation
+build/
+dist/
+*.spec

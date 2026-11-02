@@ -1,0 +1,23 @@
+<!--
+  Service Windows d'Emby Proxy (WinSW : https://github.com/winsw/winsw).
+  Installe par installer_service.bat ; ne pas lancer ce fichier directement.
+-->
+<service>
+  <id>EmbyProxy</id>
+  <name>Emby Proxy</name>
+  <description>Proxy securise pour Emby : cache des vignettes, activite, securite, quotas de lecture, alertes.</description>
+  <executable>%BASE%\emby_proxy.exe</executable>
+  <arguments>--config "%BASE%\emby_proxy.ini"</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="60 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>20 sec</stoptimeout>
+  <log mode="roll-by-size">
+    <sizeThreshold>5120</sizeThreshold>
+    <keepFiles>3</keepFiles>
+  </log>
+</service>

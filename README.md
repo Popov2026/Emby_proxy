@@ -176,7 +176,26 @@ Emby, envoi de fichiers.
 
 ## Installation
 
-### Windows
+### Windows : version compilée, installée en service (recommandé)
+Pas besoin de Python.
+1. Page **Releases** du dépôt : télécharge `EmbyProxy-vX.Y.Z-windows.zip`.
+2. Décompresse-le dans un dossier fixe, par exemple `C:\EmbyProxy`.
+3. Double-clic sur **`installer_service.bat`** et accepte l'autorisation
+   Windows.
+4. La page d'administration s'ouvre (`http://localhost:8098/`) : le mot de
+   passe est affiché dans la fenêtre d'installation.
+
+Le service démarre avec Windows, même sans session ouverte, et redémarre
+tout seul en cas de plantage. Le pare-feu est réglé : le port 8097 est
+ouvert, le 8098 seulement au réseau local. Pour le retirer :
+`desinstaller_service.bat`.
+
+La version compilée est construite et testée sur un vrai Windows par GitHub
+(fichier `.github/workflows/release.yml`) à chaque étiquette `vX.Y.Z` : chiffrement
+DPAPI, installation, démarrage, redémarrage et désinstallation du service.
+Pour compiler soi-même : `build_windows.bat`.
+
+### Windows, avec Python
 1. Python 3.9 ou plus récent (<https://www.python.org>, avec tkinter, inclus
    par défaut).
 2. Dans une invite de commandes, dans le dossier du projet :

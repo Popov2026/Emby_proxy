@@ -1,0 +1,124 @@
+# Version compilee pour Windows : emby_proxy.exe + service Windows (WinSW).
+# Se declenche quand on pousse une etiquette vX.Y.Z (ou a la main).
+name: Version Windows
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q -p no:anyio
+
+  windows:
+    needs: tests
+    runs-on: windows-latest
+    env:
+      WINSW_URL: https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependances
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Compilation de emby_proxy.exe
+        run: >
+          pyinstaller --onefile --console --name emby_proxy
+          --hidden-import emby_quota --hidden-import emby_quota_i18n
+          emby_proxy.py
+
+      - name: Assemblage du dossier
+        shell: pwsh
+        run: |
+          $d = "dist\EmbyProxy"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item dist\emby_proxy.exe $d
+          Invoke-WebRequest $env:WINSW_URL -OutFile "$d\EmbyProxy-service.exe"
+          Copy-Item packaging\windows\* $d
+          Copy-Item emby_quota.ini.example, emby_proxy.example.ini $d
+          $v = (& "$d\emby_proxy.exe" --version)
+          Write-Host "Version : $v"
+          if ($v -notmatch "Emby Proxy") { exit 1 }
+
+      - name: Archive
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
+          Compress-Archive -Path dist\EmbyProxy -DestinationPath "EmbyProxy-$tag-windows.zip"
+          "ZIP=EmbyProxy-$tag-windows.zip" | Out-File -Append $env:GITHUB_ENV
+
+      # --- essais reels sur Windows, dans une copie (l'archive reste vierge) ---
+      - name: Essai - chiffrement DPAPI de la cle API
+        shell: pwsh
+        run: |
+          Expand-Archive $env:ZIP -DestinationPath essai1
+          cd essai1\EmbyProxy
+          "[emby]`napi_key = CLE-DE-TEST-123`n[log]`nfile = proxy.log`n" | Out-File -Encoding utf8 emby_proxy.ini
+          $p = Start-Process .\emby_proxy.exe -ArgumentList '--config', "$PWD\emby_proxy.ini" -PassThru -NoNewWindow
+          Start-Sleep 8
+          $ini = Get-Content emby_proxy.ini -Raw
+          Stop-Process $p -Force
+          Write-Host $ini
+          if ($ini -match "CLE-DE-TEST-123") { throw "cle API restee en clair" }
+          if ($ini -notmatch "api_key = enc:dpapi:") { throw "cle API non chiffree par DPAPI" }
+          if ($ini -notmatch "(?m)^password = \S+") { throw "mot de passe de la page absent" }
+          Get-Content proxy.log
+          if ((Get-Content proxy.log -Raw) -notmatch "cle API Emby : chiffree") { throw "cle relue impossible" }
+
+      - name: Essai - service Windows
+        shell: pwsh
+        run: |
+          Expand-Archive $env:ZIP -DestinationPath essai2
+          cd essai2\EmbyProxy
+          .\EmbyProxy-service.exe install
+          .\EmbyProxy-service.exe start
+          Start-Sleep 10
+          $s = Get-Service EmbyProxy
+          Write-Host "Etat : $($s.Status) / demarrage : $($s.StartType)"
+          if ($s.Status -ne "Running") { Get-ChildItem *.log | ForEach-Object { Get-Content $_ }; throw "service non demarre" }
+          $r = Invoke-WebRequest http://127.0.0.1:8098/__proxy/login -UseBasicParsing
+          if ($r.StatusCode -ne 200) { throw "page d'administration injoignable" }
+          $u = Invoke-WebRequest http://127.0.0.1:8097/ -UseBasicParsing -SkipHttpErrorCheck
+          Write-Host "Port utilisateurs : $($u.StatusCode)"
+          if ((Get-Content emby_proxy.ini -Raw) -notmatch "(?m)^password = \S+") { throw "mot de passe non cree" }
+          .\EmbyProxy-service.exe restart
+          Start-Sleep 8
+          if ((Get-Service EmbyProxy).Status -ne "Running") { throw "redemarrage du service" }
+          .\EmbyProxy-service.exe stop
+          .\EmbyProxy-service.exe uninstall
+          if (Get-Service EmbyProxy -ErrorAction SilentlyContinue) { throw "desinstallation" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EmbyProxy-windows
+          path: ${{ env.ZIP }}
+
+      - name: Publication (Releases)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          name: Emby Proxy ${{ github.ref_name }} pour Windows
+          body: |
+            Version compilee pour Windows, avec installation en service.
+
+            1. Telecharge EmbyProxy-${{ github.ref_name }}-windows.zip ci-dessous.
+            2. Decompresse-le dans C:\EmbyProxy.
+            3. Double-clic sur installer_service.bat.
+            4. Page d'administration : http://localhost:8098/
+
+            Detail : LISEZMOI.txt dans l'archive.
