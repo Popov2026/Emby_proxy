@@ -88,6 +88,23 @@ l'utilisateur.
 - Filtres par type, par origine (Internet ou réseau local) et par texte.
 - Journal sur disque `emby_security.log`, relu au redémarrage.
 
+### Onglet Configuration
+- **Adresse du serveur Emby** et **clé API**, modifiables depuis la page.
+- Bouton **Tester la connexion** : nom du serveur, version d'Emby, temps de
+  réponse, et validité de la clé API.
+- **Enregistrer** applique **immédiatement**, sans redémarrage, et écrit dans
+  `emby_proxy.ini` en gardant ses commentaires.
+- Garde-fous, car cette adresse décide où partent les mots de passe des
+  utilisateurs :
+  - il faut **retaper le mot de passe** de la page pour confirmer ;
+  - les modifications ne sont possibles **que depuis le réseau local** ;
+  - la clé API n'est jamais renvoyée à la page (seulement ses 4 derniers
+    caractères) ;
+  - chaque modification est tracée dans l'onglet Sécurité ;
+  - en passant à un autre serveur, le cache des vignettes est vidé.
+- Sous Docker, si l'adresse vient de `docker-compose.yml`, la page prévient
+  que cette valeur reprendra le dessus au redémarrage.
+
 ### Tout le reste passe tel quel
 API, lecture vidéo (avec avance rapide / reprise), WebSocket des applications
 Emby, envoi de fichiers.
@@ -104,8 +121,11 @@ Emby, envoi de fichiers.
 3. **Double-clic sur `emby_proxy_fenetre.pyw`** : la fenêtre de suivi s'ouvre.
    Au premier lancement, le fichier de réglages `emby_proxy.ini` est créé à
    côté du script.
-4. Ferme la fenêtre, ouvre `emby_proxy.ini` et règle au moins
-   `upstream = http://ADRESSE-DE-TON-EMBY:8096`, puis relance.
+4. Clique sur **Activite / page d'etat**, colle le mot de passe (bouton
+   **Copier le mot de passe**), puis ouvre l'onglet **Configuration** : saisis
+   l'adresse de ton Emby (`http://ADRESSE-DE-TON-EMBY:8096`), **Tester la
+   connexion**, puis **Enregistrer**. Tu peux aussi la régler directement
+   dans `emby_proxy.ini` (`upstream =`).
 
 Sans fenêtre (console) : `py emby_proxy.py`.
 
@@ -147,6 +167,8 @@ copie.
   (voir plus haut).
 - Onglet **Cache** : vignettes servies du cache, taux de cache, volume
   économisé sur Emby, taille du cache, et un bouton pour vider le cache.
+- Onglet **Configuration** : adresse du serveur Emby et clé API (voir plus
+  haut).
 
 Depuis Internet, cette page n'existe pas (erreur 404).
 
@@ -229,4 +251,7 @@ Les tests font tourner le proxy contre un faux serveur Emby. Ils vérifient :
 - la sécurité : 14 façons de contourner le blocage de l'administration,
   mots de passe faux comptés sous toutes les formes d'adresse, page d'état
   (mot de passe, sites piégés, déconnexion, bannissement), onglet Sécurité,
-  journal relu au redémarrage, nettoyage des journaux, avertissements.
+  journal relu au redémarrage, nettoyage des journaux, avertissements ;
+- la configuration : lecture sans dévoiler la clé, test de connexion, prise
+  en compte immédiate, fichier mis à jour, mot de passe de confirmation,
+  refus depuis Internet et depuis un site piégé, adresses invalides.

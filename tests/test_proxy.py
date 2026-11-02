@@ -98,6 +98,15 @@ def fake_emby():
         ids = request.query.get("Ids", "").split(",")
         return web.json_response({"Items": [ITEMS[i] for i in ids if i in ITEMS]})
 
+    async def info_public(request):
+        return web.json_response({"ServerName": "Salon", "Version": "4.8.10.0",
+                                  "Id": "srv1"})
+
+    async def info_private(request):
+        if request.query.get("api_key") == "CLEADMIN":
+            return web.json_response({"ServerName": "Salon"})
+        return web.Response(status=401)
+
     async def no_content(request):
         await request.read()
         return web.Response(status=204)
@@ -125,6 +134,8 @@ def fake_emby():
     app.router.add_get("/emby/Users/{uid}/Views", views)
     app.router.add_get("/emby/Users/{uid}/Items/{item}", item)
     app.router.add_get("/emby/Items", items_by_id)
+    app.router.add_get("/emby/System/Info/Public", info_public)
+    app.router.add_get("/emby/System/Info", info_private)
     app.router.add_post("/emby/Sessions/Playing/Progress", no_content)
     app.router.add_post("/emby/Sessions/Playing/Stopped", no_content)
     app.router.add_post("/emby/Users/{uid}/FavoriteItems/{item}", no_content)
@@ -608,3 +619,138 @@ def test_mot_de_passe_cree_au_premier_lancement(tmp_path):
     assert len(pwd) >= 12
     assert ep.Settings(ini).status_password == pwd            # bien ecrit
     assert ep.ensure_status_password(ini, ep.Settings(ini)) is False
+
+
+
+# ---------------------------------------------------------------------
+#  Onglet Configuration : serveur Emby
+# ---------------------------------------------------------------------
+async def test_config_lecture_sans_devoiler_la_cle(env):
+    make, _, _ = env
+    proxy, c = await make(emby__api_key="CLEADMIN")
+    assert (await c.get("/__proxy/config.json")).status == 401     # connexion requise
+    await login(c, proxy)
+    d = await (await c.get("/__proxy/config.json")).json()
+    assert d["upstream"] == proxy.cfg.upstream and d["api_key_set"]
+    assert "CLEADMIN" not in json.dumps(d) and d["api_key_hint"].endswith("ADMIN"[-4:])
+
+
+async def test_config_tester_la_connexion(env):
+    make, _, _ = env
+    proxy, c = await make()
+    await login(c, proxy)
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    r = await (await c.post("/__proxy/config/test", headers=own,
+                            json={"upstream": proxy.cfg.upstream + "/web/index.html",
+                                  "api_key": "CLEADMIN"})).json()
+    assert r["ok"] and r["server_name"] == "Salon" and r["version"] == "4.8.10.0"
+    assert r["key_ok"] is True
+    r = await (await c.post("/__proxy/config/test", headers=own,
+                            json={"upstream": proxy.cfg.upstream,
+                                  "api_key": "FAUSSE"})).json()
+    assert r["ok"] and r["key_ok"] is False
+    r = await (await c.post("/__proxy/config/test", headers=own,
+                            json={"upstream": "http://127.0.0.1:9"})).json()
+    assert not r["ok"] and "injoignable" in r["error"]
+    r = await c.post("/__proxy/config/test", headers=own,
+                     json={"upstream": "ftp://x"})
+    assert r.status == 400
+
+
+async def test_config_enregistrer_applique_tout_de_suite(env, aiohttp_server, tmp_path):
+    make, _, calls = env
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    # deuxieme serveur Emby : le proxy doit basculer dessus sans redemarrer
+    autre = web.Application()
+
+    async def hello(request):
+        return web.json_response({"serveur": "autre"})
+    autre.router.add_get("/emby/Hello", hello)
+    srv2 = await aiohttp_server(autre)
+    url2 = str(srv2.make_url("")).rstrip("/")
+
+    emby_app, _ = fake_emby()
+    srv1 = await aiohttp_server(emby_app)
+    cfg = ep.Settings(ini, overrides={("proxy", "upstream"): str(srv1.make_url("")).rstrip("/"),
+                                      ("cache", "dir"): str(tmp_path / "cache"),
+                                      ("log", "file"): ""})
+    proxy = ep.EmbyProxy(cfg)
+    from aiohttp.test_utils import TestClient, TestServer
+    c = TestClient(TestServer(proxy.build_app()))
+    await c.start_server()
+    try:
+        own = {"Origin": str(c.make_url("")).rstrip("/")}
+        await c.get("/Items/1/Images/Primary?tag=a")
+        assert len(proxy.cache.index) == 1
+        await login(c, proxy)
+        # mauvais mot de passe de confirmation : refuse et trace
+        r = await c.post("/__proxy/config", headers=own,
+                         json={"upstream": url2, "password": "faux"})
+        assert r.status == 403 and proxy.cfg.upstream != url2
+        assert proxy.seclog.events[-1]["type"] == "config_fail"
+        # sans origine (site piege) : refuse
+        r = await c.post("/__proxy/config", json={"upstream": url2,
+                                                  "password": cfg.status_password})
+        assert r.status == 403
+        r = await c.post("/__proxy/config", headers=own,
+                         json={"upstream": url2 + "/", "api_key": "NOUVELLECLE",
+                               "password": cfg.status_password})
+        d = await r.json()
+        assert d["ok"] and d["changed"]
+        assert proxy.cfg.upstream == url2 and proxy.cfg.api_key == "NOUVELLECLE"
+        assert any("cache" in n for n in d["notes"])
+        assert len(proxy.cache.index) == 0             # autre serveur : cache vide
+        # le trafic part immediatement vers le nouveau serveur
+        assert (await (await c.get("/emby/Hello")).json())["serveur"] == "autre"
+        # fichier de reglages mis a jour, commentaires conserves
+        txt = ini.read_text(encoding="utf-8")
+        assert "upstream = %s" % url2 in txt and "api_key = NOUVELLECLE" in txt
+        assert "# Adresse du vrai serveur Emby" in txt
+        again = ep.Settings(ini)
+        assert again.upstream == url2 and again.api_key == "NOUVELLECLE"
+        ev = proxy.seclog.events[-1]
+        assert ev["type"] == "config" and "NOUVELLECLE" not in ev["detail"]
+        # effacer la cle
+        r = await c.post("/__proxy/config", headers=own,
+                         json={"upstream": url2, "clear_key": True,
+                               "password": cfg.status_password})
+        assert (await r.json())["changes"] == ["cle API effacee"]
+        assert ep.Settings(ini).api_key == ""
+        # adresse invalide
+        r = await c.post("/__proxy/config", headers=own,
+                         json={"upstream": "pas une adresse", "password": cfg.status_password})
+        assert r.status == 400
+    finally:
+        await c.close()
+
+
+async def test_config_interdite_depuis_internet(env):
+    make, _, _ = env
+    proxy, c = await make(status__allow_internet="true",
+                          security__local_networks="10.0.0.0/8")
+    await login(c, proxy)
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    r = await c.post("/__proxy/config", headers=own,
+                     json={"upstream": "http://1.2.3.4:8096",
+                           "password": proxy.cfg.status_password})
+    assert r.status == 403 and proxy.cfg.upstream != "http://1.2.3.4:8096"
+
+
+def test_config_variable_environnement(tmp_path, monkeypatch):
+    monkeypatch.setenv("EMBY_PROXY_UPSTREAM", "http://nas:8096")
+    cfg = ep.Settings(tmp_path / "x.ini")
+    assert ("proxy", "upstream") in cfg.env_locked and cfg.upstream == "http://nas:8096"
+
+
+def test_normalisation_adresse_emby():
+    n = ep.normalize_upstream
+    assert n("192.168.1.10:8096") == "http://192.168.1.10:8096"
+    assert n("http://nas:8096/web/index.html") == "http://nas:8096"
+    assert n("https://emby.exemple.fr/emby/") == "https://emby.exemple.fr"
+    assert n("http://[::1]:8096") == "http://[::1]:8096"
+    assert n("emby-nas.local") == "http://emby-nas.local"
+    for bad in ("", "ftp://x", "http://", "http:", "http://x:99999", "http://u:p@x",
+                "http://x/?a=1", "pas une adresse", "http://a b:8096",
+                "javascript:alert(1)", "http://[zz]:1"):
+        assert n(bad) == "", bad

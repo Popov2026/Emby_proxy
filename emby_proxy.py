@@ -151,6 +151,67 @@ def _nets(txt):
     return out
 
 
+def normalize_upstream(url):
+    """Adresse d'Emby propre : schema http(s), sans / ni /web ni /emby final.
+    -> "" si l'adresse n'est pas utilisable."""
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
+        if not re.match(r"^https?://", url, re.I):
+            return ""                    # ftp://, file://... : refuse
+    else:
+        url = "http://" + url
+    url = re.sub(r"/(?:web(?:/index\.html)?|emby)$", "", url, flags=re.I).rstrip("/")
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:               # crochets IPv6 invalides...
+        return ""
+    if parts.scheme.lower() not in ("http", "https") or not host \
+            or parts.query or parts.fragment or parts.username:
+        return ""
+    if ":" in host:                  # IPv6
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return ""
+    elif not re.match(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+                      r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$", host) \
+            or host.lower() in ("http", "https"):
+        return ""
+    if not re.match(r"^[A-Za-z0-9/_.~-]*$", parts.path):
+        return ""
+    try:
+        parts.port                   # port invalide -> ValueError
+    except ValueError:
+        return ""
+    return url
+
+
+def update_ini(path, section, key, value):
+    """Change une valeur du fichier de reglages en gardant ses commentaires."""
+    path = Path(path)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines)
+                  if ln.strip().lower() == "[%s]" % section), None)
+    if start is None:
+        lines += ["", "[%s]" % section, "%s = %s" % (key, value)]
+    else:
+        end = next((i for i in range(start + 1, len(lines))
+                    if lines[i].strip().startswith("[")), len(lines))
+        for i in range(start + 1, end):
+            if re.match(r"^\s*%s\s*[=:]" % re.escape(key), lines[i], re.I):
+                lines[i] = "%s = %s" % (key, value)
+                break
+        else:
+            lines.insert(start + 1, "%s = %s" % (key, value))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
 class Settings:
     """Reglages lus dans le fichier .ini, completes par l'environnement."""
 
@@ -160,9 +221,11 @@ class Settings:
         self.path = Path(path) if path else DEFAULT_CONFIG
         if self.path.exists():
             cp.read(self.path, encoding="utf-8")
+        self.env_locked = set()     # reglages imposes par l'environnement
         for env, (sec, key) in ENV_OVERRIDES.items():
             if os.environ.get(env):
                 cp[sec][key] = os.environ[env]
+                self.env_locked.add((sec, key))
         for (sec, key), val in (overrides or {}).items():
             cp[sec][key] = str(val)
         p, c, s = cp["proxy"], cp["cache"], cp["security"]
@@ -170,9 +233,7 @@ class Settings:
 
         self.listen_host = p.get("listen_host")
         self.listen_port = p.getint("listen_port")
-        self.upstream = p.get("upstream").strip().rstrip("/")
-        if not re.match(r"^https?://", self.upstream):
-            self.upstream = "http://" + self.upstream
+        self.upstream = normalize_upstream(p.get("upstream")) or "http://127.0.0.1:8096"
         self.tls_cert = self._path(base, p.get("tls_cert"))
         self.tls_key = self._path(base, p.get("tls_key"))
 
@@ -629,7 +690,9 @@ class SecurityLog:
     LABELS = {"login_ok": "Connexion reussie", "login_fail": "Mot de passe faux",
               "ban": "Adresse bannie", "unban": "Adresse debannie",
               "refused": "Acces refuse", "status_ok": "Connexion a la page d'etat",
-              "status_fail": "Mot de passe faux (page d'etat)"}
+              "status_fail": "Mot de passe faux (page d'etat)",
+              "config": "Configuration modifiee",
+              "config_fail": "Configuration refusee"}
 
     def __init__(self, path, max_mb=20):
         self.path = path
@@ -1339,6 +1402,9 @@ class EmbyProxy:
         app.router.add_get("/__proxy/security.json", self.security_json)
         app.router.add_post("/__proxy/purge", self.purge)
         app.router.add_post("/__proxy/unban", self.unban)
+        app.router.add_get("/__proxy/config.json", self.config_json)
+        app.router.add_post("/__proxy/config", self.config_save)
+        app.router.add_post("/__proxy/config/test", self.config_test)
         app.router.add_route("*", "/{tail:.*}", self.handle)
         return app
 
@@ -1710,6 +1776,136 @@ class EmbyProxy:
             return web.json_response({"clients": [], "feed": [], "disabled": True})
         return web.json_response(self.activity.snapshot())
 
+    # -- configuration du serveur Emby (onglet Configuration) -------------
+    def _config_view(self):
+        k = self.cfg.api_key
+        return {"upstream": self.cfg.upstream,
+                "api_key_set": bool(k),
+                "api_key_hint": ("\u2022\u2022\u2022\u2022" + k[-4:]) if len(k) > 4 else
+                                ("\u2022\u2022\u2022\u2022" if k else ""),
+                "locked": {"upstream": ("proxy", "upstream") in self.cfg.env_locked,
+                           "api_key": ("emby", "api_key") in self.cfg.env_locked},
+                "config_file": str(self.cfg.path),
+                "upstream_errors": self.stats.upstream_errors}
+
+    async def config_json(self, request):
+        return web.json_response(self._config_view())
+
+    async def _probe_emby(self, url, api_key):
+        """Interroge un serveur Emby : nom, version, validite de la cle API."""
+        out = {"ok": False, "url": url}
+        t0 = time.time()
+        try:
+            async with self.session.get(url + "/emby/System/Info/Public",
+                                        timeout=ClientTimeout(total=8)) as r:
+                raw = await r.read()
+                out["latency_ms"] = int((time.time() - t0) * 1000)
+                if r.status != 200:
+                    out["error"] = "Le serveur a repondu %d : est-ce bien Emby ?" % r.status
+                    return out
+                info = json.loads(_decode(raw, r.headers.get("Content-Encoding")))
+        except (ClientError, asyncio.TimeoutError, OSError) as exc:
+            out["error"] = "Serveur injoignable : %s" % (exc or exc.__class__.__name__)
+            return out
+        except ValueError:
+            out["error"] = "Reponse illisible : ce n'est pas un serveur Emby."
+            return out
+        if not isinstance(info, dict) or not (info.get("Version") or info.get("ServerName")):
+            out["error"] = "Reponse inattendue : ce n'est pas un serveur Emby."
+            return out
+        out.update(ok=True, server_name=info.get("ServerName", ""),
+                   version=info.get("Version", ""), server_id=info.get("Id", ""))
+        if api_key:
+            try:
+                async with self.session.get(url + "/emby/System/Info",
+                                            params={"api_key": api_key},
+                                            timeout=ClientTimeout(total=8)) as r:
+                    await r.read()
+                    out["key_ok"] = r.status == 200
+                    if r.status != 200:
+                        out["key_error"] = ("Cle API refusee par Emby (%d)." % r.status)
+            except (ClientError, asyncio.TimeoutError, OSError) as exc:
+                out["key_ok"] = False
+                out["key_error"] = "Verification de la cle impossible : %s" % exc
+        return out
+
+    async def config_test(self, request):
+        data = await request.json()
+        url = normalize_upstream(str(data.get("upstream", "")))
+        if not url:
+            return web.json_response({"ok": False, "error": "Adresse invalide. Exemple : "
+                                      "http://192.168.1.10:8096"}, status=400)
+        key = str(data.get("api_key", "")).strip()
+        if not key and not data.get("clear_key"):
+            key = self.cfg.api_key            # cle deja enregistree
+        return web.json_response(await self._probe_emby(url, key))
+
+    async def config_save(self, request):
+        ip = request[CLIENT_IP]
+        local = self.guard.is_local(ip)
+        if not local:                          # jamais depuis Internet
+            return web.json_response({"ok": False, "error": "Modification possible "
+                                      "uniquement depuis le reseau local."}, status=403)
+        data = await request.json()
+        given = str(data.get("password", ""))
+        if not hmac.compare_digest(given.encode("utf-8"),
+                                   self.cfg.status_password.encode("utf-8")):
+            self.seclog.add("config_fail", ip, local, detail="mot de passe de "
+                            "confirmation faux")
+            if self.guard.login_result(ip, False):
+                self.seclog.add("ban", ip, local, detail="configuration : %d mots de "
+                                "passe faux" % self.cfg.login_max)
+            return web.json_response({"ok": False, "error": "Mot de passe de "
+                                      "confirmation incorrect."}, status=403)
+        url = normalize_upstream(str(data.get("upstream", "")))
+        if not url:
+            return web.json_response({"ok": False, "error": "Adresse invalide. Exemple : "
+                                      "http://192.168.1.10:8096"}, status=400)
+        new_key = str(data.get("api_key", "")).strip()
+        clear_key = bool(data.get("clear_key"))
+        if re.search(r"[\s;#]", new_key):
+            return web.json_response({"ok": False, "error": "Cle API invalide."},
+                                     status=400)
+        changes, notes = [], []
+        old_url = self.cfg.upstream
+        if url != old_url:
+            self.cfg.upstream = url
+            changes.append("adresse Emby %s -> %s" % (old_url, url))
+            if urlsplit(url).netloc.lower() != urlsplit(old_url).netloc.lower():
+                # autre serveur : ses vignettes et ses titres ne sont plus les memes
+                await asyncio.get_running_loop().run_in_executor(None, self.cache.clear)
+                if self.activity:
+                    self.activity.info.items.clear()
+                notes.append("cache des vignettes vide (autre serveur)")
+        if clear_key and self.cfg.api_key:
+            self.cfg.api_key = ""
+            changes.append("cle API effacee")
+        elif new_key and new_key != self.cfg.api_key:
+            self.cfg.api_key = new_key
+            changes.append("cle API changee")
+        if not changes:
+            return web.json_response({"ok": True, "changed": False,
+                                      "config": self._config_view()})
+        self.guard.login_result(ip, True)
+        try:
+            update_ini(self.cfg.path, "proxy", "upstream", self.cfg.upstream)
+            update_ini(self.cfg.path, "emby", "api_key", self.cfg.api_key)
+        except OSError as exc:
+            notes.append("ATTENTION : fichier %s non modifie (%s), le changement sera "
+                         "perdu au redemarrage" % (self.cfg.path, exc))
+        for (sec, key), what in ((("proxy", "upstream"), "l'adresse"),
+                                 (("emby", "api_key"), "la cle API")):
+            if (sec, key) in self.cfg.env_locked:
+                notes.append("%s est aussi fixee par une variable d'environnement "
+                             "(docker-compose) : c'est elle qui reprendra le dessus "
+                             "au redemarrage" % what)
+        self.seclog.add("config", ip, local, detail="; ".join(changes))
+        log.warning("configuration modifiee par %s : %s", ip, "; ".join(changes))
+        return web.json_response({"ok": True, "changed": True, "changes": changes,
+                                  "notes": notes, "config": self._config_view(),
+                                  "probe": await self._probe_emby(self.cfg.upstream,
+                                                                  self.cfg.api_key)})
+
     async def security_json(self, request):
         return web.json_response(self.seclog.snapshot(self.guard))
 
@@ -1790,7 +1986,7 @@ STATUS_HTML = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Emby Proxy</title><style>
 :root{--bg:#16181f;--card:#1f222b;--line:#2e323d;--fg:#e4e6ec;--mut:#9aa0aa;--acc:#e94560;--ok:#2ecc71;--warn:#eb8c14;--bad:#e05555;--info:#5aaaeb}
-*{box-sizing:border-box}body{font:14px/1.45 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:18px 16px}
+*{box-sizing:border-box}[hidden]{display:none!important}body{font:14px/1.45 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:18px 16px}
 h1{font-size:19px;margin:0 0 12px}h2{font-size:15px;margin:22px 0 10px}
 .tabs{display:flex;gap:6px;margin-bottom:14px}.tabs button{background:var(--card);color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:7px 14px;cursor:pointer;font:inherit}
 .tabs button.on{color:var(--fg);border-color:var(--acc)}
@@ -1813,12 +2009,17 @@ pre{background:var(--card);padding:10px;border-radius:8px;white-space:pre-wrap}.
 button.ghost{background:none;border:1px solid var(--line);color:var(--mut);border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
 button.small{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font:inherit}
 .w{background:#3a2a12;border:1px solid var(--warn);color:#ffd9a0;border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:13px}
-.t-login_fail,.t-status_fail,.t-ban{color:var(--bad)}.t-login_ok,.t-status_ok,.t-unban{color:var(--ok)}.t-refused{color:var(--warn)}
+.t-login_fail,.t-status_fail,.t-ban,.t-config_fail{color:var(--bad)}.t-login_ok,.t-status_ok,.t-unban{color:var(--ok)}.t-refused,.t-config{color:var(--warn)}
+.form{max-width:640px;display:flex;flex-direction:column;gap:6px}.form label{margin-top:8px}.form input:not([type=checkbox]){width:100%}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.row button{margin-top:0}
+.confirm{margin-top:12px;padding:10px;border:1px solid var(--warn);border-radius:8px;background:#2a2316;display:flex;flex-direction:column;gap:8px}
+.res{margin-top:12px;padding:10px;border-radius:8px;border:1px solid var(--line)}.res.ok{border-color:var(--ok)}.res.bad{border-color:var(--bad)}
+.lock{color:var(--warn)}
 </style></head><body>
 <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
 <h1>Emby Proxy</h1><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div>
 <div id="warn"></div>
-<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="cache">Cache</button></div>
+<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="cache">Cache</button><button data-t="conf">Configuration</button></div>
 
 <section id="act">
   <div class="sub" id="summary"></div>
@@ -1857,6 +2058,32 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
   <div class="tw"><table><thead><tr><th>Date</th><th>Événement</th><th>Nom tapé</th><th>Adresse IP</th><th>Application / appareil</th><th>Détail</th></tr></thead><tbody id="sfeed"></tbody></table></div>
 </section>
 
+<section id="conf" hidden>
+  <h2 style="margin-top:4px">Serveur Emby</h2>
+  <div class="c form">
+    <label for="cUrl">Adresse du serveur Emby</label>
+    <input id="cUrl" placeholder="http://192.168.1.10:8096" autocomplete="off" spellcheck="false">
+    <div class="sub">Adresse vue depuis la machine du proxy. Les utilisateurs ne la voient jamais.</div>
+    <div class="sub lock" id="cUrlLock" hidden></div>
+    <label for="cKey">Clé API Emby <span class="sub">(facultative)</span></label>
+    <input id="cKey" type="password" autocomplete="off" spellcheck="false">
+    <div class="sub">Emby : Tableau de bord › Avancé › Clés API. Sert à afficher le nom de tous les films dans l'activité.</div>
+    <label class="sub"><input type="checkbox" id="cClear"> effacer la clé enregistrée</label>
+    <div class="sub lock" id="cKeyLock" hidden></div>
+    <div class="row">
+      <button class="small" id="cTest">Tester la connexion</button>
+      <button class="red" id="cSave">Enregistrer…</button>
+    </div>
+    <div id="cConfirm" hidden class="confirm">
+      <div>Ces réglages décident vers quel serveur partent les mots de passe de tes utilisateurs. Pour confirmer, retape le mot de passe de cette page.</div>
+      <input id="cPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
+      <div class="row"><button class="red" id="cDo">Confirmer et appliquer</button><button class="small" id="cCancel">Annuler</button></div>
+    </div>
+    <div id="cOut"></div>
+    <div class="sub" id="cFile"></div>
+  </div>
+</section>
+
 <section id="cache" hidden>
   <div class="g" id="g"></div>
   <button class="red" id="purge">Vider le cache</button>
@@ -1871,7 +2098,8 @@ const hm=t=>new Date(t*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'
 const day=t=>new Date(t*1000).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
-  ['act','sec','cache'].forEach(t=>$(t).hidden=b.dataset.t!==t);});
+  ['act','sec','cache','conf'].forEach(t=>$(t).hidden=b.dataset.t!==t);
+  if(b.dataset.t==='conf')loadConf();});
 
 function userCard(u){
   const c=el('div','c');
@@ -1946,6 +2174,36 @@ function renderSecFeed(){
       el('td','sub',[e.client,e.device].filter(Boolean).join(' · ')||'-'),el('td','sub',e.detail||''));return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun événement.');td.colSpan=6;tr.append(td);return tr})()]))}
 ['sKind','sNet'].forEach(i=>$(i).onchange=renderSecFeed);$('sText').oninput=renderSecFeed;
+
+// ---- Configuration du serveur Emby
+let conf=null;
+function post(u,body){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  .then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()})}
+function loadConf(){fetch('config.json').then(r=>r.json()).then(c=>{conf=c;$('cUrl').value=c.upstream;$('cKey').value='';
+  $('cKey').placeholder=c.api_key_set?'clé enregistrée ('+c.api_key_hint+') : laisser vide pour la garder':'aucune clé enregistrée';
+  $('cClear').checked=false;$('cClear').parentElement.hidden=!c.api_key_set;
+  const lk=(id,on,what)=>{$(id).hidden=!on;$(id).textContent=on?'⚠ '+what+' est aussi fixée par une variable d\'environnement (docker-compose) : elle reprendra le dessus au redémarrage.':''};
+  lk('cUrlLock',c.locked.upstream,"L'adresse");lk('cKeyLock',c.locked.api_key,'La clé API');
+  $('cFile').textContent='Fichier de réglages : '+c.config_file})}
+function probeBox(p){const d=el('div','res '+(p.ok&&p.key_ok!==false?'ok':'bad'));
+  if(!p.ok){d.append(el('div',null,'✖ '+(p.error||'Échec')));return d}
+  d.append(el('div',null,'✔ Emby joignable : « '+(p.server_name||'?')+' », version '+(p.version||'?')+(p.latency_ms!=null?' ('+p.latency_ms+' ms)':'')));
+  if(p.key_ok===true)d.append(el('div',null,'✔ Clé API acceptée'));
+  if(p.key_ok===false)d.append(el('div',null,'✖ '+(p.key_error||'Clé API refusée')));
+  return d}
+function form(){return {upstream:$('cUrl').value,api_key:$('cKey').value,clear_key:$('cClear').checked}}
+$('cTest').onclick=()=>{$('cOut').replaceChildren(el('div','sub','Test en cours…'));
+  post('config/test',form()).then(p=>$('cOut').replaceChildren(probeBox(p))).catch(()=>{})};
+$('cSave').onclick=()=>{$('cConfirm').hidden=false;$('cPwd').value='';$('cPwd').focus()};
+$('cCancel').onclick=()=>{$('cConfirm').hidden=true};
+$('cDo').onclick=()=>{const b=form();b.password=$('cPwd').value;
+  post('config',b).then(r=>{
+    if(!r.ok){$('cOut').replaceChildren(el('div','res bad','✖ '+r.error));return}
+    $('cConfirm').hidden=true;const box=el('div');
+    box.append(el('div','res ok',r.changed?'✔ Appliqué immédiatement et enregistré : '+r.changes.join(' ; '):'Rien n\'a changé.'));
+    (r.notes||[]).forEach(n=>box.append(el('div','sub lock','⚠ '+n)));
+    if(r.probe)box.append(probeBox(r.probe));
+    $('cOut').replaceChildren(box);loadConf();tick()}).catch(()=>{})};
 
 function tick(){
   const j=u=>fetch(u).then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()});
@@ -2039,9 +2297,8 @@ def run_gui(cfg):
     tk.Label(root, text="Emby Proxy", fg=fg, bg=bg,
              font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=2,
                                                  sticky="w", padx=14, pady=(12, 2))
-    tk.Label(root, text="%s://%s:%d  ->  %s" % (scheme, cfg.listen_host,
-                                                 cfg.listen_port, cfg.upstream),
-             fg=mut, bg=bg).grid(row=1, column=0, columnspan=2, sticky="w", padx=14)
+    head = tk.Label(root, text="", fg=mut, bg=bg)
+    head.grid(row=1, column=0, columnspan=2, sticky="w", padx=14)
     rows = [("Etat", "state"), ("Utilisateurs actifs", "users"),
             ("Mots de passe faux (24 h)", "fails"), ("Adresses bannies", "bans"),
             ("Vignettes servies du cache", "hits"),
@@ -2088,6 +2345,8 @@ def run_gui(cfg):
             vals["state"].config(text="ARRETE : %s" % errors[0], fg="#e05555")
         else:
             vals["state"].config(text="en service", fg="#2ecc71")
+        head.config(text="%s://%s:%d  ->  %s" % (scheme, cfg.listen_host,
+                                                  cfg.listen_port, cfg.upstream))
         vals["users"].config(text=str(d["active_users"]))
         fails = sum(1 for e in proxy.seclog.events if e["type"] == "login_fail"
                     and time.time() - e["t"] < 86400)
