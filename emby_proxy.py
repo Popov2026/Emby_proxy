@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.3"
+__version__ = "2.1.4"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1370,6 +1370,7 @@ RE_SEASONS = re.compile(_P + r"Shows/(?P<item>%s)/(?P<what>Seasons|Episodes)/?$"
 RE_HINTS = re.compile(_P + r"Search/Hints/?$", re.I)
 RE_PLAYING = re.compile(_P + r"Sessions/Playing(?:/(?P<what>Progress|Stopped|Ping))?/?$", re.I)
 RE_STREAM = re.compile(_P + r"(?:Videos|Audio)/(?P<item>%s)/(?:stream|master|main|live|universal)" % _HEX, re.I)
+RE_PBINFO = re.compile(_P + r"Items/(?P<item>%s)/PlaybackInfo/?$" % _HEX, re.I)
 RE_DOWNLOAD = re.compile(_P + r"Items/(?P<item>%s)/(?:Download|File)/?$" % _HEX, re.I)
 RE_FAV = re.compile(_P + r"Users/(?P<uid>%s)/FavoriteItems/(?P<item>%s)/?$" % (_HEX, _HEX), re.I)
 RE_PLAYED = re.compile(_P + r"Users/(?P<uid>%s)/PlayedItems/(?P<item>%s)/?$" % (_HEX, _HEX), re.I)
@@ -1394,6 +1395,7 @@ class ItemInfo:
         self.items = {}            # id -> dict
         self.users = {}            # uid -> nom
         self.pending = {}          # id -> (auth) a resoudre
+        self.pending_users = set()  # uid dont le nom est inconnu
 
     def learn(self, it):
         if not isinstance(it, dict) or not it.get("Id"):
@@ -1549,6 +1551,8 @@ class Activity:
             c.user_id = self.token_user[token]
         if c.user_id and not c.user_name:
             c.user_name = self.info.users.get(c.user_id, "")
+            if not c.user_name and len(self.info.pending_users) < 1000:
+                self.info.pending_users.add(c.user_id)
         return c
 
     def _rekey(self, c, key):
@@ -1671,6 +1675,10 @@ class Activity:
             if mt:
                 todo.append(("download", mt.group("item")))
                 return todo
+        mt = RE_PBINFO.match(p)
+        if mt and m in ("GET", "POST"):
+            todo.append(("pbinfo", mt.group("item")))
+            return todo
         mt = RE_PLAYING.match(p)
         if mt and m == "POST":
             todo.append(("playing", ((mt.group("what") or "start").lower(),
@@ -1709,6 +1717,12 @@ class Activity:
                 folder, bits = arg
                 self.browse(c, "Parcourt : %s%s" % (X, " (%s)" % bits if bits
                                                     else ""), folder)
+            elif kind == "pbinfo" and not ok:
+                self.event(c, "refused", "Demande de lecture : %s → erreur Emby HTTP %d"
+                           % (X, status), arg, merge=5)
+            elif kind == "stream" and not ok:
+                self.event(c, "refused", "Video refusee par Emby (HTTP %d) : %s"
+                           % (status, X), arg[0], merge=5)
             elif kind == "stream" and ok:
                 item, q = arg
                 if not c.playing or c.playing["item"] != item:
@@ -1790,10 +1804,45 @@ class Activity:
         return request.method == "GET" and bool(
             RE_ITEM.match(p) or RE_VIEWS.match(p) or RE_USER.match(p)
             or RE_SEASONS.match(p)) or (request.method == "POST"
-                                         and bool(LOGIN_RE.match(p)))
+                                         and bool(LOGIN_RE.match(p))) \
+            or (request.method in ("GET", "POST") and bool(RE_PBINFO.match(p)))
+
+    @staticmethod
+    def _pb_summary(data):
+        """Reponse d'Emby a une demande de lecture -> (refusee ?, resume)."""
+        if data.get("ErrorCode"):
+            return True, "REFUSEE par Emby : %s" % data["ErrorCode"]
+        sources = data.get("MediaSources") or []
+        if not sources:
+            return True, "REFUSEE par Emby : aucune source"
+        s = sources[0]
+        bits = []
+        for k in ("Container",):
+            if s.get(k):
+                bits.append(str(s[k]))
+        if s.get("Bitrate"):
+            bits.append("%.1f Mb/s" % (s["Bitrate"] / 1e6))
+        info = (" [%s]" % ", ".join(bits)) if bits else ""
+        if s.get("SupportsDirectPlay"):
+            return False, "lecture directe" + info
+        if s.get("SupportsDirectStream"):
+            return False, "flux direct" + info
+        if s.get("TranscodingUrl"):
+            q = dict(parse_qsl(urlsplit(s["TranscodingUrl"]).query))
+            why = q.get("TranscodeReasons") or q.get("transcodereasons") or ""
+            return False, ("transcodage (%s)" % why if why else "transcodage") + info
+        return True, "REFUSEE par Emby : ni lecture directe ni transcodage possible" + info
 
     def learn_response(self, c, request, data):
         p = npath(request)
+        mt = RE_PBINFO.match(p)
+        if mt:
+            if isinstance(data, dict):
+                bad, txt = self._pb_summary(data)
+                self.event(c, "refused" if bad else "play",
+                           "Demande de lecture : %s → %s" % (X, txt),
+                           mt.group("item"), merge=5)
+            return
         if LOGIN_RE.match(p) and isinstance(data, dict):
             u = data.get("User") or {}
             if u.get("Id"):
@@ -2719,6 +2768,8 @@ class EmbyProxy:
         info = self.activity.info
         while True:
             await asyncio.sleep(1.5)
+            if info.pending_users:
+                await self._resolve_users()
             if not info.pending:
                 continue
             groups = {}
@@ -2728,6 +2779,32 @@ class EmbyProxy:
             for auth, ids in groups.items():
                 for i in range(0, len(ids), 50):
                     await self._resolve(auth, ids[i:i + 50])
+
+    async def _resolve_users(self):
+        """Nom des utilisateurs vus sans connexion (appli deja connectee avant
+        le demarrage du proxy) : demande a Emby avec la cle API."""
+        info = self.activity.info
+        uids, info.pending_users = list(info.pending_users)[:50], set()
+        if not self.cfg.api_key:
+            return
+        for uid in uids:
+            try:
+                async with self.session.get(
+                        "%s/emby/Users/%s" % (self.cfg.upstream, uid),
+                        params={"api_key": self.cfg.api_key},
+                        timeout=ClientTimeout(total=10)) as r:
+                    raw = await r.read()
+                    if r.status != 200:
+                        continue
+                    name = json.loads(_decode(raw, r.headers.get("Content-Encoding"))
+                                      ).get("Name") or ""
+            except (ClientError, asyncio.TimeoutError, OSError, ValueError):
+                continue
+            if name:
+                info.users[uid] = name
+                for c in list(self.activity.clients.values()):
+                    if c.user_id == uid and not c.user_name:
+                        c.user_name = name
 
     async def _resolve(self, auth, ids):
         info = self.activity.info
@@ -3090,7 +3167,9 @@ class EmbyProxy:
             # L'activite n'est attribuee a un utilisateur qu'une fois la
             # requete acceptee par Emby : sinon n'importe qui pourrait, sans
             # compte, ecrire de fausses actions dans la fiche d'un autre.
-            trusted = up.status < 400
+            # 401 / 403 : jeton refuse. Les autres erreurs (500...) viennent
+            # d'une requete authentifiee : elles vont dans la fiche de l'appareil
+            trusted = up.status not in (401, 403, 407)
             c = act.identify(request, trusted=trusted)
             if trusted or is_login:
                 todo = act.before(c, request, body_json)

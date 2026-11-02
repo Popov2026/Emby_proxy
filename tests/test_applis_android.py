@@ -208,3 +208,61 @@ async def test_demande_de_lecture_envoyee_entiere(aiohttp_server, tmp_path):
         assert got["cl"] == str(len(profil)) and got["te"] is None
     finally:
         await c.close()
+
+
+@pytest.mark.parametrize("reponse,statut,attendu", [
+    ({"MediaSources": [{"SupportsDirectPlay": True, "Container": "mkv",
+                        "Bitrate": 12_000_000}]}, 200,
+     "Demande de lecture : Argylle (2024) → lecture directe [mkv, 12.0 Mb/s]"),
+    ({"MediaSources": [{"SupportsDirectPlay": False, "SupportsDirectStream": False,
+                        "TranscodingUrl": "/videos/9/master.m3u8?TranscodeReasons="
+                                          "ContainerBitrateExceedsLimit"}]}, 200,
+     "Demande de lecture : Argylle (2024) → transcodage "
+     "(ContainerBitrateExceedsLimit)"),
+    ({"ErrorCode": "NoCompatibleStream", "MediaSources": []}, 200,
+     "Demande de lecture : Argylle (2024) → REFUSEE par Emby : NoCompatibleStream"),
+    ({"x": 1}, 500, "Demande de lecture : Argylle (2024) → erreur Emby HTTP 500"),
+])
+async def test_demande_de_lecture_visible_dans_l_activite(aiohttp_server, tmp_path,
+                                                          reponse, statut, attendu):
+    """Au Play, la reponse d'Emby (lecture directe, transcodage, refus et sa
+    raison) apparait dans la fiche de l'appareil."""
+    async def pbinfo(request):
+        await request.read()
+        return web.json_response(reponse, status=statut)
+
+    async def items(request):
+        return web.json_response({"Items": [{"Id": "9", "Name": "Argylle",
+                                             "Type": "Movie", "ProductionYear": 2024}]})
+
+    async def user(request):
+        return web.json_response({"Id": UID, "Name": "Bob"})
+    app = web.Application()
+    app.router.add_post("/emby/Items/{id}/PlaybackInfo", pbinfo)
+    app.router.add_get("/emby/Items", items)
+    app.router.add_get("/emby/Users/{uid}", user)
+    srv = await aiohttp_server(app)
+    cfg = ep.Settings(tmp_path / "absent.ini", overrides={
+        ("proxy", "upstream"): str(srv.make_url("")).rstrip("/"),
+        ("cache", "dir"): str(tmp_path / "cache"), ("log", "file"): "",
+        ("status", "port"): "0", ("emby", "api_key"): "CLE"})
+    proxy = ep.EmbyProxy(cfg)
+    c = TestClient(TestServer(proxy.build_app()))
+    await c.start_server()
+    try:
+        auth = AUTH.replace('UserId=""', 'UserId="%s"' % UID) + ', Token="TOKTV"'
+        r = await c.post("/emby/Items/9/PlaybackInfo?UserId=%s&IsPlayback=true" % UID,
+                         json={"DeviceProfile": {}},
+                         headers={"X-Emby-Authorization": auth})
+        assert r.status == statut
+        for _ in range(40):                    # noms demandes a Emby (cle API)
+            await __import__("asyncio").sleep(0.1)
+            snap = proxy.activity.snapshot()
+            if snap["clients"] and snap["clients"][0]["user"] == "Bob" and \
+                    "Argylle" in snap["clients"][0]["events"][0]["text"]:
+                break
+        card = snap["clients"][0]
+        assert card["user"] == "Bob"
+        assert card["events"][0]["text"] == attendu
+    finally:
+        await c.close()

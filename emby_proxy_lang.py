@@ -104,6 +104,8 @@ EN = {
     "direct": "direct",
     "lecture directe": "direct play",
     "flux direct": "direct stream",
+    "aucune source": "no source",
+    "ni lecture directe ni transcodage possible": "neither direct play nor transcoding possible",
 
     # ---- onglet Securite
     "Adresses bannies": "Banned addresses",
@@ -638,6 +640,14 @@ PATTERNS = [
     (r"^Pause : (.*)$", "Paused: $1"),
     (r"^Reprise : (.*)$", "Resumed: $1"),
     (r"^Refuse : (.*)$", "Refused: {1}"),
+    (r"^Demande de lecture : (.*) → (.*)$", "Playback request: $1 → {2}"),
+    (r"^REFUSEE par Emby : (.*)$", "REFUSED by Emby: {1}"),
+    (r"^erreur Emby HTTP (\d+)$", "Emby error HTTP $1"),
+    (r"^Video refusee par Emby \(HTTP (\d+)\) : (.*)$", "Video refused by Emby (HTTP $1): $2"),
+    (r"^lecture directe \[(.*)\]$", "direct play [$1]"),
+    (r"^flux direct \[(.*)\]$", "direct stream [$1]"),
+    (r"^transcodage \((.*)\)(?: \[(.*)\])?$", "transcoding ($1) $2"),
+    (r"^transcodage \[(.*)\]$", "transcoding [$1]"),
     (r"^element (\w+)\.\.\.$", "item $1..."),
     # securite
     (r"^(.*\.) \((GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH) (.*)\)$", "{1} ($2 $3)"),
