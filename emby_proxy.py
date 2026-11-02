@@ -4432,7 +4432,13 @@ def main(argv=None):
         except OSError:
             pass
     emby = args.emby
-    if not emby and created and not args.gui and sys.stdin and sys.stdin.isatty():
+    # question seulement dans une vraie fenetre de console : un service
+    # Windows (WinSW) presente une entree "interactive" mais personne n'y
+    # repond, et le proxy resterait bloque sans jamais demarrer
+    interactive = all(f is not None and hasattr(f, "isatty") and f.isatty()
+                      for f in (sys.stdin, sys.stdout))
+    if not emby and created and not args.gui and interactive \
+            and not os.environ.get("EMBY_PROXY_NO_PROMPT"):
         # premier lancement en console : on demande tout de suite l'adresse
         try:
             emby = input("Adresse de ton serveur Emby (ex. http://192.168.1.234:8096), "

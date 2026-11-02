@@ -80,7 +80,9 @@ jobs:
           $p = Start-Process .\emby_proxy.exe -ArgumentList '--config', "$PWD\emby_proxy.ini" -PassThru -NoNewWindow
           Start-Sleep 8
           $ini = Get-Content emby_proxy.ini -Raw
-          Stop-Process $p -Force
+          # exe "onefile" = 2 processus : on arrete tout l'arbre
+          taskkill /F /T /PID $p.Id | Out-Null
+          Start-Sleep 2
           Write-Host $ini
           if ($ini -match "CLE-DE-TEST-123") { throw "cle API restee en clair" }
           if ($ini -notmatch "api_key = enc:dpapi:") { throw "cle API non chiffree par DPAPI" }
@@ -91,6 +93,11 @@ jobs:
       - name: Essai - service Windows
         shell: pwsh
         run: |
+          Get-Process emby_proxy -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep 2
+          foreach ($port in 8097, 8098) {
+            if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { throw "port $port deja pris avant l'essai" }
+          }
           Expand-Archive $env:ZIP -DestinationPath essai2
           cd essai2\EmbyProxy
           .\EmbyProxy-service.exe install
@@ -101,11 +108,25 @@ jobs:
           if ($s.Status -ne "Running") { Get-ChildItem *.log | ForEach-Object { Get-Content $_ }; throw "service non demarre" }
           $r = Invoke-WebRequest http://127.0.0.1:8098/__proxy/login -UseBasicParsing
           if ($r.StatusCode -ne 200) { throw "page d'administration injoignable" }
+          # la page doit etre servie par le service lui-meme
+          $owner = (Get-NetTCPConnection -LocalPort 8098 -State Listen).OwningProcess | Select-Object -First 1
+          $svcpid = (Get-CimInstance Win32_Service -Filter "Name='EmbyProxy'").ProcessId
+          $parents = @((Get-CimInstance Win32_Process -Filter "ProcessId=$owner").ParentProcessId)
+          $parents += (Get-CimInstance Win32_Process -Filter "ProcessId=$($parents[0])").ParentProcessId
+          Write-Host "port 8098 : processus $owner, parents $parents, service $svcpid"
+          if ($parents -notcontains $svcpid) { throw "le port 8098 n'est pas tenu par le service" }
           $u = Invoke-WebRequest http://127.0.0.1:8097/ -UseBasicParsing -SkipHttpErrorCheck
           Write-Host "Port utilisateurs : $($u.StatusCode)"
           Write-Host "--- emby_proxy.ini ---"; Get-Content emby_proxy.ini | Select-String -Pattern "password|^\[" | ForEach-Object { $_.Line -replace '(password = ).+', '$1***' }
           Write-Host "--- journaux ---"; Get-ChildItem *.log | ForEach-Object { Write-Host "## $($_.Name)"; Get-Content $_ -Tail 30 }
-          if ((Get-Content emby_proxy.ini -Raw) -notmatch "(?m)^password = \S+") { throw "mot de passe non cree" }
+          if ((Get-Content emby_proxy.ini -Raw) -notmatch "(?m)^password = (\S+)") { throw "mot de passe non cree" }
+          $mdp = $Matches[1]
+          $sess = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $lg = Invoke-WebRequest http://127.0.0.1:8098/__proxy/login -Method Post -Body @{password=$mdp} -Headers @{Origin='http://127.0.0.1:8098'} -WebSession $sess -UseBasicParsing -MaximumRedirection 0 -SkipHttpErrorCheck
+          Write-Host "connexion a la page : $($lg.StatusCode)"
+          if ($lg.StatusCode -ne 303) { throw "connexion a la page refusee" }
+          $st = Invoke-WebRequest http://127.0.0.1:8098/__proxy/stats.json -WebSession $sess -UseBasicParsing
+          Write-Host "stats : $($st.Content.Substring(0, 80))"
           .\EmbyProxy-service.exe restart
           Start-Sleep 8
           if ((Get-Service EmbyProxy).Status -ne "Running") { throw "redemarrage du service" }
