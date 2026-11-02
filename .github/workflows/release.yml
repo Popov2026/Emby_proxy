@@ -122,10 +122,12 @@ jobs:
           if ((Get-Content emby_proxy.ini -Raw) -notmatch "(?m)^password = (\S+)") { throw "mot de passe non cree" }
           $mdp = $Matches[1]
           $sess = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-          $lg = Invoke-WebRequest http://127.0.0.1:8098/__proxy/login -Method Post -Body @{password=$mdp} -Headers @{Origin='http://127.0.0.1:8098'} -WebSession $sess -UseBasicParsing -MaximumRedirection 0 -SkipHttpErrorCheck
+          $lg = Invoke-WebRequest http://127.0.0.1:8098/__proxy/login -Method Post -Body @{password=$mdp} -Headers @{Origin='http://127.0.0.1:8098'} -WebSession $sess -UseBasicParsing -SkipHttpErrorCheck
           Write-Host "connexion a la page : $($lg.StatusCode)"
-          if ($lg.StatusCode -ne 303) { throw "connexion a la page refusee" }
+          if ($lg.StatusCode -ne 200) { throw "connexion a la page refusee" }
+          # sans connexion valide, stats.json repond 401 (et l'essai echoue ici)
           $st = Invoke-WebRequest http://127.0.0.1:8098/__proxy/stats.json -WebSession $sess -UseBasicParsing
+          $null = $st.Content | ConvertFrom-Json
           Write-Host "stats : $($st.Content.Substring(0, 80))"
           .\EmbyProxy-service.exe restart
           Start-Sleep 8
