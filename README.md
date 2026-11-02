@@ -145,7 +145,7 @@ Sans fenêtre (console) : `py emby_proxy.py`.
 
 ## Mise en service
 1. Les utilisateurs se connectent à **l'adresse du proxy**
-   (`http://ADRESSE-DU-PROXY:8097`) au lieu de celle d'Emby, dans l'application
+   (`http://192.168.1.123:8097`) au lieu de celle d'Emby, dans l'application
    Emby comme dans le navigateur.
 2. Pour l'accès depuis Internet : sur ta box, redirige le port public vers le
    **proxy** (8097), et **plus vers Emby**. Sinon le proxy peut être
@@ -167,12 +167,14 @@ utilisateurs sur `https://emby.mondomaine.fr` et transmet au proxy.
 ```
 
 1. **Sur le relais** : une entrée `https://emby.mondomaine.fr` qui pointe vers
-   `http://ADRESSE-DU-PROXY:8097`, avec le WebSocket activé, et qui transmet
+   `http://192.168.1.123:8097`, avec le WebSocket activé, et qui transmet
    les en-têtes `X-Forwarded-For`, `X-Forwarded-Proto` et `X-Forwarded-Host`
    (c'est le réglage par défaut de la plupart des relais).
 2. **Dans `emby_proxy.ini`** : l'adresse du relais **vue par le proxy** dans
-   `trusted_proxies` (par exemple `trusted_proxies = 192.168.1.5/32`, ou
-   `127.0.0.1/32` si le relais tourne sur la même machine).
+   `trusted_proxies`. **Préconfiguré** pour un relais installé sur le serveur
+   du proxy, 192.168.1.123 :
+   `trusted_proxies = 127.0.0.1/32, 192.168.1.123/32`. Si le relais est sur
+   une autre machine, remplace par son adresse.
 3. **Sur la box** : redirige le port 443 vers le **relais**, et **supprime**
    les redirections vers 8097, 8096 et 8098.
 
@@ -192,7 +194,7 @@ Si le relais tourne sur la même machine que le proxy, tu peux en plus mettre
 relais. Les appareils de la maison passent alors eux aussi par le relais.
 
 ## Page d'état
-Depuis le réseau local seulement : **`http://ADRESSE-DU-PROXY:8098/`**
+Depuis le réseau local seulement : **`http://192.168.1.123:8098/`**
 
 Elle est sur un **port à part** (8098, réglage `[status] port`), distinct de
 celui des utilisateurs : ainsi, une faille dans l'interface web d'Emby ne

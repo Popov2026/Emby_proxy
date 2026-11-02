@@ -338,10 +338,12 @@ ban_minutes = 60
 # facilement 100 vignettes d'un coup : garder une marge large).
 rate_per_second = 100
 rate_burst = 400
-# Si le proxy est lui-meme derriere un autre proxy (Nginx, box...), ses
-# adresses ici : l'adresse reelle du client est alors lue dans
-# X-Forwarded-For.
-trusted_proxies =
+# Relais HTTPS (proxy inverse) place devant ce proxy : ses adresses ici.
+# L'adresse reelle du visiteur est alors lue dans X-Forwarded-For.
+# Preconfigure pour un relais installe sur ce serveur (192.168.1.123), qui
+# se connecte au proxy par 127.0.0.1 ou par 192.168.1.123. Si le relais est
+# sur une autre machine, remplace par son adresse.
+trusted_proxies = 127.0.0.1/32, 192.168.1.123/32
 # Avec un relais declare ci-dessus : refuser les connexions venues
 # d'Internet qui arrivent directement sur le proxy sans passer par le relais
 # (elles contourneraient son HTTPS). Le reseau local reste accepte.

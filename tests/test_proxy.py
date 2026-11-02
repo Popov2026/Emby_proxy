@@ -922,3 +922,16 @@ async def test_connexion_directe_sans_relais_refusee(env):
     # depuis le reseau local, la connexion directe reste permise
     _, c3 = await make(security__trusted_proxies="192.0.2.1/32")
     assert (await c3.get("/emby/Users/u1/Items")).status == 200
+
+
+
+def test_preconfiguration_serveur_192_168_1_123(tmp_path):
+    ini = tmp_path / "emby_proxy.ini"
+    ep.write_example_config(ini)
+    cfg = ep.Settings(ini)
+    assert ep.Guard._in("127.0.0.1", cfg.trusted)
+    assert ep.Guard._in("192.168.1.123", cfg.trusted)
+    assert not ep.Guard._in("192.168.1.20", cfg.trusted)   # un PC de la maison
+    assert cfg.require_relay
+    p = ep.EmbyProxy(cfg)
+    assert "http" not in p.warnings          # HTTPS assure par le relais
