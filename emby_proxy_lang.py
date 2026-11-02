@@ -267,6 +267,16 @@ EN = {
     "Vide si le HTTPS est fait par un relais (proxy inverse) devant.":
         "Empty if HTTPS is handled by a relay (reverse proxy) in front.",
     "Clé du certificat (fichier PEM)": "Certificate key (PEM file)",
+    "Transmettre à Emby l'adresse réelle des visiteurs":
+        "Pass the visitors' real address to Emby",
+    "Décoché : Emby voit tout le monde comme sur le réseau local (adresse du proxy). "
+    "Il n'applique plus sa limite de débit « à distance », ni l'option « autoriser "
+    "l'accès à distance » de ses utilisateurs. Le proxy garde, lui, toute sa "
+    "sécurité (bannissements, refus).":
+        "Unticked: Emby sees everyone as on the local network (the proxy's address). "
+        "It no longer applies its “remote” bitrate limit, nor its users' “allow "
+        "remote access” option. The proxy keeps all its own security (bans, "
+        "refusals).",
     "Cache des vignettes": "Thumbnail cache",
     "Taille maximale du cache (Mo)": "Maximum cache size (MB)",
     "Au-delà, les vignettes les moins vues sont effacées.":

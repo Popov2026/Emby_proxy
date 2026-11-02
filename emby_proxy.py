@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.1.8"
+__version__ = "2.1.9"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -86,6 +86,7 @@ DEFAULTS = {
         "upstream": "http://127.0.0.1:8096",
         "tls_cert": "",
         "tls_key": "",
+        "forward_client_ip": "true",
     },
     "cache": {
         "dir": "cache_images",
@@ -435,6 +436,7 @@ class Settings:
         base = self.path.parent
 
         self.listen_host = p.get("listen_host")
+        self.forward_ip = p.getboolean("forward_client_ip")
         self.listen_port = p.getint("listen_port")
         self.upstream = normalize_upstream(p.get("upstream")) or "http://127.0.0.1:8096"
         self.tls_cert = self._path(base, p.get("tls_cert"))
@@ -546,6 +548,9 @@ def write_example_config(path):
 # Adresse et port sur lesquels les utilisateurs se connectent.
 listen_host = 0.0.0.0
 listen_port = 8097
+# Transmettre a Emby l'adresse reelle des visiteurs. false : Emby voit tout le
+# monde comme sur le reseau local (plus de limite de debit "a distance").
+forward_client_ip = true
 # Adresse du vrai serveur Emby (jamais montree aux utilisateurs).
 upstream = http://127.0.0.1:8096
 # HTTPS direct : chemins du certificat et de la clef (PEM). Vide = HTTP.
@@ -720,6 +725,12 @@ CONFIG_SCHEMA = [
          "help": "Vide si le HTTPS est fait par un relais (proxy inverse) devant."},
         {"sec": "proxy", "key": "tls_key", "type": "text", "live": False,
          "label": "Clé du certificat (fichier PEM)", "help": ""},
+        {"sec": "proxy", "key": "forward_client_ip", "type": "bool", "live": True,
+         "label": "Transmettre à Emby l'adresse réelle des visiteurs",
+         "help": "Décoché : Emby voit tout le monde comme sur le réseau local (adresse "
+                 "du proxy). Il n'applique plus sa limite de débit « à distance », ni "
+                 "l'option « autoriser l'accès à distance » de ses utilisateurs. Le "
+                 "proxy garde, lui, toute sa sécurité (bannissements, refus)."},
     ]},
     {"id": "cache", "title": "Cache des vignettes", "fields": [
         {"sec": "cache", "key": "max_size_mb", "type": "float", "min": 10,
@@ -855,7 +866,7 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "burst", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
-              "language")
+              "language", "forward_ip")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -3061,11 +3072,13 @@ class EmbyProxy:
              and k.lower() not in FORWARD_HDRS}
         ip = request[CLIENT_IP]
         prev = request.headers.get("X-Forwarded-For")
-        # relais de confiance : on prolonge sa chaine avec SON adresse
-        # (visiteur, relais) ; sinon on ignore ce que le client pretend
-        h["X-Forwarded-For"] = "%s, %s" % (prev, request.remote) if prev and \
-            self.guard._in(request.remote or "", self.cfg.trusted) else ip
-        h["X-Real-IP"] = ip
+        if getattr(self.cfg, "forward_ip", True):
+            # relais de confiance : on prolonge sa chaine avec SON adresse
+            # (visiteur, relais) ; sinon on ignore ce que le client pretend
+            h["X-Forwarded-For"] = "%s, %s" % (prev, request.remote) if prev and \
+                self.guard._in(request.remote or "", self.cfg.trusted) else ip
+            h["X-Real-IP"] = ip
+        # sinon : aucune adresse de visiteur, Emby ne voit que le proxy (local)
         proto, host = self._public_origin(request)
         h["X-Forwarded-Proto"] = proto
         h["X-Forwarded-Host"] = host
@@ -3282,8 +3295,9 @@ class EmbyProxy:
         keep = {"cookie", "authorization", "x-emby-authorization", "x-emby-token",
                 "user-agent", "origin"}
         headers = {k: v for k, v in request.headers.items() if k.lower() in keep}
-        headers["X-Forwarded-For"] = request[CLIENT_IP]
-        headers["X-Real-IP"] = request[CLIENT_IP]
+        if getattr(self.cfg, "forward_ip", True):
+            headers["X-Forwarded-For"] = request[CLIENT_IP]
+            headers["X-Real-IP"] = request[CLIENT_IP]
         headers["X-Forwarded-Proto"], headers["X-Forwarded-Host"] = \
             self._public_origin(request)
         protos = [x.strip() for x in request.headers.get(

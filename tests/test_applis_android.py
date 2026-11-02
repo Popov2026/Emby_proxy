@@ -309,3 +309,24 @@ async def test_debit_depasse_visible_dans_securite(env):
     ev = [e for e in proxy.seclog.events if e["type"] == "refused"]
     assert len(ev) == 1 and ev[0]["count"] == codes.count(429)
     assert "Trop de requetes" in ev[0]["detail"]
+
+
+async def test_option_emby_voit_tout_le_monde_en_local(env):
+    """forward_client_ip = false : aucune adresse de visiteur envoyee a Emby,
+    qui ne voit que le proxy (reseau local) : plus de limite de debit
+    distante. Le proxy, lui, connait toujours la vraie adresse."""
+    proxy, c, seen = env
+    proxy.cfg.trusted = ep._nets("127.0.0.1/32")
+    hdr = {"X-Forwarded-For": "83.204.193.128", "X-Forwarded-Proto": "https",
+           "Host": "emby.example.com"}
+    await c.get("/emby/System/Info/Public", headers=hdr)
+    assert seen["info_headers"]["X-Forwarded-For"].startswith("83.204.193.128")
+    proxy.cfg.forward_ip = False
+    await c.get("/emby/System/Info/Public", headers=hdr)
+    h = seen["info_headers"]
+    assert "X-Forwarded-For" not in h and "X-Real-IP" not in h
+    assert h["X-Forwarded-Proto"] == "https"
+    # le proxy voit toujours le visiteur (bannissements, activite)
+    await c.post("/emby/Users/AuthenticateByName", data="Username=tv&Pw=faux",
+                 headers=dict(hdr, **{"Content-Type": "application/x-www-form-urlencoded"}))
+    assert proxy.seclog.events[-1]["ip"] == "83.204.193.128"
