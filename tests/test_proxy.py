@@ -593,8 +593,14 @@ async def test_avertissement_relais(env):
     proxy, c = await make()
     assert "relay" not in proxy.warnings
     await c.get("/emby/Users/u1/Items", headers={"X-Forwarded-For": "8.8.8.8"})
-    assert "relay" in proxy.warnings and "trusted_proxies" in proxy.warnings["relay"]
+    assert "relay" in proxy.warnings
+    assert "Relais HTTPS de confiance" in proxy.warnings["relay"]
+    assert "127.0.0.1/32" in proxy.warnings["relay"]
     assert "http" in proxy.warnings                           # pas de HTTPS
+    # relais declare : l'avertissement disparait sans redemarrer
+    proxy.cfg.trusted = ep._nets("127.0.0.1/32")
+    await c.get("/emby/Users/u1/Items", headers={"X-Forwarded-For": "8.8.8.8"})
+    assert "relay" not in proxy.warnings
 
 
 async def test_recherches_non_enregistrees(env):

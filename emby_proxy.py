@@ -62,7 +62,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
 from aiohttp import ClientError
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2732,14 +2732,20 @@ class EmbyProxy:
         np = norm_path(request.path)
         request[NPATH] = np
         self.stats.requests += 1
+        if "relay" in self.warnings and self.cfg.trusted \
+                and self.guard._in(request.remote or "", self.cfg.trusted):
+            self.warnings.pop("relay", None)      # relais declare depuis
         if "X-Forwarded-For" in request.headers and "relay" not in self.warnings \
                 and not self.guard._in(request.remote or "", self.cfg.trusted) \
                 and self.guard.is_local(request.remote or ""):
             self.warnings["relay"] = (
-                "Des requetes arrivent par un autre relais (%s, en-tete "
-                "X-Forwarded-For) : renseigne son adresse dans trusted_proxies. "
-                "Sinon tout Internet est vu comme le reseau local et un "
-                "bannissement touche tout le monde." % request.remote)
+                "Des requetes arrivent par un relais (%s, en-tete "
+                "X-Forwarded-For) qui n'est pas declare. Si c'est ton relais "
+                "HTTPS, ajoute %s/32 dans la page d'administration, onglet "
+                "Configuration, partie Securite, champ \"Relais HTTPS de "
+                "confiance\", puis Enregistrer. Sinon tout Internet est vu "
+                "comme le reseau local et un bannissement touche tout le monde."
+                % (request.remote, request.remote))
             log.warning(self.warnings["relay"])
         if request.path.startswith("/__proxy/") and self.cfg.status_port:
             raise web.HTTPNotFound()          # administration : autre port
