@@ -4,6 +4,8 @@
     pytest
 """
 import asyncio
+import gzip
+import json
 import sys
 from pathlib import Path
 
@@ -14,6 +16,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import emby_proxy as ep  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 500
+UID = "a" * 32
+ITEMS = {
+    "111": {"Id": "111", "Name": "Dune : Deuxieme partie", "Type": "Movie",
+            "ProductionYear": 2024, "RunTimeTicks": 166 * 60 * 10_000_000},
+    "222": {"Id": "222", "Name": "Le retour", "Type": "Episode",
+            "SeriesName": "Severance", "ParentIndexNumber": 2, "IndexNumber": 3},
+    "333": {"Id": "333", "Name": "Oppenheimer", "Type": "Movie",
+            "ProductionYear": 2023},
+    "900": {"Id": "900", "Name": "Films", "Type": "CollectionFolder"},
+}
+
+
+def gz_json(obj):
+    """Emby compresse ses reponses JSON : le proxy doit savoir les lire."""
+    return web.Response(body=gzip.compress(json.dumps(obj).encode()),
+                        headers={"Content-Type": "application/json",
+                                 "Content-Encoding": "gzip"})
 
 
 def fake_emby():
@@ -29,6 +48,11 @@ def fake_emby():
                             content_type="image/png")
 
     async def items(request):
+        if request.query.get("Ids"):           # resolution avec le jeton utilisateur
+            calls.setdefault("resolve_user", []).append(
+                request.headers.get("X-Emby-Token"))
+            ids = request.query["Ids"].split(",")
+            return web.json_response({"Items": [ITEMS[i] for i in ids if i in ITEMS]})
         return web.json_response({"Items": [{"Name": "Dune"}],
                                   "auth": request.headers.get("X-Emby-Token"),
                                   "xff": request.headers.get("X-Forwarded-For")})
@@ -51,12 +75,31 @@ def fake_emby():
         calls["login"] += 1
         data = await request.json()
         if data.get("Pw") == "bon":
-            return web.json_response({"AccessToken": "abc"})
+            return web.json_response({"AccessToken": "TOKPAUL",
+                                      "User": {"Id": UID, "Name": "Paul"}})
         return web.Response(status=401)
 
     async def admin(request):
         calls["admin"] += 1
         return web.json_response({"ok": True})
+
+    async def user(request):
+        return gz_json({"Id": UID, "Name": "Paul"})
+
+    async def views(request):
+        return gz_json({"Items": [ITEMS["900"]]})
+
+    async def item(request):
+        return gz_json(ITEMS[request.match_info["item"]])
+
+    async def items_by_id(request):        # resolution des noms (cle API)
+        calls.setdefault("resolve", []).append(request.query.get("api_key"))
+        ids = request.query.get("Ids", "").split(",")
+        return web.json_response({"Items": [ITEMS[i] for i in ids if i in ITEMS]})
+
+    async def no_content(request):
+        await request.read()
+        return web.Response(status=204)
 
     async def ws(request):
         sock = web.WebSocketResponse()
@@ -75,6 +118,15 @@ def fake_emby():
     app.router.add_post("/emby/Users/AuthenticateByName", login)
     app.router.add_get("/emby/System/Configuration", admin)
     app.router.add_get("/embywebsocket", ws)
+    app.router.add_get("/emby/Users/{uid}", user)
+    app.router.add_get("/emby/Users/{uid}/Views", views)
+    app.router.add_get("/emby/Users/{uid}/Items/{item}", item)
+    app.router.add_get("/emby/Items", items_by_id)
+    app.router.add_post("/emby/Sessions/Playing/Progress", no_content)
+    app.router.add_post("/emby/Sessions/Playing/Stopped", no_content)
+    app.router.add_post("/emby/Users/{uid}/FavoriteItems/{item}", no_content)
+    app.router.add_delete("/emby/Items/{item}", no_content)
+    app.router.add_post("/emby/Sessions/Logout", no_content)
     return app, calls
 
 
@@ -253,3 +305,115 @@ def test_clef_de_cache():
     assert a == b and "secret" not in a.lower()
     assert ep.IMAGE_RE.match("/emby/Items/1/Images/Backdrop/0")
     assert not ep.IMAGE_RE.match("/emby/Items/1/Images")      # liste JSON
+
+
+# ---------------------------------------------------------------------
+#  Activite des utilisateurs
+# ---------------------------------------------------------------------
+WEB = {"X-Emby-Client": "Emby Web", "X-Emby-Device-Name": "Chrome",
+       "X-Emby-Device-Id": "dev-paul", "X-Emby-Client-Version": "4.8.0",
+       "X-Emby-Token": "TOKPAUL"}
+
+
+def q(**extra):
+    d = dict(WEB)
+    d.update(extra)
+    return "&".join("%s=%s" % kv for kv in d.items())
+
+
+async def test_activite_navigation_et_lecture(env):
+    make, _, calls = env
+    proxy, c = await make()
+    r = await c.post("/emby/Users/AuthenticateByName?" + q(),
+                     json={"Username": "Paul", "Pw": "bon"})
+    assert r.status == 200
+    await c.get("/emby/Users/%s?%s" % (UID, q()))
+    await c.get("/emby/Users/%s/Views?%s" % (UID, q()))
+    await c.get("/emby/Users/%s/Items?ParentId=900&IncludeItemTypes=Movie"
+                "&SortBy=DateCreated&StartIndex=0&%s" % (UID, q()))
+    for term in ("op", "opp", "oppen"):              # tape lettre par lettre
+        await c.get("/emby/Users/%s/Items?SearchTerm=%s&%s" % (UID, term, q()))
+    await c.get("/emby/Users/%s/Items/333?%s" % (UID, q()))
+    r = await c.get("/emby/Users/%s/Items/111?%s" % (UID, q()))
+    assert r.headers["Content-Encoding"] == "gzip"      # transmis tel quel
+    assert (await r.json())["Name"].startswith("Dune")
+    await c.post("/emby/Sessions/Playing?" + q(),
+                 json={"ItemId": "111", "PositionTicks": 0, "PlayMethod": "Transcode"})
+    await c.post("/emby/Sessions/Playing/Progress?" + q(),
+                 json={"ItemId": "111", "PositionTicks": 600 * 10_000_000,
+                       "IsPaused": True})
+    await c.post("/emby/Users/%s/FavoriteItems/111?%s" % (UID, q()))
+
+    d = proxy.activity.snapshot()
+    u = d["clients"][0]
+    assert u["user"] == "Paul" and u["client"] == "Emby Web"
+    assert u["device"] == "Chrome" and u["version"] == "4.8.0"
+    assert u["ip"] == "127.0.0.1" and u["local"] is True and u["active"]
+    assert u["location"] == "Fiche : Dune : Deuxieme partie (2024)"
+    pl = u["playing"]
+    assert pl["title"] == "Dune : Deuxieme partie (2024)" and pl["paused"]
+    assert pl["mode"] == "transcodage" and pl["pos"] == "10:00"
+    assert pl["duration"] == "2:46:00" and pl["percent"] == 6.0
+    texts = [e["text"] for e in u["events"]]
+    assert "Connexion reussie (Paul)" in texts
+    assert "Accueil" in texts
+    assert "Fiche : Oppenheimer (2023)" in texts         # 2 fiches de suite :
+    assert "Fiche : Dune : Deuxieme partie (2024)" in texts   # les deux gardees
+    assert "Parcourt : Films (Movie, tri DateCreated)" in texts
+    assert [t for t in texts if t.startswith("Recherche")] == [
+        "Recherche : \u00ab oppen \u00bb"]
+    assert "Lecture : Dune : Deuxieme partie (2024) (transcodage)" in texts
+    assert "Pause : Dune : Deuxieme partie (2024)" in texts
+    assert "Ajoute aux favoris : Dune : Deuxieme partie (2024)" in texts
+
+    await c.post("/emby/Sessions/Playing/Stopped?" + q(),
+                 json={"ItemId": "111", "PositionTicks": 3600 * 10_000_000})
+    await c.delete("/emby/Items/222?" + q())
+    await c.post("/emby/Sessions/Logout?" + q())
+    await asyncio.sleep(1.8)                          # resolution des noms
+    u = proxy.activity.snapshot()["clients"][0]
+    texts = [e["text"] for e in u["events"]]
+    assert "Arret : Dune : Deuxieme partie (2024) a 1:00:00 / 2:46:00" in texts
+    assert "SUPPRESSION : Severance S02E03 - Le retour" in texts  # nom demande a Emby
+    assert texts[0] == "Deconnexion" and u["playing"] is None
+    # resolution faite avec le jeton de l'utilisateur (pas de cle API reglee)
+    assert calls.get("resolve", []) == []
+    assert calls["resolve_user"] == ["TOKPAUL"]
+
+
+async def test_activite_cle_api_journal_et_page(env, tmp_path):
+    make, _, calls = env
+    proxy, c = await make(emby__api_key="CLEADMIN",
+                          activity__log_file=str(tmp_path / "act.log"))
+    await c.post("/emby/Sessions/Playing?" + q(),
+                 json={"ItemId": "333", "PlayMethod": "DirectPlay"})
+    await asyncio.sleep(1.8)
+    assert calls["resolve"] == ["CLEADMIN"]
+    d = await (await c.get("/__proxy/activity.json")).json()
+    assert d["clients"][0]["playing"]["title"] == "Oppenheimer (2023)"
+    assert d["feed"][0]["text"] == "Lecture : Oppenheimer (2023) (lecture directe)"
+    line = json.loads((tmp_path / "act.log").read_text(encoding="utf-8").splitlines()[0])
+    assert line["appli"] == "Emby Web" and line["type"] == "play"
+    assert (await c.get("/__proxy/")).status == 200
+    s = await (await c.get("/__proxy/stats.json")).json()
+    assert s["active_users"] == 1
+
+
+async def test_activite_mot_de_passe_faux_et_refus(env):
+    make, _, _ = env
+    proxy, c = await make(security__local_networks="10.0.0.0/8")
+    await c.post("/emby/Users/AuthenticateByName?" + q(),
+                 json={"Username": "Paul", "Pw": "faux"})
+    await c.get("/emby/System/Configuration?" + q())
+    texts = [e["text"] for e in proxy.activity.snapshot()["clients"][0]["events"]]
+    assert "Mot de passe faux pour Paul" in texts
+    assert any(t.startswith("Refuse : Administration") for t in texts)
+
+
+async def test_activite_desactivable(env):
+    make, _, _ = env
+    proxy, c = await make(activity__enabled="false")
+    assert proxy.activity is None
+    assert (await c.get("/emby/Users/u1/Items")).status == 200
+    d = await (await c.get("/__proxy/activity.json")).json()
+    assert d["disabled"] is True

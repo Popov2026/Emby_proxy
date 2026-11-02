@@ -42,6 +42,36 @@ petite fenêtre de suivi) ou **en Docker** sur un NAS ou un serveur.
 | **Emby caché** | son adresse réelle n'est jamais renvoyée aux utilisateurs ; en-têtes `Server` retirés |
 | **En-têtes de sécurité** | `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` |
 
+### Activité des utilisateurs
+Onglet **Activité** de la page d'état (réseau local seulement), rafraîchi
+toutes les 3 secondes :
+
+- **Qui est connecté** : nom Emby, application (Emby Web, Android, TV…),
+  appareil, version, adresse IP, réseau local ou Internet, heure de
+  connexion, dernière action, nombre de requêtes, volume de données reçu.
+- **Où il navigue** : accueil, bibliothèque parcourue (avec type, genre, tri),
+  fiche de film ou d'épisode ouverte, saisons et épisodes d'une série,
+  recherches tapées.
+- **Ce qu'il regarde** : titre, position et durée, pourcentage, pause,
+  lecture directe ou transcodage.
+- **Ses actions** :
+  - favoris ajoutés ou retirés ;
+  - marqué vu ou non vu ;
+  - téléchargements ;
+  - **suppressions** ;
+  - connexions et déconnexions ;
+  - **mots de passe faux** ;
+  - requêtes refusées par le proxy.
+- **Journal d'activité** de tous les utilisateurs, filtrable par utilisateur,
+  par type d'action et par texte.
+- **Journal sur disque** `emby_activity.log` : une ligne JSON par action,
+  pour garder l'historique.
+
+Les noms des films sont lus dans les réponses d'Emby elles-mêmes. Pour un
+élément jamais ouvert avant, le proxy demande son nom à Emby, avec la clé API
+des réglages (`[emby] api_key`, facultative) ou, à défaut, avec le jeton de
+l'utilisateur.
+
 ### Tout le reste passe tel quel
 API, lecture vidéo (avec avance rapide / reprise), WebSocket des applications
 Emby, envoi de fichiers.
@@ -90,13 +120,16 @@ Sans fenêtre (console) : `py emby_proxy.py`.
 ## Page d'état
 Depuis le réseau local seulement : **`http://ADRESSE-DU-PROXY:8097/__proxy/`**
 
-Elle affiche les vignettes servies du cache, le taux de cache, le volume
-économisé sur Emby, la taille du cache, les requêtes bloquées et les adresses
-bannies. Elle permet aussi de vider le cache.
+- Onglet **Activité** : les utilisateurs et le journal d'activité (voir plus
+  haut).
+- Onglet **Cache & sécurité** : vignettes servies du cache, taux de cache,
+  volume économisé sur Emby, taille du cache, requêtes bloquées, adresses
+  bannies, et un bouton pour vider le cache.
 
 Depuis Internet, cette page n'existe pas (erreur 404).
 
-La même chose est disponible en JSON sur `/__proxy/stats.json`.
+Les mêmes informations sont disponibles en JSON sur `/__proxy/activity.json`
+et `/__proxy/stats.json`.
 
 ## Réglages (`emby_proxy.ini`)
 Le fichier est commenté ; voir aussi `emby_proxy.example.ini`.
@@ -118,10 +151,16 @@ Le fichier est commenté ; voir aussi `emby_proxy.example.ini`.
 | security | `ban_minutes` | 60 | durée du bannissement |
 | security | `rate_per_second` / `rate_burst` | 100 / 400 | débit par adresse IP |
 | security | `trusted_proxies` | vide | proxy placé devant celui-ci (Nginx…) |
+| emby | `api_key` | vide | facultative : noms des films dans l'activité |
+| activity | `enabled` | true | suivi de l'activité des utilisateurs |
+| activity | `idle_minutes` | 15 | délai avant d'afficher un utilisateur inactif |
+| activity | `keep_hours` | 48 | durée de conservation d'un utilisateur parti |
+| activity | `log_file` | `emby_activity.log` | journal d'activité sur disque (vide = aucun) |
 
 Sous Docker, des variables d'environnement remplacent le fichier :
 `EMBY_PROXY_UPSTREAM`, `EMBY_PROXY_PORT`, `EMBY_PROXY_CACHE_MB`,
-`EMBY_PROXY_CACHE_DIR`, `EMBY_PROXY_TLS_CERT`, `EMBY_PROXY_TLS_KEY`.
+`EMBY_PROXY_CACHE_DIR`, `EMBY_PROXY_TLS_CERT`, `EMBY_PROXY_TLS_KEY`,
+`EMBY_PROXY_API_KEY`, `EMBY_PROXY_ACTIVITY_LOG`.
 
 ## Tests
 ```
@@ -137,4 +176,7 @@ Les tests font tourner le proxy contre un faux serveur Emby. Ils vérifient :
 - le bannissement, le blocage de l'administration, les listes d'adresses et
   le débit ;
 - la page d'état ;
-- l'éviction du cache.
+- l'éviction du cache ;
+- l'activité : connexion, accueil, bibliothèque, recherche, fiches, lecture,
+  pause, arrêt, favoris, suppression, déconnexion, mots de passe faux, refus,
+  noms demandés à Emby, journal sur disque.

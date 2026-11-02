@@ -6,3 +6,4 @@ emby_proxy.log
 cache_images/
 data/
 *.pem
+emby_activity.log*

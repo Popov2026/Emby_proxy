@@ -9,6 +9,7 @@ COPY emby_proxy.py .
 ENV EMBY_PROXY_CONFIG=/data/emby_proxy.ini \
     EMBY_PROXY_CACHE_DIR=/data/cache_images \
     EMBY_PROXY_LOG_FILE=/data/emby_proxy.log \
+    EMBY_PROXY_ACTIVITY_LOG=/data/emby_activity.log \
     PYTHONUNBUFFERED=1
 VOLUME /data
 

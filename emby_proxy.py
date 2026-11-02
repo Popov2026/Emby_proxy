@@ -18,6 +18,11 @@ Les utilisateurs se connectent au proxy au lieu du serveur Emby :
       * listes d'adresses autorisees / interdites ;
       * HTTPS possible directement (certificat + clef) ;
       * en-tetes de securite ajoutes, adresse reelle d'Emby jamais exposee.
+  - ACTIVITE DES UTILISATEURS (page d'etat, reseau local) : qui est connecte,
+    avec quelle application, depuis quelle adresse ; ou il navigue (accueil,
+    bibliotheques, fiches, recherches) ; ce qu'il regarde (position, pause,
+    lecture directe ou transcodage) ; favoris, vus, telechargements,
+    suppressions, connexions, mots de passe faux. Journal sur disque.
   - TOUT LE RESTE passe tel quel : lecture video (avec reprise / Range),
     WebSocket des applications Emby, envoi de fichiers...
 
@@ -32,6 +37,7 @@ Page d'etat (depuis le reseau local) : http://<proxy>:8097/__proxy/
 import argparse
 import asyncio
 import configparser
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -43,6 +49,7 @@ import sys
 import threading
 import time
 import webbrowser
+import zlib
 from collections import deque
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -96,6 +103,16 @@ DEFAULTS = {
         "file": "emby_proxy.log",
         "level": "INFO",
     },
+    "emby": {
+        "api_key": "",
+    },
+    "activity": {
+        "enabled": "true",
+        "idle_minutes": "15",
+        "keep_hours": "48",
+        "log_file": "emby_activity.log",
+        "log_max_mb": "20",
+    },
 }
 
 # Variables d'environnement prioritaires (pratique sous Docker).
@@ -108,6 +125,8 @@ ENV_OVERRIDES = {
     "EMBY_PROXY_TLS_CERT": ("proxy", "tls_cert"),
     "EMBY_PROXY_TLS_KEY": ("proxy", "tls_key"),
     "EMBY_PROXY_LOG_FILE": ("log", "file"),
+    "EMBY_PROXY_API_KEY": ("emby", "api_key"),
+    "EMBY_PROXY_ACTIVITY_LOG": ("activity", "log_file"),
 }
 
 
@@ -164,6 +183,14 @@ class Settings:
 
         self.log_file = self._path(base, cp["log"].get("file"))
         self.log_level = cp["log"].get("level", "INFO").upper()
+
+        self.api_key = cp["emby"].get("api_key", "").strip()
+        a = cp["activity"]
+        self.activity_enabled = a.getboolean("enabled")
+        self.activity_idle_minutes = a.getfloat("idle_minutes")
+        self.activity_keep_hours = a.getfloat("keep_hours")
+        self.activity_log = self._path(base, a.get("log_file"))
+        self.activity_log_max = int(a.getfloat("log_max_mb") * 1024 * 1024)
 
     @staticmethod
     def _path(base, value):
@@ -230,6 +257,23 @@ trusted_proxies =
 [log]
 file = emby_proxy.log
 level = INFO
+
+[emby]
+# Cle API Emby (Tableau de bord > Avance > Cles API). Facultative : sans elle,
+# le nom d'un film que l'utilisateur n'a pas ouvert avant (lecture lancee
+# depuis l'accueil...) est demande a Emby avec le jeton de cet utilisateur.
+api_key =
+
+[activity]
+# Suivi de ce que font les utilisateurs (page d'etat, onglet Activite).
+enabled = true
+# Sans requete depuis ce delai, l'utilisateur est affiche inactif.
+idle_minutes = 15
+# Duree pendant laquelle un utilisateur parti reste dans la liste.
+keep_hours = 48
+# Journal de toute l'activite (une ligne JSON par action), vide = aucun.
+log_file = emby_activity.log
+log_max_mb = 20
 """ % PRIVATE_NETS
     Path(path).write_text(text, encoding="utf-8")
 
@@ -464,6 +508,479 @@ class Guard:
 
 
 # =====================================================================
+#  ACTIVITE DES UTILISATEURS
+# =====================================================================
+# Toutes les requetes passent par le proxy : il sait qui navigue ou, ce qui
+# est lu, recherche, ajoute aux favoris, supprime... Les noms des films sont
+# appris dans les reponses d'Emby elles-memes (fiche ouverte, connexion,
+# bibliotheques) et, au besoin, demandes a Emby avec la cle API des reglages
+# ou le jeton de l'utilisateur.
+_HEX = r"[0-9a-fA-F]{32}|\d+"
+_P = r"^/(?:emby/)?"
+RE_ITEM = re.compile(_P + r"Users/(?P<uid>%s)/Items/(?P<item>%s)/?$" % (_HEX, _HEX), re.I)
+RE_ITEMS = re.compile(_P + r"(?:Users/(?P<uid>%s)/)?Items/?$" % _HEX, re.I)
+RE_VIEWS = re.compile(_P + r"Users/(?P<uid>%s)/Views/?$" % _HEX, re.I)
+RE_USER = re.compile(_P + r"Users/(?P<uid>%s)/?$" % _HEX, re.I)
+RE_SEASONS = re.compile(_P + r"Shows/(?P<item>%s)/(?P<what>Seasons|Episodes)/?$" % _HEX, re.I)
+RE_HINTS = re.compile(_P + r"Search/Hints/?$", re.I)
+RE_PLAYING = re.compile(_P + r"Sessions/Playing(?:/(?P<what>Progress|Stopped|Ping))?/?$", re.I)
+RE_STREAM = re.compile(_P + r"(?:Videos|Audio)/(?P<item>%s)/(?:stream|master|main|live|universal)" % _HEX, re.I)
+RE_DOWNLOAD = re.compile(_P + r"Items/(?P<item>%s)/(?:Download|File)/?$" % _HEX, re.I)
+RE_FAV = re.compile(_P + r"Users/(?P<uid>%s)/FavoriteItems/(?P<item>%s)/?$" % (_HEX, _HEX), re.I)
+RE_PLAYED = re.compile(_P + r"Users/(?P<uid>%s)/PlayedItems/(?P<item>%s)/?$" % (_HEX, _HEX), re.I)
+RE_DELETE = re.compile(_P + r"Items/(?P<item>%s)/?$" % _HEX, re.I)
+RE_LOGOUT = re.compile(_P + r"Sessions/Logout/?$", re.I)
+RE_ANYUID = re.compile(_P + r"Users/(?P<uid>[0-9a-fA-F]{32})/", re.I)
+_AUTH_KV = re.compile(r'(\w+)="([^"]*)"')
+TICKS = 10_000_000
+X = "\x00"            # remplace par le nom de l'element a l'affichage
+
+
+def _hms(seconds):
+    s = int(max(0, seconds or 0))
+    h, m, s = s // 3600, s % 3600 // 60, s % 60
+    return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+
+
+class ItemInfo:
+    """Noms des films, series, episodes et dossiers, par identifiant."""
+
+    def __init__(self):
+        self.items = {}            # id -> dict
+        self.users = {}            # uid -> nom
+        self.pending = {}          # id -> (auth) a resoudre
+
+    def learn(self, it):
+        if not isinstance(it, dict) or not it.get("Id"):
+            return
+        self.items[str(it["Id"])] = {
+            "name": it.get("Name") or "", "type": it.get("Type") or "",
+            "year": it.get("ProductionYear"), "series": it.get("SeriesName") or "",
+            "season": it.get("ParentIndexNumber"), "episode": it.get("IndexNumber"),
+            "runtime": (it.get("RunTimeTicks") or 0) / TICKS,
+            "collection": it.get("CollectionType") or ""}
+        self.pending.pop(str(it["Id"]), None)
+
+    def need(self, item_id, auth):
+        """Nom inconnu : a demander a Emby (auth = (jeton, uid) du client)."""
+        item_id = str(item_id or "")
+        if item_id and item_id not in self.items and len(self.pending) < 5000:
+            self.pending.setdefault(item_id, auth)
+
+    def label(self, item_id):
+        it = self.items.get(str(item_id or ""))
+        if not it:
+            return "element %s..." % str(item_id)[:8] if item_id else "?"
+        if it["type"] == "Episode":
+            code = ""
+            if it["season"] is not None and it["episode"] is not None:
+                code = " S%02dE%02d" % (it["season"], it["episode"])
+            return "%s%s - %s" % (it["series"] or "?", code, it["name"])
+        if it["type"] == "Season":
+            return "%s - %s" % (it["series"] or "?", it["name"])
+        if it["year"] and it["type"] in ("Movie", "Series", "Video", "MusicAlbum"):
+            return "%s (%s)" % (it["name"], it["year"])
+        return it["name"] or "?"
+
+    def runtime(self, item_id):
+        it = self.items.get(str(item_id or ""))
+        return it["runtime"] if it else 0
+
+
+class Client:
+    """Une application connectee : navigateur, telephone, TV..."""
+
+    def __init__(self, key):
+        self.key = key
+        self.user_id = ""
+        self.user_name = ""
+        self.client = ""
+        self.device = ""
+        self.device_id = ""
+        self.version = ""
+        self.ip = ""
+        self.local = False
+        self.user_agent = ""
+        self.token = ""
+        self.first_seen = self.last_seen = time.time()
+        self.requests = 0
+        self.bytes_out = 0
+        self.location = ""          # derniere page parcourue
+        self.location_item = None
+        self.location_at = 0.0
+        self.playing = None         # lecture en cours
+        self.events = deque(maxlen=300)
+
+
+class Activity:
+    def __init__(self, cfg, guard):
+        self.cfg = cfg
+        self.guard = guard
+        self.info = ItemInfo()
+        self.clients = {}
+        self.feed = deque(maxlen=3000)
+        self.token_user = {}        # jeton -> uid
+        self.log_path = cfg.activity_log
+        self._log_lock = threading.Lock()
+
+    # -- identification ------------------------------------------------
+    @staticmethod
+    def _auth_fields(request):
+        """Champs d'identification envoyes par les applications Emby, dans
+        l'en-tete X-Emby-Authorization ou dans l'adresse (client web)."""
+        f = {}
+        for name in ("X-Emby-Authorization", "Authorization"):
+            raw = request.headers.get(name, "")
+            if "Token=" in raw or "DeviceId=" in raw or "Client=" in raw:
+                f.update({k.lower(): v for k, v in _AUTH_KV.findall(raw)})
+        q = {k.lower(): v for k, v in request.query.items()}
+        for src, dst in (("x-emby-client", "client"), ("x-emby-device-name", "device"),
+                         ("x-emby-device-id", "deviceid"),
+                         ("x-emby-client-version", "version"),
+                         ("x-emby-token", "token"), ("api_key", "token"),
+                         ("deviceid", "deviceid")):
+            if q.get(src) and not f.get(dst):
+                f[dst] = q[src]
+        for h in ("X-Emby-Token", "X-MediaBrowser-Token"):
+            if request.headers.get(h) and not f.get("token"):
+                f["token"] = request.headers[h]
+        for h, dst in (("X-Emby-Client", "client"), ("X-Emby-Device-Name", "device"),
+                       ("X-Emby-Device-Id", "deviceid")):
+            if request.headers.get(h) and not f.get(dst):
+                f[dst] = request.headers[h]
+        return f
+
+    def identify(self, request):
+        ip = request[CLIENT_IP]
+        f = self._auth_fields(request)
+        token = f.get("token", "")
+        if f.get("deviceid"):
+            key = "dev:" + f["deviceid"]
+        elif token:
+            key = "tok:" + hashlib.sha1(token.encode()).hexdigest()[:16]
+        else:
+            ua = request.headers.get("User-Agent", "")
+            key = "ip:%s:%s" % (ip, hashlib.sha1(ua.encode()).hexdigest()[:8])
+        c = self.clients.get(key)
+        if c is None:
+            if len(self.clients) > 2000:
+                self._forget_old(force=True)
+            c = self.clients[key] = Client(key)
+        now = time.time()
+        c.last_seen = now
+        c.requests += 1
+        c.ip = ip
+        c.local = self.guard.is_local(ip)
+        c.user_agent = request.headers.get("User-Agent", "")[:200] or c.user_agent
+        c.client = f.get("client") or c.client
+        c.device = f.get("device") or c.device
+        c.device_id = f.get("deviceid") or c.device_id
+        c.version = f.get("version") or c.version
+        if token:
+            c.token = token
+        uid = f.get("userid", "")
+        m = RE_ANYUID.match(request.path)
+        if m:
+            uid = m.group("uid")
+        if uid:
+            c.user_id = uid.lower()
+            if token:
+                self.token_user[token] = c.user_id
+        elif token and token in self.token_user:
+            c.user_id = self.token_user[token]
+        if c.user_id and not c.user_name:
+            c.user_name = self.info.users.get(c.user_id, "")
+        return c
+
+    def _forget_old(self, force=False):
+        limit = time.time() - self.cfg.activity_keep_hours * 3600
+        for k in [k for k, c in self.clients.items() if c.last_seen < limit]:
+            del self.clients[k]
+        if force and len(self.clients) > 2000:
+            for k, _ in sorted(self.clients.items(),
+                               key=lambda kv: kv[1].last_seen)[:500]:
+                del self.clients[k]
+
+    # -- evenements ----------------------------------------------------
+    def event(self, c, kind, text, item=None, merge=60, term=""):
+        """Ajoute un evenement ; le meme repete dans la minute est fusionne."""
+        now = time.time()
+        if c.events:
+            last = c.events[-1]
+            if last["kind"] == kind and last["text"] == text and \
+                    last["item"] == item and now - last["t"] < merge:
+                last["t"] = now
+                return last
+            # une recherche tapee lettre par lettre ne garde que le dernier mot
+            if kind == "search" and last["kind"] == "search" and \
+                    now - last["t"] < 8 and (term.startswith(last["term"][:-1])
+                                             or last["term"].startswith(term[:-1])):
+                last.update(text=text, term=term, t=now)
+                return last
+        if item:
+            self.info.need(item, (c.token, c.user_id))
+        ev = {"t": now, "kind": kind, "text": text, "item": item,
+              "client": c.key, "term": term}
+        c.events.append(ev)
+        self.feed.append(ev)
+        self._write_log(c, ev)
+        return ev
+
+    def render(self, text, item):
+        return text.replace(X, self.info.label(item)) if X in text else text
+
+    def _write_log(self, c, ev):
+        if not self.log_path:
+            return
+        line = json.dumps({
+            "date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["t"])),
+            "utilisateur": c.user_name or c.user_id or "?", "appli": c.client,
+            "appareil": c.device, "ip": c.ip, "type": ev["kind"],
+            "action": self.render(ev["text"], ev["item"]), "element": ev["item"]},
+            ensure_ascii=False)
+        try:
+            with self._log_lock:
+                p = Path(self.log_path)
+                if p.exists() and p.stat().st_size > self.cfg.activity_log_max:
+                    os.replace(p, p.with_suffix(p.suffix + ".1"))
+                with open(p, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except OSError:
+            pass
+
+    def browse(self, c, text, item=None):
+        c.location, c.location_item, c.location_at = text, item, time.time()
+        self.event(c, "browse", text, item)
+
+    # -- lecture des requetes ------------------------------------------
+    def before(self, c, request, body_json):
+        """Ce que la requete dit, avant meme la reponse d'Emby.
+        -> liste d'actions a confirmer selon le statut de la reponse."""
+        p, m, q = request.path, request.method, request.query
+        todo = []
+        term = q.get("SearchTerm") or q.get("searchTerm")
+        if term and m == "GET" and (RE_ITEMS.match(p) or RE_HINTS.match(p)):
+            term = term.strip()[:120]
+            self.event(c, "search", "Recherche : \u00ab %s \u00bb" % term, term=term)
+            return todo
+        if m == "GET":
+            mt = RE_ITEM.match(p)
+            if mt:
+                todo.append(("open", mt.group("item")))
+                return todo
+            if RE_VIEWS.match(p):
+                self.browse(c, "Accueil")
+                return todo
+            mt = RE_SEASONS.match(p)
+            if mt:
+                what = "Saisons" if mt.group("what").lower() == "seasons" else "Episodes"
+                todo.append(("show", (what, mt.group("item"), q.get("SeasonId"))))
+                return todo
+            mt = RE_ITEMS.match(p)
+            if mt and q.get("ParentId") and q.get("StartIndex", "0") in ("0", ""):
+                bits = []
+                for key, lbl in (("IncludeItemTypes", ""), ("Genres", "genre "),
+                                 ("GenreIds", "genre "), ("Years", "annee "),
+                                 ("Filters", ""), ("SortBy", "tri ")):
+                    if q.get(key):
+                        bits.append(lbl + q[key])
+                todo.append(("folder", (q["ParentId"], ", ".join(bits))))
+                return todo
+            mt = RE_STREAM.match(p)
+            if mt:
+                todo.append(("stream", (mt.group("item"), dict(q))))
+                return todo
+            mt = RE_DOWNLOAD.match(p)
+            if mt:
+                todo.append(("download", mt.group("item")))
+                return todo
+        mt = RE_PLAYING.match(p)
+        if mt and m == "POST":
+            todo.append(("playing", ((mt.group("what") or "start").lower(),
+                                     body_json or {})))
+            return todo
+        mt = RE_FAV.match(p)
+        if mt and m in ("POST", "DELETE"):
+            todo.append(("fav", (m == "POST", mt.group("item"))))
+            return todo
+        mt = RE_PLAYED.match(p)
+        if mt and m in ("POST", "DELETE"):
+            todo.append(("played", (m == "POST", mt.group("item"))))
+            return todo
+        if m == "DELETE":
+            mt = RE_DELETE.match(p)
+            if mt:
+                todo.append(("delete", mt.group("item")))
+                return todo
+        if m == "POST" and LOGIN_RE.match(p):
+            user = (body_json or {}).get("Username") or (body_json or {}).get("Name") or ""
+            todo.append(("login", user))
+        elif m == "POST" and RE_LOGOUT.match(p):
+            todo.append(("logout", None))
+        return todo
+
+    def after(self, c, todo, status):
+        """Confirme les actions selon la reponse d'Emby."""
+        ok = status < 400
+        for kind, arg in todo:
+            if kind == "open" and ok:
+                self.browse(c, "Fiche : " + X, arg)
+            elif kind == "show" and ok:
+                what, show, season = arg
+                self.browse(c, "%s de %s" % (what, X), season or show)
+            elif kind == "folder" and ok:
+                folder, bits = arg
+                self.browse(c, "Parcourt : %s%s" % (X, " (%s)" % bits if bits
+                                                    else ""), folder)
+            elif kind == "stream" and ok:
+                item, q = arg
+                if not c.playing or c.playing["item"] != item:
+                    mode = "transcodage" if q.get("VideoCodec") and \
+                        q.get("Static", "").lower() != "true" else "direct"
+                    self._start_play(c, item, mode, 0, False)
+            elif kind == "download" and ok:
+                self.event(c, "download", "Telecharge : " + X, arg)
+            elif kind == "playing" and ok:
+                self._playing(c, *arg)
+            elif kind == "fav" and ok:
+                add, item = arg
+                self.event(c, "fav", ("Ajoute aux favoris : " if add else
+                                      "Retire des favoris : ") + X,
+                           item)
+            elif kind == "played" and ok:
+                seen, item = arg
+                self.event(c, "played", ("Marque vu : " if seen else
+                                         "Marque non vu : ") + X,
+                           item)
+            elif kind == "delete":
+                self.event(c, "delete", ("SUPPRESSION : " if ok else
+                                         "Suppression refusee : ") + X, arg)
+            elif kind == "login":
+                if ok:
+                    self.event(c, "login", "Connexion reussie (%s)" % (arg or c.user_name))
+                elif status in (401, 403):
+                    self.event(c, "badpass", "Mot de passe faux pour %s" % (arg or "?"),
+                               merge=0)
+            elif kind == "logout" and ok:
+                c.playing = None
+                self.event(c, "logout", "Deconnexion")
+
+    def _start_play(self, c, item, mode, pos, paused):
+        self.info.need(item, (c.token, c.user_id))
+        c.playing = {"item": item, "mode": mode, "pos": pos, "paused": paused,
+                     "started": time.time(), "updated": time.time()}
+        self.event(c, "play", "Lecture : %s (%s)" % (X, mode), item, merge=600)
+
+    def _playing(self, c, what, body):
+        item = str(body.get("ItemId") or (c.playing or {}).get("item") or "")
+        pos = (body.get("PositionTicks") or 0) / TICKS
+        mode = {"DirectPlay": "lecture directe", "DirectStream": "flux direct",
+                "Transcode": "transcodage"}.get(body.get("PlayMethod"), "")
+        if what == "start" and c.playing and c.playing["item"] == item:
+            # flux deja vu : on complete seulement (mode exact, position)
+            c.playing.update(mode=mode or c.playing["mode"], pos=pos,
+                             paused=bool(body.get("IsPaused")), updated=time.time())
+            return
+        if what == "start" or not c.playing or c.playing["item"] != item:
+            if what == "stopped":
+                self.event(c, "stop", "Arret : %s a %s" % (X, _hms(pos)), item)
+                c.playing = None
+                return
+            self._start_play(c, item, mode or "?", pos, bool(body.get("IsPaused")))
+            return
+        pl = c.playing
+        if mode:
+            pl["mode"] = mode
+        if what == "stopped":
+            dur = self.info.runtime(item)
+            self.event(c, "stop", "Arret : %s a %s%s" % (
+                X, _hms(pos),
+                " / %s" % _hms(dur) if dur else ""), item)
+            c.playing = None
+            return
+        if body.get("IsPaused") is not None and bool(body["IsPaused"]) != pl["paused"]:
+            pl["paused"] = bool(body["IsPaused"])
+            self.event(c, "pause", ("Pause : " if pl["paused"] else "Reprise : ")
+                       + X, item, merge=5)
+        pl["pos"] = pos or pl["pos"]
+        pl["updated"] = time.time()
+
+    # -- noms appris dans les reponses d'Emby ----------------------------
+    def wants_body(self, request):
+        p = request.path
+        return request.method == "GET" and bool(
+            RE_ITEM.match(p) or RE_VIEWS.match(p) or RE_USER.match(p)
+            or RE_SEASONS.match(p)) or (request.method == "POST"
+                                         and bool(LOGIN_RE.match(p)))
+
+    def learn_response(self, c, request, data):
+        p = request.path
+        if LOGIN_RE.match(p) and isinstance(data, dict):
+            u = data.get("User") or {}
+            if u.get("Id"):
+                uid = str(u["Id"]).lower()
+                self.info.users[uid] = u.get("Name") or ""
+                c.user_id, c.user_name = uid, u.get("Name") or c.user_name
+                if data.get("AccessToken"):
+                    self.token_user[data["AccessToken"]] = uid
+                    c.token = data["AccessToken"]
+            return
+        if RE_USER.match(p) and isinstance(data, dict) and data.get("Name"):
+            uid = RE_USER.match(p).group("uid").lower()
+            self.info.users[uid] = data["Name"]
+            if c.user_id == uid:
+                c.user_name = data["Name"]
+            return
+        if isinstance(data, dict) and isinstance(data.get("Items"), list):
+            for it in data["Items"]:
+                self.info.learn(it)
+        elif isinstance(data, dict):
+            self.info.learn(data)
+
+    # -- etat pour la page web -----------------------------------------
+    def snapshot(self, limit_events=40):
+        now = time.time()
+        idle = self.cfg.activity_idle_minutes * 60
+        self._forget_old()
+        out = []
+        for c in sorted(self.clients.values(), key=lambda x: -x.last_seen):
+            if not c.user_id and not c.client and c.requests < 5:
+                continue                   # robots, sondes : sans interet
+            pl = None
+            if c.playing and now - c.playing["updated"] < 600:
+                p = c.playing
+                pos = p["pos"] + (0 if p["paused"] else now - p["updated"])
+                dur = self.info.runtime(p["item"])
+                pl = {"title": self.info.label(p["item"]), "mode": p["mode"],
+                      "paused": p["paused"], "pos": _hms(min(pos, dur) if dur else pos),
+                      "duration": _hms(dur) if dur else "",
+                      "percent": round(100 * pos / dur, 1) if dur else None,
+                      "since": int(now - p["started"])}
+            out.append({
+                "user": c.user_name or (c.user_id[:8] if c.user_id else "inconnu"),
+                "client": c.client, "device": c.device, "version": c.version,
+                "ip": c.ip, "local": c.local, "user_agent": c.user_agent,
+                "first_seen": int(c.first_seen), "last_seen": int(c.last_seen),
+                "idle_s": int(now - c.last_seen), "active": now - c.last_seen < idle,
+                "requests": c.requests, "bytes_out": c.bytes_out,
+                "location": self.render(c.location, c.location_item),
+                "location_s": int(now - c.location_at)
+                if c.location_at else None, "playing": pl,
+                "events": [{"t": int(e["t"]), "kind": e["kind"],
+                            "text": self.render(e["text"], e["item"])}
+                           for e in list(c.events)[-limit_events:]][::-1]})
+        feed = []
+        for e in list(self.feed)[-300:][::-1]:
+            c = self.clients.get(e["client"])
+            feed.append({"t": int(e["t"]), "kind": e["kind"],
+                         "text": self.render(e["text"], e["item"]),
+                         "user": (c.user_name or c.user_id[:8] or "inconnu") if c else "?",
+                         "device": ("%s - %s" % (c.client, c.device)).strip(" -")
+                         if c else ""})
+        return {"clients": out, "feed": feed, "now": int(now)}
+
+
+# =====================================================================
 #  PROXY
 # =====================================================================
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -473,6 +990,18 @@ try:                                     # aiohttp >= 3.11
     CLIENT_IP = web.RequestKey("client_ip", str)
 except AttributeError:
     CLIENT_IP = "client_ip"
+
+
+def _decode(raw, encoding):
+    enc = (encoding or "").lower()
+    if enc == "gzip":
+        return gzip.decompress(raw)
+    if enc == "deflate":
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:
+            return zlib.decompress(raw, -zlib.MAX_WBITS)
+    return raw
 
 
 class Stats:
@@ -495,8 +1024,10 @@ class EmbyProxy:
         self.stats = Stats()
         self.session = None
         self._locks = {}
+        self._tasks = []
         up = urlsplit(cfg.upstream)
         self.up_host = up.netloc
+        self.activity = Activity(cfg, self.guard) if cfg.activity_enabled else None
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
@@ -508,10 +1039,60 @@ class EmbyProxy:
                  "%s:%d" % (self.cfg.listen_host, self.cfg.listen_port),
                  self.cfg.upstream, self.cfg.cache_dir, len(self.cache.index),
                  self.cache.total / 1048576)
+        if self.activity:
+            self._tasks.append(asyncio.create_task(self._resolve_loop()))
 
     async def cleanup(self, app):
+        for t in self._tasks:
+            t.cancel()
         if self.session:
             await self.session.close()
+
+    async def _resolve_loop(self):
+        """Demande a Emby le nom des elements vus dans l'activite mais pas
+        encore connus, par paquets."""
+        info = self.activity.info
+        while True:
+            await asyncio.sleep(1.5)
+            if not info.pending:
+                continue
+            groups = {}
+            for item, auth in list(info.pending.items())[:200]:
+                key = ("api",) if self.cfg.api_key else auth
+                groups.setdefault(key, []).append(item)
+            for auth, ids in groups.items():
+                for i in range(0, len(ids), 50):
+                    await self._resolve(auth, ids[i:i + 50])
+
+    async def _resolve(self, auth, ids):
+        info = self.activity.info
+        fields = "ProductionYear,RunTimeTicks,SeriesName,ParentIndexNumber,IndexNumber"
+        if auth == ("api",):
+            url = "%s/emby/Items" % self.cfg.upstream
+            params = {"Ids": ",".join(ids), "Fields": fields,
+                      "api_key": self.cfg.api_key}
+            headers = {}
+        else:
+            token, uid = auth
+            if not token or not uid:
+                for i in ids:                    # rien pour les demander
+                    info.pending.pop(i, None)
+                return
+            url = "%s/emby/Users/%s/Items" % (self.cfg.upstream, uid)
+            params = {"Ids": ",".join(ids), "Fields": fields}
+            headers = {"X-Emby-Token": token}
+        try:
+            async with self.session.get(url, params=params, headers=headers,
+                                        timeout=ClientTimeout(total=20)) as r:
+                raw = await r.read()
+                if r.status == 200:
+                    data = json.loads(_decode(raw, r.headers.get("Content-Encoding")))
+                    for it in data.get("Items") or []:
+                        info.learn(it)
+        except (ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            log.debug("noms introuvables : %s", exc)
+        for i in ids:                            # pas de nouvel essai en boucle
+            info.pending.pop(i, None)
 
     def build_app(self):
         app = web.Application(middlewares=[self.security_mw],
@@ -521,6 +1102,7 @@ class EmbyProxy:
         app.on_response_prepare.append(self.add_security_headers)
         app.router.add_get("/__proxy/", self.status_page)
         app.router.add_get("/__proxy/stats.json", self.status_json)
+        app.router.add_get("/__proxy/activity.json", self.activity_json)
         app.router.add_post("/__proxy/purge", self.purge)
         app.router.add_route("*", "/{tail:.*}", self.handle)
         return app
@@ -541,6 +1123,10 @@ class EmbyProxy:
             if refus[0] != 429:
                 log.info("refuse %s %s %s : %s", ip, request.method,
                          request.path, refus[1])
+                if self.activity:
+                    c = self.activity.identify(request)
+                    self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
+                        refus[1], request.method, request.path[:80]))
             return web.Response(status=refus[0], text=refus[1])
         return await handler(request)
 
@@ -585,9 +1171,26 @@ class EmbyProxy:
     async def proxy_http(self, request):
         url = self.cfg.upstream + request.raw_path
         data = request.content if request.body_exists else None
+        act, c, todo, tee = self.activity, None, [], False
+        headers = self._up_headers(request)
+        if act:
+            c = act.identify(request)
+            body_json = None
+            if request.method == "POST" and request.body_exists and (
+                    RE_PLAYING.match(request.path) or LOGIN_RE.match(request.path)) \
+                    and (request.content_length or 0) < 1_000_000:
+                data = await request.read()          # petit JSON : on le lit
+                try:
+                    body_json = json.loads(data or b"{}")
+                except ValueError:
+                    body_json = None
+            todo = act.before(c, request, body_json)
+            tee = act.wants_body(request)
+            if tee:
+                headers["Accept-Encoding"] = "gzip, deflate"
         try:
             up = await self.session.request(
-                request.method, url, headers=self._up_headers(request),
+                request.method, url, headers=headers,
                 data=data, allow_redirects=False)
         except (ClientError, asyncio.TimeoutError, OSError) as exc:
             self.stats.upstream_errors += 1
@@ -607,18 +1210,34 @@ class EmbyProxy:
                     v = self._rewrite_location(v, request)
                 resp.headers.add(k, v)
             await resp.prepare(request)
+            buf = bytearray() if tee and up.status == 200 and "json" in \
+                up.headers.get("Content-Type", "") else None
             if request.method != "HEAD":
                 async for chunk in up.content.iter_chunked(CHUNK):
                     await resp.write(chunk)
+                    if c is not None:
+                        c.bytes_out += len(chunk)
+                    if buf is not None and len(buf) < 8_000_000:
+                        buf.extend(chunk)
             await resp.write_eof()
+            if buf:
+                try:
+                    act.learn_response(c, request, json.loads(
+                        _decode(bytes(buf), up.headers.get("Content-Encoding"))))
+                except (ValueError, OSError, zlib.error):
+                    pass
             return resp
         except (ConnectionResetError, asyncio.CancelledError):
             raise                            # le client a ferme : on lache
         finally:
+            if act and todo:
+                act.after(c, todo, up.status)
             up.release()
 
     # -- WebSocket des applications Emby ----------------------------------
     async def proxy_ws(self, request):
+        if self.activity:
+            self.activity.identify(request)
         ws_url = re.sub(r"^http", "ws", self.cfg.upstream) + request.raw_path
         keep = {"cookie", "authorization", "x-emby-authorization", "x-emby-token",
                 "user-agent", "origin"}
@@ -768,10 +1387,19 @@ class EmbyProxy:
             "bans": self.guard.active_bans(),
             "cache_entries": c["entries"], "cache_bytes": c["bytes"],
             "cache_max_bytes": c["max_bytes"],
+            "active_users": sum(
+                1 for x in self.activity.clients.values()
+                if time.time() - x.last_seen < self.cfg.activity_idle_minutes * 60
+                and (x.user_id or x.client)) if self.activity else 0,
         }
 
     async def status_json(self, request):
         return web.json_response(self.snapshot())
+
+    async def activity_json(self, request):
+        if not self.activity:
+            return web.json_response({"clients": [], "feed": [], "disabled": True})
+        return web.json_response(self.activity.snapshot())
 
     async def purge(self, request):
         await asyncio.get_running_loop().run_in_executor(None, self.cache.clear)
@@ -782,32 +1410,124 @@ class EmbyProxy:
         return web.Response(text=STATUS_HTML, content_type="text/html")
 
 
-STATUS_HTML = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
+STATUS_HTML = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Emby Proxy</title><style>
-body{font:15px/1.5 system-ui,Segoe UI,sans-serif;background:#16181f;color:#e4e6ec;margin:0;padding:24px}
-h1{font-size:20px;margin:0 0 16px}.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
-.c{background:#1f222b;border:1px solid #2e323d;border-radius:8px;padding:12px}
-.l{color:#9aa0aa;font-size:12px}.v{font-size:22px;font-weight:600}
-button{margin-top:16px;background:#e94560;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer}
-pre{background:#1f222b;padding:10px;border-radius:8px}</style></head><body>
-<h1>Emby Proxy</h1><div class="g" id="g"></div>
-<h3>Adresses bannies</h3><pre id="b">-</pre>
-<button onclick="if(confirm('Vider le cache des vignettes ?'))fetch('purge',{method:'POST'}).then(r)">Vider le cache</button>
+:root{--bg:#16181f;--card:#1f222b;--line:#2e323d;--fg:#e4e6ec;--mut:#9aa0aa;--acc:#e94560;--ok:#2ecc71;--warn:#eb8c14;--bad:#e05555;--info:#5aaaeb}
+*{box-sizing:border-box}body{font:14px/1.45 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:18px 16px}
+h1{font-size:19px;margin:0 0 12px}h2{font-size:15px;margin:22px 0 10px}
+.tabs{display:flex;gap:6px;margin-bottom:14px}.tabs button{background:var(--card);color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:7px 14px;cursor:pointer;font:inherit}
+.tabs button.on{color:var(--fg);border-color:var(--acc)}
+.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+.users{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.c{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;min-width:0}
+.l{color:var(--mut);font-size:12px}.v{font-size:21px;font-weight:600}
+.name{font-size:16px;font-weight:600}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+.sub{color:var(--mut);font-size:12px;word-break:break-word}.tag{font-size:11px;padding:1px 6px;border-radius:9px;margin-left:6px;border:1px solid var(--line)}
+.play{margin-top:8px;padding:8px;border-radius:6px;background:#26303f}.bar{height:5px;background:#3a3f4d;border-radius:3px;margin-top:5px}.bar>i{display:block;height:100%;background:var(--acc);border-radius:3px}
+.loc{margin-top:8px}.ev{margin-top:8px;max-height:220px;overflow:auto;border-top:1px solid var(--line);padding-top:6px}
+.e{display:flex;gap:8px;font-size:12.5px;padding:1px 0}.e time{color:var(--mut);flex:none;width:58px}
+.k-browse{color:var(--fg)}.k-search{color:var(--info)}.k-play,.k-pause,.k-stop{color:var(--ok)}.k-delete,.k-badpass,.k-refused{color:var(--bad)}.k-fav,.k-played,.k-download,.k-login,.k-logout{color:var(--warn)}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+td,th{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:top}th{color:var(--mut);font-weight:500}
+.tw{overflow-x:auto}select,input{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
+.bar2{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+button.red{margin-top:16px;background:var(--acc);color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer}
+pre{background:var(--card);padding:10px;border-radius:8px;white-space:pre-wrap}.empty{color:var(--mut);padding:10px}
+</style></head><body>
+<h1>Emby Proxy</h1>
+<div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="cache">Cache &amp; sécurité</button></div>
+
+<section id="act">
+  <div class="sub" id="summary"></div>
+  <h2>Utilisateurs</h2>
+  <label class="sub"><input type="checkbox" id="showIdle"> afficher aussi les inactifs</label>
+  <div class="users" id="users" style="margin-top:10px"></div>
+  <h2>Journal d'activité</h2>
+  <div class="bar2">
+    <select id="fUser"><option value="">Tous les utilisateurs</option></select>
+    <select id="fKind"><option value="">Toutes les actions</option>
+      <option value="browse">Navigation</option><option value="search">Recherches</option>
+      <option value="play,pause,stop">Lectures</option><option value="fav,played,download">Favoris, vus, téléchargements</option>
+      <option value="delete,badpass,refused">Alertes (suppressions, mots de passe faux, refus)</option>
+      <option value="login,logout">Connexions</option></select>
+    <input id="fText" placeholder="Filtrer (titre, recherche...)">
+  </div>
+  <div class="tw"><table><thead><tr><th>Heure</th><th>Utilisateur</th><th>Appareil</th><th>Action</th></tr></thead><tbody id="feed"></tbody></table></div>
+</section>
+
+<section id="cache" hidden>
+  <div class="g" id="g"></div>
+  <h2>Adresses bannies</h2><pre id="b">-</pre>
+  <button class="red" id="purge">Vider le cache</button>
+</section>
+
 <script>
-const mo=b=>(b/1048576).toFixed(1)+' Mo';
-const F=[['Vignettes servies du cache','cache_hits'],['Demandees a Emby','cache_misses'],
-['Taux de cache','hit_ratio',v=>v+' %'],['Economise sur Emby','bytes_saved',mo],
+const $=id=>document.getElementById(id);
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
+const mo=b=>b>=1073741824?(b/1073741824).toFixed(2)+' Go':(b/1048576).toFixed(1)+' Mo';
+const ago=s=>s==null?'':s<60?'il y a '+s+' s':s<3600?'il y a '+Math.floor(s/60)+' min':'il y a '+Math.floor(s/3600)+' h '+Math.floor(s%3600/60)+' min';
+const hm=t=>new Date(t*1000).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const day=t=>new Date(t*1000).toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
+  $('act').hidden=b.dataset.t!=='act';$('cache').hidden=b.dataset.t!=='cache';});
+
+function userCard(u){
+  const c=el('div','c');
+  const top=el('div');const dot=el('span','dot');dot.style.background=u.playing?'var(--ok)':u.active?'var(--info)':'#555';
+  top.append(dot,el('span','name',u.user));
+  const t=el('span','tag',u.local?'réseau local':'Internet');t.style.color=u.local?'var(--mut)':'var(--warn)';top.append(t);
+  c.append(top);
+  c.append(el('div','sub',[u.client,u.device,u.version&&('v'+u.version)].filter(Boolean).join(' · ')||u.user_agent||'application inconnue'));
+  c.append(el('div','sub','IP '+u.ip+' · connecté depuis '+day(u.first_seen)+' · dernière action '+ago(u.idle_s)));
+  c.append(el('div','sub',u.requests+' requêtes · '+mo(u.bytes_out)+' reçus'));
+  if(u.playing){const p=u.playing,b=el('div','play');
+    b.append(el('div',null,(p.paused?'⏸ En pause : ':'▶ Regarde : ')+p.title));
+    b.append(el('div','sub',p.pos+(p.duration?' / '+p.duration:'')+(p.percent!=null?' ('+p.percent+' %)':'')+' · '+p.mode+' · depuis '+ago(p.since).replace('il y a ','')));
+    if(p.percent!=null){const bar=el('div','bar'),i=el('i');i.style.width=Math.min(100,p.percent)+'%';bar.append(i);b.append(bar)}
+    c.append(b)}
+  if(u.location){const l=el('div','loc');l.append(el('span','l','Où : '),el('span',null,u.location),el('span','sub','  '+ago(u.location_s)));c.append(l)}
+  if(u.events.length){const ev=el('div','ev');
+    u.events.forEach(e=>{const r=el('div','e k-'+e.kind);r.append(el('time',null,hm(e.t)),el('span',null,e.text));ev.append(r)});c.append(ev)}
+  return c}
+
+let last=null;
+function renderAct(d){
+  last=d;const showIdle=$('showIdle').checked;
+  const list=d.clients.filter(u=>showIdle||u.active||u.playing);
+  const playing=d.clients.filter(u=>u.playing).length,active=d.clients.filter(u=>u.active).length;
+  $('summary').textContent=active+' connecté(s) · '+playing+' en lecture · '+d.clients.length+' vu(s) ces dernières heures';
+  const box=$('users');box.replaceChildren(...(list.length?list.map(userCard):[el('div','empty',"Personne n'est connecté en ce moment.")]));
+  const sel=$('fUser'),cur=sel.value,names=[...new Set(d.feed.map(f=>f.user))].sort();
+  sel.replaceChildren(el('option',null,'Tous les utilisateurs'),...names.map(n=>{const o=el('option',null,n);o.value=n;return o}));
+  sel.firstChild.value='';sel.value=names.includes(cur)?cur:'';
+  renderFeed()}
+function renderFeed(){
+  if(!last)return;const u=$('fUser').value,k=$('fKind').value.split(',').filter(Boolean),q=$('fText').value.toLowerCase();
+  const rows=last.feed.filter(f=>(!u||f.user===u)&&(!k.length||k.includes(f.kind))&&(!q||f.text.toLowerCase().includes(q)));
+  $('feed').replaceChildren(...(rows.length?rows.map(f=>{const tr=el('tr','k-'+f.kind);
+    tr.append(el('td',null,day(f.t)),el('td',null,f.user),el('td','sub',f.device),el('td',null,f.text));return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune action.');td.colSpan=4;tr.append(td);return tr})()]))}
+['fUser','fKind'].forEach(i=>$(i).onchange=renderFeed);$('fText').oninput=renderFeed;$('showIdle').onchange=()=>last&&renderAct(last);
+
+const F=[['Vignettes servies du cache','cache_hits'],['Demandées à Emby','cache_misses'],
+['Taux de cache','hit_ratio',v=>v+' %'],['Économisé sur Emby','bytes_saved',mo],
 ['Vignettes en cache','cache_entries'],['Taille du cache','cache_bytes',mo],
-['Perimees servies (Emby HS)','stale_served'],['Requetes','requests'],
-['Requetes bloquees','blocked'],['Erreurs Emby','upstream_errors'],['WebSocket ouverts','websockets'],
+['Périmées servies (Emby HS)','stale_served'],['Requêtes','requests'],
+['Requêtes bloquées','blocked'],['Erreurs Emby','upstream_errors'],['WebSocket ouverts','websockets'],
+['Utilisateurs actifs','active_users'],
 ['En service depuis','uptime_s',v=>Math.floor(v/3600)+' h '+Math.floor(v%3600/60)+' min']];
-function r(){fetch('stats.json').then(x=>x.json()).then(d=>{
-document.getElementById('g').innerHTML=F.map(([l,k,f])=>'<div class=c><div class=l>'+l+
-'</div><div class=v>'+(f?f(d[k]):d[k])+'</div></div>').join('');
-const b=Object.entries(d.bans);document.getElementById('b').textContent=
-b.length?b.map(([ip,s])=>ip+'  encore '+Math.ceil(s/60)+' min').join('\\n'):'aucune';});}
-r();setInterval(r,3000);</script></body></html>"""
+function renderStats(d){
+  $('g').replaceChildren(...F.map(([l,k,f])=>{const c=el('div','c');c.append(el('div','l',l),el('div','v',f?f(d[k]):String(d[k])));return c}));
+  const b=Object.entries(d.bans);$('b').textContent=b.length?b.map(([ip,s])=>ip+'  encore '+Math.ceil(s/60)+' min').join('\n'):'aucune'}
+$('purge').onclick=()=>{if(confirm('Vider le cache des vignettes ?'))fetch('purge',{method:'POST'}).then(tick)};
+function tick(){
+  fetch('activity.json').then(r=>r.json()).then(renderAct).catch(()=>{});
+  fetch('stats.json').then(r=>r.json()).then(renderStats).catch(()=>{})}
+tick();setInterval(tick,3000);
+</script></body></html>
+"""
 
 
 # =====================================================================
@@ -895,7 +1615,8 @@ def run_gui(cfg):
     tk.Label(root, text="%s://%s:%d  ->  %s" % (scheme, cfg.listen_host,
                                                  cfg.listen_port, cfg.upstream),
              fg=mut, bg=bg).grid(row=1, column=0, columnspan=2, sticky="w", padx=14)
-    rows = [("Etat", "state"), ("Vignettes servies du cache", "hits"),
+    rows = [("Etat", "state"), ("Utilisateurs actifs", "users"),
+            ("Vignettes servies du cache", "hits"),
             ("Demandees a Emby", "misses"), ("Taux de cache", "ratio"),
             ("Economise sur Emby", "saved"), ("Cache sur disque", "cache"),
             ("Requetes bloquees", "blocked"), ("Adresses bannies", "bans")]
@@ -917,8 +1638,8 @@ def run_gui(cfg):
         stop.set()
         root.after(600, root.destroy)
 
-    tk.Button(bar, text="Page d'etat", command=lambda: webbrowser.open(status_url)
-              ).pack(side="left")
+    tk.Button(bar, text="Activite / page d'etat",
+              command=lambda: webbrowser.open(status_url)).pack(side="left")
     tk.Button(bar, text="Vider le cache", command=purge).pack(side="left", padx=8)
     tk.Button(bar, text="Arreter", command=quit_).pack(side="left")
     root.protocol("WM_DELETE_WINDOW", quit_)
@@ -929,6 +1650,7 @@ def run_gui(cfg):
             vals["state"].config(text="ARRETE : %s" % errors[0], fg="#e05555")
         else:
             vals["state"].config(text="en service", fg="#2ecc71")
+        vals["users"].config(text=str(d["active_users"]))
         vals["hits"].config(text=str(d["cache_hits"]))
         vals["misses"].config(text=str(d["cache_misses"]))
         vals["ratio"].config(text="%s %%" % d["hit_ratio"])
