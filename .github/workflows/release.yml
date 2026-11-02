@@ -1,11 +1,17 @@
 # Version compilee pour Windows : emby_proxy.exe + service Windows (WinSW).
-# Se declenche quand on pousse une etiquette vX.Y.Z (ou a la main).
+# Se declenche quand on pousse une etiquette vX.Y.Z, ou a la main
+# (onglet Actions > Version Windows > Run workflow, avec un numero de version).
 name: Version Windows
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Numero de version a publier (ex. 2.0.0) ; vide = simple essai"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -57,9 +63,12 @@ jobs:
       - name: Archive
         shell: pwsh
         run: |
-          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME }
+                 elseif ("${{ github.event.inputs.version }}") { "v${{ github.event.inputs.version }}" }
+                 else { "dev" }
           Compress-Archive -Path dist\EmbyProxy -DestinationPath "EmbyProxy-$tag-windows.zip"
           "ZIP=EmbyProxy-$tag-windows.zip" | Out-File -Append $env:GITHUB_ENV
+          "TAG=$tag" | Out-File -Append $env:GITHUB_ENV
 
       # --- essais reels sur Windows, dans une copie (l'archive reste vierge) ---
       - name: Essai - chiffrement DPAPI de la cle API
@@ -108,15 +117,17 @@ jobs:
           path: ${{ env.ZIP }}
 
       - name: Publication (Releases)
-        if: github.ref_type == 'tag'
+        if: env.TAG != 'dev'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
           files: ${{ env.ZIP }}
-          name: Emby Proxy ${{ github.ref_name }} pour Windows
+          name: Emby Proxy ${{ env.TAG }} pour Windows
           body: |
             Version compilee pour Windows, avec installation en service.
 
-            1. Telecharge EmbyProxy-${{ github.ref_name }}-windows.zip ci-dessous.
+            1. Telecharge EmbyProxy-${{ env.TAG }}-windows.zip ci-dessous.
             2. Decompresse-le dans C:\EmbyProxy.
             3. Double-clic sur installer_service.bat.
             4. Page d'administration : http://localhost:8098/
