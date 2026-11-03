@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.10"
+__version__ = "2.6.11"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -4763,9 +4763,20 @@ class EmbyProxy:
             self._public_origin(request)
         protos = [x.strip() for x in request.headers.get(
             "Sec-WebSocket-Protocol", "").split(",") if x.strip()]
+        self._note_request(wc, request, 0, t_ws, "  [WebSocket : ouverture aupres d'Emby...]")
         try:
-            up = await self.session.ws_connect(ws_url, headers=headers,
-                                               protocols=protos, autoping=True)
+            # jamais d'attente sans fin si Emby ne repond pas a l'ouverture ;
+            # pas de compression (Emby n'en fait pas : meme comportement)
+            up = await asyncio.wait_for(self.session.ws_connect(
+                ws_url, headers=headers, protocols=protos, autoping=True,
+                compress=0, max_msg_size=16 * 1024 * 1024), self.WS_OPEN_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._note_request(wc, request, 504, t_ws,
+                               "  [WebSocket : Emby n'a pas repondu en 20 s]")
+            self.stats.upstream_errors += 1
+            log.warning("WebSocket : Emby ne repond pas a l'ouverture (%s)",
+                        _safe(request.path))
+            return web.Response(status=504, text="Serveur Emby injoignable.")
         except WSServerHandshakeError as exc:          # cle refusee par Emby
             self._note_request(wc, request, exc.status, t_ws, "  [WebSocket refuse par Emby]")
             if exc.status in (401, 403):
@@ -4774,13 +4785,15 @@ class EmbyProxy:
             self.stats.upstream_errors += 1
             log.warning("WebSocket Emby refuse : %s", exc)
             return web.Response(status=502, text="Serveur Emby injoignable.")
-        except (ClientError, asyncio.TimeoutError, OSError) as exc:
-            self._note_request(wc, request, 502, t_ws, "  [WebSocket : Emby injoignable]")
+        except (ClientError, OSError) as exc:
+            self._note_request(wc, request, 502, t_ws, "  [WebSocket : Emby injoignable : %s]"
+                               % _safe(str(exc), 80))
             self.stats.upstream_errors += 1
             log.warning("WebSocket Emby injoignable : %s", exc)
             return web.Response(status=502, text="Serveur Emby injoignable.")
         self._mark_authenticated(request)       # Emby a accepte la cle de session
-        ws = web.WebSocketResponse(autoping=True,
+        ws = web.WebSocketResponse(autoping=True, compress=False,
+                                   max_msg_size=16 * 1024 * 1024,
                                    protocols=[up.protocol] if up.protocol else ())
         await ws.prepare(request)
         self.stats.ws_open += 1
@@ -4806,8 +4819,12 @@ class EmbyProxy:
                                  return_exceptions=True)
         finally:
             if wc is not None:
-                wc.recent.append((time.time(), "WS", "fermee apres %d s" % int(
-                    time.time() - t_ws), 0, int((time.time() - t_ws) * 1000)))
+                why = ("par l'appli" if ws.closed and not up.closed else
+                       "par Emby" if up.closed and not ws.closed else "")
+                code = ws.close_code if ws.close_code is not None else up.close_code
+                wc.recent.append((time.time(), "WS", "fermee apres %d s %s(code %s)" % (
+                    int(time.time() - t_ws), why + " " if why else "", code), 0,
+                    int((time.time() - t_ws) * 1000)))
             self.stats.ws_open -= 1
             if dev:
                 self.ws_by_device.get(dev, set()).discard(ws)
@@ -4816,6 +4833,8 @@ class EmbyProxy:
             if not up.closed:
                 await up.close()
         return ws
+
+    WS_OPEN_TIMEOUT = 20        # secondes pour qu'Emby accepte un WebSocket
 
     # -- messages de quota envoyes en direct (sans l'API d'Emby) ----------
     async def push_message(self, device_id, header, text, timeout_ms=None,
