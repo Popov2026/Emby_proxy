@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -102,6 +102,7 @@ DEFAULTS = {
         "denied_networks": "",
         "local_networks": PRIVATE_NETS,
         "block_admin_from_internet": "true",
+        "ban_scanners": "true",
         "login_max_failures": "5",
         "login_window_minutes": "15",
         "ban_minutes": "60",
@@ -485,6 +486,7 @@ class Settings:
         self.denied = _nets(s.get("denied_networks"))
         self.local = _nets(s.get("local_networks"))
         self.block_admin = s.getboolean("block_admin_from_internet")
+        self.ban_scanners = s.getboolean("ban_scanners")
         self.login_max = s.getint("login_max_failures")
         self.login_window = s.getfloat("login_window_minutes") * 60
         self.ban_seconds = s.getfloat("ban_minutes") * 60
@@ -619,6 +621,9 @@ local_networks = %s
 # Refuser l'administration d'Emby (tableau de bord, redemarrage, cles API,
 # plugins...) depuis toute adresse hors du reseau local.
 block_admin_from_internet = true
+# Bannir aussitot une adresse d'Internet qui cherche des failles (.env,
+# wp-config, .git, .php...) : ces fichiers n'existent jamais sur Emby.
+ban_scanners = true
 # Mots de passe faux : bannissement de l'adresse IP.
 login_max_failures = 5
 login_window_minutes = 15
@@ -813,6 +818,11 @@ CONFIG_SCHEMA = [
         {"sec": "security", "key": "block_admin_from_internet", "type": "bool",
          "live": True, "label": "Bloquer l'administration d'Emby depuis Internet",
          "help": ""},
+        {"sec": "security", "key": "ban_scanners", "type": "bool", "live": True,
+         "label": "Bannir aussitôt les robots qui cherchent des failles",
+         "help": "Une adresse d'Internet qui demande .env, wp-config, .git, .php… "
+                 "(fichiers qui n'existent jamais sur Emby) est bannie dès sa "
+                 "première tentative, pour la durée de bannissement ci-dessous."},
         {"sec": "security", "key": "login_max_failures", "type": "int", "min": 1,
          "max": 100, "live": True, "label": "Mots de passe faux avant bannissement",
          "help": ""},
@@ -918,7 +928,8 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "burst", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
-              "language", "forward_ip", "landing_page", "quota_delivery")
+              "language", "forward_ip", "landing_page", "quota_delivery",
+              "ban_scanners")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -1175,6 +1186,19 @@ ADMIN_RE = re.compile(
     # public, demande par les applis iPhone / Android avant meme le login)
     r"Encoding|Backup"
     r")(?![A-Za-z0-9])", re.I)
+# Recherches de failles des robots d'Internet : fichiers qui n'existent jamais
+# sur Emby (configuration d'autres logiciels, sauvegardes, scripts PHP...).
+SCANNER_RE = re.compile(
+    r"(?:^|/)\.(?:env|git|svn|hg|bzr|aws|ssh|docker|vscode|idea|htaccess|htpasswd|"
+    r"ds_store|npmrc|travis|circleci|well-known/acme-challenge/\.\.)(?:$|[/.~])"
+    r"|(?:^|/)wp-(?:admin|login|config|content|includes|json|cron)"
+    r"|\.(?:php\d?|phtml|asp|aspx|ashx|jsp|jspx|cgi|bak|old|orig|save|swp|sql|"
+    r"sqlite|tgz|rar|7z|pem|key|env)$"
+    r"|(?:^|/)(?:phpmyadmin|myadmin|pma|cgi-bin|actuator|boaform|hnap1|xmlrpc|"
+    r"solr|telescope|_profiler|server-status|owa|autodiscover|"
+    r"vendor/(?:composer|phpunit)|storage/logs|web\.config|"
+    r"(?:credentials|secrets|dump|backup)\.(?:json|txt|xml|zip|tar|gz))(?:$|/)",
+    re.I)
 LOGIN_RE = re.compile(r"^/Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$", re.I)
 
 
@@ -2831,7 +2855,7 @@ class EmbyProxy:
     # -- evenements -> alertes par mail -------------------------------------
     def _security_event(self, e):
         t, ip, who = e["type"], e["ip"], e.get("user") or "?"
-        if t == "ban":
+        if t == "ban" and not str(e.get("detail", "")).startswith("robot"):
             self.alerts.add("on_ban", "Adresse bannie : %s" % ip,
                             "%s ; nom tape : %s" % (e.get("detail", ""), who))
         elif t == "login_ok" and not e.get("local"):
@@ -3140,6 +3164,9 @@ class EmbyProxy:
             # administrateur deja connecte : jamais bloque par un bannissement
             # (sinon impossible de debannir sa propre adresse)
             return await self._status_gate(request, handler, ip)
+        if getattr(self.cfg, "ban_scanners", True) and (
+                SCANNER_RE.search(np) or SCANNER_RE.search(request.path)):
+            return self._scanner(request, ip)
         refus = self.guard.check(ip, np)
         remote = request.remote or ""
         if not refus and self.cfg.trusted and self.cfg.require_relay \
@@ -3155,20 +3182,22 @@ class EmbyProxy:
                 self.seclog.add("refused", ip, self.guard.is_local(ip),
                                 client=f.get("client", ""), device=f.get("device", ""),
                                 detail=refus[1])
-                if self.activity:
-                    c = self._device_card(request)
+                c = self._device_card(request)
+                if c is not None:
                     self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
                         refus[1], request.method, request.path[:80]), merge=60)
             else:
                 log.info("refuse %s %s %s : %s", ip, _safe(request.method, 10),
                          _safe(request.path), refus[1])
                 f = Activity._auth_fields(request)
+                banned = refus[1].startswith("Adresse bannie")
                 self.seclog.add("refused", ip, self.guard.is_local(ip),
                                 client=f.get("client", ""), device=f.get("device", ""),
-                                detail="%s (%s %s)" % (refus[1], request.method,
-                                                       request.path[:80]))
-                if self.activity:
-                    c = self._device_card(request)
+                                # adresse bannie : une ligne comptee, pas une par page
+                                detail=refus[1] if banned else "%s (%s %s)" % (
+                                    refus[1], request.method, request.path[:80]))
+                c = self._device_card(request)
+                if c is not None:
                     self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
                         refus[1], request.method, request.path[:80]))
             return web.Response(status=refus[0], text=refus[1])
@@ -3302,11 +3331,33 @@ class EmbyProxy:
                             headers={"Cache-Control": "no-store"})
 
     def _device_card(self, request):
-        """Fiche de l'appareil pour une requete refusee par le proxy : la vraie
-        fiche si son jeton a deja ete accepte par Emby, sinon une fiche a part."""
+        """Fiche de l'appareil pour une requete refusee par le proxy : seulement
+        si son jeton a deja ete accepte par Emby (un vrai utilisateur). Robots
+        et inconnus : onglet Securite seulement, pas de fiche."""
+        if not self.activity:
+            return None
         tok = Activity._auth_fields(request).get("token", "")
-        return self.activity.identify(
-            request, trusted=bool(tok) and tok in self.activity.token_user)
+        if not tok or tok not in self.activity.token_user:
+            return None
+        return self.activity.identify(request, trusted=True)
+
+    def _scanner(self, request, ip):
+        """Robot qui cherche des failles : banni des sa premiere tentative
+        (jamais une adresse du reseau local, qui peut etre le relais HTTPS)."""
+        self.guard.blocked += 1
+        if not self.guard.is_local(ip):
+            key = self.guard.key(ip)
+            first = self.guard.banned.get(key, 0) <= time.time()
+            self.guard.banned[key] = time.time() + self.cfg.ban_seconds
+            if first:
+                self.seclog.add("ban", ip, False,
+                                client=request.headers.get("User-Agent", "")[:60],
+                                detail="robot : recherche de failles (%s %s)" % (
+                                    _safe(request.method, 10), _safe(request.path, 80)),
+                                ban_key=key)
+                log.warning("robot banni : %s (%s %s)", ip, _safe(request.method, 10),
+                            _safe(request.path))
+        return web.Response(status=404, text="Not found")
 
     async def handle(self, request):
         if request.method == "GET" and request.path in ("/", "/emby", "/emby/") \
@@ -3491,7 +3542,8 @@ class EmbyProxy:
         finally:
             if act and todo:
                 act.after(c, todo, up.status)
-            if act and c is not None and up.status >= 400 and not is_login \
+            if act and c is not None and c.user_id and up.status >= 400 \
+                    and not is_login \
                     and not any(k in ("pbinfo", "stream", "login", "delete")
                                 for k, _ in todo):
                 # toute autre erreur d'Emby : visible dans la fiche de l'appareil

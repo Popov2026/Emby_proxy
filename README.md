@@ -49,6 +49,7 @@ right).
 |---|---|
 | **Emby administration blocked from the Internet** | Dashboard, restart, API keys, plugins, users… refused outside the local network, however the address is written (`//emby/…`, `/mediabrowser/…`, `%2F`, `;…`, `..`). Button at the top of the page to allow / block it instantly. What normal apps need (login page, wake-on-LAN info, photo upload) stays allowed. |
 | **Wrong passwords** | 5 failures in 15 min ⇒ IP address banned for 1 hour |
+| **Robots banned at once** | an Internet address looking for security holes (`.env`, `wp-config`, `.git`, `.php`…, files that never exist on Emby) is banned at its first attempt, never reaches Emby, gets no Activity card and triggers no mail (Security tab only) |
 | **Protected admin page** | **separate port** (8098): a flaw in Emby's web interface cannot reach it; local network **and** password; protected against malicious sites and framing; ban after wrong passwords |
 | **Activity cannot be faked** | an action is attributed to a user only if Emby accepted the request |
 | **IPv6** | bans and rate limits per /64 block |
@@ -312,6 +313,7 @@ anglais** (bouton en haut à droite).
 |---|---|
 | **Administration d'Emby bloquée depuis Internet** | Tableau de bord, redémarrage, clés API, plugins, utilisateurs… refusés hors du réseau local, quelle que soit l'écriture de l'adresse (`//emby/…`, `/mediabrowser/…`, `%2F`, `;…`, `..`). Bouton en haut de la page pour l'autoriser / l'interdire tout de suite. Ce dont les applis ordinaires ont besoin (page de connexion, réveil du serveur, envoi des photos) reste autorisé. |
 | **Mots de passe faux** | 5 échecs en 15 min ⇒ adresse IP bannie 1 heure |
+| **Robots bannis aussitôt** | une adresse d'Internet qui cherche des failles (`.env`, `wp-config`, `.git`, `.php`…, fichiers qui n'existent jamais sur Emby) est bannie dès sa première tentative, n'atteint jamais Emby, n'a pas de fiche dans l'Activité et ne déclenche pas de mail (onglet Sécurité seulement) |
 | **Page d'administration protégée** | **port à part** (8098) : une faille de l'interface web d'Emby ne peut pas l'atteindre ; réseau local **et** mot de passe ; protégée contre les sites piégés ; bannissement après mots de passe faux |
 | **Activité non falsifiable** | une action n'est attribuée à un utilisateur que si Emby a accepté sa requête |
 | **IPv6** | bannissement et débit par bloc /64 |

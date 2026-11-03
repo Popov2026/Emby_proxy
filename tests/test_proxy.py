@@ -440,7 +440,10 @@ async def test_activite_mot_de_passe_faux_et_refus(env):
     await c.get("/emby/System/Configuration?" + q())
     texts = [e["text"] for e in proxy.activity.snapshot()["clients"][0]["events"]]
     assert "Mot de passe faux pour Paul" in texts
-    assert any(t.startswith("Refuse : Administration") for t in texts)
+    # visiteur sans compte valable : le refus va dans l'onglet Securite seulement
+    assert not any(t.startswith("Refuse : Administration") for t in texts)
+    assert any(e["type"] == "refused" and e["detail"].startswith("Administration")
+               for e in proxy.seclog.events)
 
 
 async def test_activite_desactivable(env):

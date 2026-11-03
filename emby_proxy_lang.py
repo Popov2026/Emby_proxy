@@ -335,6 +335,13 @@ EN = {
         "Refuse Internet connections that do not go through the relay",
     "Sinon elles contourneraient son HTTPS. Le réseau local reste accepté.":
         "Otherwise they would bypass its HTTPS. The local network stays accepted.",
+    "Bannir aussitôt les robots qui cherchent des failles":
+        "Ban at once robots looking for security holes",
+    "Une adresse d'Internet qui demande .env, wp-config, .git, .php… (fichiers qui "
+    "n'existent jamais sur Emby) est bannie dès sa première tentative, pour la durée "
+    "de bannissement ci-dessous.":
+        "An Internet address asking for .env, wp-config, .git, .php… (files that never "
+        "exist on Emby) is banned at its first attempt, for the ban duration below.",
     "Bloquer l'administration d'Emby depuis Internet":
         "Block Emby administration from the Internet",
     "Mots de passe faux avant bannissement": "Wrong passwords before a ban",
@@ -689,6 +696,7 @@ PATTERNS = [
     (r"^Pause : (.*)$", "Paused: $1"),
     (r"^Reprise : (.*)$", "Resumed: $1"),
     (r"^Refuse : (.*)$", "Refused: {1}"),
+    (r"^robot : recherche de failles \((.*)\)$", "robot: looking for security holes ($1)"),
     (r"^Message de quota \((direct|API)\) : (.*)$", "Quota message ($1): $2"),
     (r"^Erreur Emby HTTP (\d+) : (\S+) (.*)$", "Emby error HTTP $1: $2 $3"),
     (r"^Demande de lecture : (.*) → (.*)$", "Playback request: $1 → {2}"),
