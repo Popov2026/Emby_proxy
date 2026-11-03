@@ -14,7 +14,20 @@ import emby_proxy as ep
 
 import tempfile
 D = tempfile.mkdtemp(prefix="emby_proxy_attack_")
-EMBY, USERS, ADMINP = 39096, 39097, 39098
+def _free_ports(n):
+    """Ports libres choisis par le systeme (jamais de port fixe : sur une
+    machine partagee, il peut etre pris par une autre connexion)."""
+    import socket as _s
+    socks = [_s.socket() for _ in range(n)]
+    for k in socks:
+        k.bind(("127.0.0.1", 0))
+    ports = [k.getsockname()[1] for k in socks]
+    for k in socks:
+        k.close()
+    return ports
+
+
+EMBY, USERS, ADMINP = _free_ports(3)
 ADMIN_UID, USER_UID = "a" * 32, "b" * 32
 TOKENS = {"TOKADMIN": ADMIN_UID, "TOKUSER": USER_UID}
 reached = []          # ce que le faux Emby a recu des attaquants
@@ -283,7 +296,7 @@ async def main():
         print("\n11) Fuite d'informations")
         async with s.get(U + "/emby/System/Info/Public", headers=H("leak")) as resp:
             body = await resp.text()
-            check("adresse reelle d'Emby jamais devoilee", "10.9.9.9" not in body and "39096" not in body, body[:80])
+            check("adresse reelle d'Emby jamais devoilee", "10.9.9.9" not in body and str(EMBY) not in body, body[:80])
             check("en-tete Server retire", "Server" not in resp.headers or "Python" not in resp.headers.get("Server", ""), resp.headers.get("Server", ""))
 
     ok = sum(1 for _, o, _ in results if o)

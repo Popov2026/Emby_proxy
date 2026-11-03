@@ -18,7 +18,20 @@ from aiohttp import web, ClientSession, CookieJar, WSMsgType
 import emby_proxy as ep
 
 D = tempfile.mkdtemp(prefix="emby_proxy_func_")
-EMBY, USERS, ADMINP = 39196, 39197, 39198
+def _free_ports(n):
+    """Ports libres choisis par le systeme (jamais de port fixe : sur une
+    machine partagee, il peut etre pris par une autre connexion)."""
+    import socket as _s
+    socks = [_s.socket() for _ in range(n)]
+    for k in socks:
+        k.bind(("127.0.0.1", 0))
+    ports = [k.getsockname()[1] for k in socks]
+    for k in socks:
+        k.close()
+    return ports
+
+
+EMBY, USERS, ADMINP = _free_ports(3)
 UID, TOK, APIKEY, DEV = "c" * 32, "TOKPAUL", "CLEAPI", "dev-paul"
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
                     "1f15c4890000000d49444154789c6360000002000100e221bc330000000049454e44ae426082")
