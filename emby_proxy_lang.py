@@ -399,6 +399,15 @@ EN = {
     "Réglages et suivi : onglet Quotas. Nécessite la clé API Emby.":
         "Settings and tracking: Quotas tab. Requires the Emby API key.",
     "Fichier des réglages de quotas": "Quota settings file",
+    "Envoi des messages de quota": "Sending of quota messages",
+    "API : Emby les envoie (POST /Sessions/…/Message). DIRECT : le proxy écrit "
+    "lui-même le message dans la connexion en direct (WebSocket) de l'appli, sans "
+    "passer par l'API d'Emby ; un appareil qui n'est pas connecté par le proxy le "
+    "reçoit quand même par l'API.":
+        "API: Emby sends them (POST /Sessions/…/Message). DIRECT: the proxy writes "
+        "the message itself into the app's live connection (WebSocket), without "
+        "Emby's API; a device not connected through the proxy still gets it "
+        "through the API.",
     "Base des compteurs": "Counter database",
     "Journal technique": "Technical log",
     "Fichier": "File",
@@ -680,6 +689,7 @@ PATTERNS = [
     (r"^Pause : (.*)$", "Paused: $1"),
     (r"^Reprise : (.*)$", "Resumed: $1"),
     (r"^Refuse : (.*)$", "Refused: {1}"),
+    (r"^Message de quota \((direct|API)\) : (.*)$", "Quota message ($1): $2"),
     (r"^Erreur Emby HTTP (\d+) : (\S+) (.*)$", "Emby error HTTP $1: $2 $3"),
     (r"^Demande de lecture : (.*) → (.*)$", "Playback request: $1 → {2}"),
     (r"^Emby : (.*) → (.*)$", "Emby: $1 → {2}"),

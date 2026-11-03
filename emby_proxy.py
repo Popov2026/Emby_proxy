@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -147,6 +147,7 @@ DEFAULTS = {
         "enabled": "false",
         "file": "emby_quota.ini",
         "db_file": "emby_quota.db",
+        "message_delivery": "API",
     },
     "activity": {
         "enabled": "true",
@@ -512,6 +513,9 @@ class Settings:
         self.alerts["smtp_password"] = self._secret(cp, "alerts", "smtp_password")
         qs = cp["quotas"]
         self.quotas_enabled = qs.getboolean("enabled")
+        self.quota_delivery = (qs.get("message_delivery") or "API").strip().upper()
+        if self.quota_delivery not in ("API", "DIRECT"):
+            self.quota_delivery = "API"
         self.quotas_file = self._path(base, qs.get("file")) or base / "emby_quota.ini"
         self.quotas_db = self._path(base, qs.get("db_file")) or base / "emby_quota.db"
 
@@ -683,6 +687,9 @@ batch_minutes = 2
 enabled = false
 file = emby_quota.ini
 db_file = emby_quota.db
+# Envoi des messages de quota : API (par Emby) ou DIRECT (le proxy les ecrit
+# lui-meme dans la connexion en direct de l'appli ; sinon par l'API).
+message_delivery = API
 
 [activity]
 # Suivi de ce que font les utilisateurs (page d'etat, onglet Activite).
@@ -882,6 +889,13 @@ CONFIG_SCHEMA = [
         {"sec": "quotas", "key": "enabled", "type": "bool", "live": True,
          "label": "Activer les quotas de lecture par utilisateur",
          "help": "Réglages et suivi : onglet Quotas. Nécessite la clé API Emby."},
+        {"sec": "quotas", "key": "message_delivery", "type": "choice",
+         "choices": ["API", "DIRECT"], "live": True,
+         "label": "Envoi des messages de quota",
+         "help": "API : Emby les envoie (POST /Sessions/…/Message). DIRECT : le "
+                 "proxy écrit lui-même le message dans la connexion en direct "
+                 "(WebSocket) de l'appli, sans passer par l'API d'Emby ; un appareil "
+                 "qui n'est pas connecté par le proxy le reçoit quand même par l'API."},
         {"sec": "quotas", "key": "file", "type": "text", "live": False,
          "label": "Fichier des réglages de quotas", "help": ""},
         {"sec": "quotas", "key": "db_file", "type": "text", "live": False,
@@ -904,7 +918,7 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "burst", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
-              "language", "forward_ip", "landing_page")
+              "language", "forward_ip", "landing_page", "quota_delivery")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -2309,6 +2323,7 @@ class QuotaService:
         self.thread = None
         self.error = ""
         self.notify = None               # alertes par mail (posee par le proxy)
+        self.pusher = None               # envoi direct par WebSocket (proxy)
         self._lock = threading.Lock()
 
     # -- fichier de reglages -------------------------------------------
@@ -2346,8 +2361,8 @@ class QuotaService:
                 self.qcfg = self._load()
                 if self.store is None:
                     self.store = _NotifyingStore(self.eq, str(self.pcfg.quotas_db), self)
-                api = self.eq.EmbyApi(self.qcfg.url, self.qcfg.api_key,
-                                      self.qcfg.http_timeout)
+                api = _RoutedApi(self.eq.EmbyApi(self.qcfg.url, self.qcfg.api_key,
+                                                 self.qcfg.http_timeout), self)
                 self.monitor = self.eq.Monitor(self.qcfg, api, self.store)
             except Exception as exc:
                 self.error = "reglages des quotas illisibles : %s" % exc
@@ -2553,6 +2568,44 @@ class QuotaService:
         return self.monitor.greet_now(user_name or "", journalise=True)
 
 
+class _RoutedApi:
+    """L'API Emby du moteur de quotas, dont les messages peuvent partir en
+    DIRECT : le proxy les ecrit lui-meme dans la connexion WebSocket de
+    l'appli, exactement comme Emby le ferait. Appareil absent du proxy (ou
+    mode API) : envoi normal par l'API d'Emby."""
+
+    def __init__(self, api, service):
+        self._api = api
+        self._svc = service
+        self._device = {}                # session Emby -> identifiant d'appareil
+
+    def __getattr__(self, name):
+        return getattr(self._api, name)
+
+    def sessions(self):
+        found = self._api.sessions()
+        for s in found or []:
+            if isinstance(s, dict) and s.get("Id"):
+                self._device[s["Id"]] = s.get("DeviceId") or ""
+        return found
+
+    def send_message(self, session_id, header, text, timeout_ms, route="message"):
+        dev = self._device.get(session_id, "")
+        if self._svc.pcfg.quota_delivery == "DIRECT" and self._svc.pusher and dev:
+            try:
+                if self._svc.pusher(dev, header, text, timeout_ms):
+                    return None
+            except Exception:
+                log.exception("quotas : envoi direct")
+        self._api.send_message(session_id, header, text, timeout_ms, route)
+        if self._svc.pusher and dev:
+            try:
+                self._svc.pusher(dev, header, text, timeout_ms, via_api=True)
+            except Exception:
+                pass
+        return None
+
+
 class _NotifyingStore:
     """La base de quotas, dont chaque evenement (coupure, desactivation...)
     peut declencher une alerte par mail."""
@@ -2729,6 +2782,8 @@ class EmbyProxy:
         self.alerts = Alerts(cfg)
         self.quota = QuotaService(cfg)
         self.quota.notify = self._quota_event
+        self.quota.pusher = self._quota_pusher
+        self.ws_by_device = {}          # appareil -> connexions WebSocket ouvertes
         self._emby_fail = 0
         self.restart_event = threading.Event()   # bouton Redemarrer de la page
         self.restart_error = ""
@@ -2750,6 +2805,7 @@ class EmbyProxy:
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
+        self._loop = asyncio.get_running_loop()
         self.session = ClientSession(
             connector=TCPConnector(limit=0, ttl_dns_cache=300),
             timeout=ClientTimeout(total=None, connect=15, sock_connect=15),
@@ -3528,6 +3584,10 @@ class EmbyProxy:
                                    protocols=[up.protocol] if up.protocol else ())
         await ws.prepare(request)
         self.stats.ws_open += 1
+        dev = (request.query.get("deviceId") or request.query.get("DeviceId")
+               or Activity._auth_fields(request).get("deviceid", ""))
+        if dev:
+            self.ws_by_device.setdefault(dev, set()).add(ws)
 
         async def pump(src, dst):
             async for msg in src:
@@ -3545,9 +3605,55 @@ class EmbyProxy:
                                  return_exceptions=True)
         finally:
             self.stats.ws_open -= 1
+            if dev:
+                self.ws_by_device.get(dev, set()).discard(ws)
+                if not self.ws_by_device.get(dev):
+                    self.ws_by_device.pop(dev, None)
             if not up.closed:
                 await up.close()
         return ws
+
+    # -- messages de quota envoyes en direct (sans l'API d'Emby) ----------
+    async def push_message(self, device_id, header, text, timeout_ms=None):
+        """Ecrit un message dans la connexion en direct de l'appli, au format
+        qu'Emby utilise lui-meme. -> nombre de connexions atteintes."""
+        args = {"Header": header, "Text": text}
+        if timeout_ms:
+            args["TimeoutMs"] = str(int(timeout_ms))
+        frame = json.dumps({"MessageType": "GeneralCommand",
+                            "MessageId": secrets.token_hex(16),
+                            "Data": {"Name": "DisplayMessage", "Arguments": args}})
+        sent = 0
+        for ws in list(self.ws_by_device.get(device_id, ())):
+            if ws.closed:
+                continue
+            try:
+                await ws.send_str(frame)
+                sent += 1
+            except (ConnectionResetError, RuntimeError):
+                continue
+        return sent
+
+    def _quota_pusher(self, device_id, header, text, timeout_ms=None, via_api=False):
+        """Appele depuis le thread des quotas."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            return 0
+        sent = 0
+        if not via_api:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.push_message(device_id, header, text, timeout_ms), loop)
+            sent = fut.result(timeout=10)
+        if (sent or via_api) and self.activity:
+            how = "direct" if sent else "API"
+            def note():
+                for c in list(self.activity.clients.values()):
+                    if c.device_id == device_id and c.user_id:
+                        self.activity.event(c, "quota", "Message de quota (%s) : %s"
+                                            % (how, header or text[:60]), merge=30)
+                        break
+            loop.call_soon_threadsafe(note)
+        return sent
 
     # -- vignettes en cache ----------------------------------------------
     def _serve_cached(self, request, meta, body, state):
@@ -4526,7 +4632,7 @@ h1{font-size:19px;margin:0 0 12px}h2{font-size:15px;margin:22px 0 10px}
 .play{margin-top:8px;padding:8px;border-radius:6px;background:#26303f}.bar{height:5px;background:#3a3f4d;border-radius:3px;margin-top:5px}.bar>i{display:block;height:100%;background:var(--acc);border-radius:3px}
 .loc{margin-top:8px}.ev{margin-top:8px;max-height:220px;overflow:auto;border-top:1px solid var(--line);padding-top:6px}
 .e{display:flex;gap:8px;font-size:12.5px;padding:1px 0}.e time{color:var(--mut);flex:none;width:58px}
-.k-browse{color:var(--fg)}.k-search{color:var(--info)}.k-play,.k-pause,.k-stop{color:var(--ok)}.k-delete,.k-badpass,.k-refused{color:var(--bad)}.k-fav,.k-played,.k-download,.k-login,.k-logout{color:var(--warn)}
+.k-browse{color:var(--fg)}.k-search{color:var(--info)}.k-play,.k-pause,.k-stop{color:var(--ok)}.k-delete,.k-badpass,.k-refused{color:var(--bad)}.k-fav,.k-played,.k-download,.k-login,.k-logout,.k-quota{color:var(--warn)}
 table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}
 td,th{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:top}th{color:var(--mut);font-weight:500}
 .tw{overflow-x:auto}select,input{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
