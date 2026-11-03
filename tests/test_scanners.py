@@ -123,3 +123,22 @@ async def test_cles_de_session_inventees_bannies(env):
     for i in range(25):
         await c.get("/emby/Items", headers=dict(via(BOT), **{"X-Emby-Token": "FAKE%d" % i}))
     assert proxy.guard.check(BOT, "/")[0] == 403
+
+
+async def test_trois_cles_differentes_suffisent_a_bannir(env):
+    proxy, c, _ = env
+    for i in range(2):
+        await c.get("/emby/Items", headers=dict(via(BOT), **{"X-Emby-Token": "FAKE%d" % i}))
+    assert proxy.guard.check(BOT, "/") is None
+    await c.get("/emby/Items", headers=dict(via(BOT), **{"X-Emby-Token": "FAKE9"}))
+    assert proxy.guard.check(BOT, "/")[0] == 403
+
+
+async def test_appli_avec_session_expiree_jamais_bannie(env):
+    """Une vraie appli dont la session a expire renvoie sa MEME ancienne cle,
+    souvent des dizaines de fois d'un coup (ecran d'accueil) : pas un robot."""
+    proxy, c, _ = env
+    home = "83.204.193.128"
+    for _ in range(60):
+        await c.get("/emby/Items", headers=dict(via(home), **{"X-Emby-Token": "FAKEOLD"}))
+    assert proxy.guard.check(home, "/") is None

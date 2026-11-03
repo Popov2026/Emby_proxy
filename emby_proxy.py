@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.3"
+__version__ = "2.5.4"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3640,25 +3640,29 @@ class EmbyProxy:
             self.anon_hits.clear()
         return web.json_response({"error": "login required"}, status=401)
 
+    BAD_KEYS_MAX = 3            # cles DIFFERENTES refusees avant bannissement
+
     def _bad_token(self, request):
-        """Cle de session refusee par Emby. Une adresse d'Internet qui en essaie
-        beaucoup (20 en 10 min) cherche a en deviner une : bannie. Une appli
-        dont la session a expire n'en envoie que quelques-unes avant de se
-        reconnecter."""
+        """Cle de session (ou cle API) refusee par Emby. On compte les cles
+        DIFFERENTES : une appli dont la session a expire renvoie toujours la
+        meme ; quelqu'un qui en essaie plusieurs cherche a en deviner une.
+        3 cles differentes refusees en 10 min depuis Internet = banni."""
         ip = request.get(CLIENT_IP, "")
         if not ip or self.guard.is_local(ip):
             return
+        tok = Activity._auth_fields(request).get("token", "")
         key = self.guard.key(ip)
         now = time.time()
-        hits = self.badtok_hits.setdefault(key, deque(maxlen=100))
-        hits.append(now)
-        while hits and now - hits[0] > 600:
-            hits.popleft()
-        if len(hits) >= 20 and self.guard.banned.get(key, 0) <= now:
+        tried = self.badtok_hits.setdefault(key, {})
+        tried[hashlib.sha256(tok.encode()).hexdigest()[:16]] = now
+        for k in [k for k, t in tried.items() if now - t > 600]:
+            del tried[k]
+        if len(tried) >= self.BAD_KEYS_MAX and self.guard.banned.get(key, 0) <= now:
             self.guard.banned[key] = now + self.cfg.ban_seconds
             self.seclog.add("ban", ip, False, detail="robot : %d cles de session "
-                            "refusees en 10 min" % len(hits), ban_key=key)
-            log.warning("robot banni : %s (%d cles de session refusees)", ip, len(hits))
+                            "refusees en 10 min" % len(tried), ban_key=key)
+            log.warning("robot banni : %s (%d cles de session differentes refusees)",
+                        ip, len(tried))
         if len(self.badtok_hits) > 20000:
             self.badtok_hits.clear()
 
