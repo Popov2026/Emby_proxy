@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -102,7 +102,9 @@ DEFAULTS = {
         "denied_networks": "",
         "local_networks": PRIVATE_NETS,
         "block_admin_from_internet": "true",
+        "admin_from_internet": "",
         "ban_scanners": "true",
+        "require_login": "true",
         "login_max_failures": "5",
         "login_window_minutes": "15",
         "ban_minutes": "60",
@@ -485,8 +487,15 @@ class Settings:
         self.allowed = _nets(s.get("allowed_networks"))
         self.denied = _nets(s.get("denied_networks"))
         self.local = _nets(s.get("local_networks"))
-        self.block_admin = s.getboolean("block_admin_from_internet")
+        # administration d'Emby depuis Internet : NONE (interdite), VIEW (lecture
+        # seule) ou FULL (autorisee) ; anciens fichiers : block_admin_from_internet
+        mode = (s.get("admin_from_internet") or "").strip().upper()
+        if mode not in ADMIN_MODES:
+            mode = "NONE" if s.getboolean("block_admin_from_internet") else "FULL"
+        self.admin_mode = mode
+        self.block_admin = mode == "NONE"
         self.ban_scanners = s.getboolean("ban_scanners")
+        self.require_login = s.getboolean("require_login")
         self.login_max = s.getint("login_max_failures")
         self.login_window = s.getfloat("login_window_minutes") * 60
         self.ban_seconds = s.getfloat("ban_minutes") * 60
@@ -621,9 +630,15 @@ local_networks = %s
 # Refuser l'administration d'Emby (tableau de bord, redemarrage, cles API,
 # plugins...) depuis toute adresse hors du reseau local.
 block_admin_from_internet = true
+# Administration d'Emby depuis Internet : NONE = interdite (tableau de bord
+# refuse), VIEW = lecture seule (visible, aucune modification), FULL = autorisee.
+admin_from_internet = NONE
 # Bannir aussitot une adresse d'Internet qui cherche des failles (.env,
 # wp-config, .git, .php...) : ces fichiers n'existent jamais sur Emby.
 ban_scanners = true
+# Depuis Internet, refuser toute requete d'un visiteur non connecte a Emby
+# (sauf ce qui sert a se connecter : page de connexion, interface web...).
+require_login = true
 # Mots de passe faux : bannissement de l'adresse IP.
 login_max_failures = 5
 login_window_minutes = 15
@@ -815,9 +830,23 @@ CONFIG_SCHEMA = [
         {"sec": "security", "key": "require_relay", "type": "bool", "live": True,
          "label": "Refuser les connexions d'Internet qui ne passent pas par le relais",
          "help": "Sinon elles contourneraient son HTTPS. Le réseau local reste accepté."},
-        {"sec": "security", "key": "block_admin_from_internet", "type": "bool",
-         "live": True, "label": "Bloquer l'administration d'Emby depuis Internet",
-         "help": ""},
+        {"sec": "security", "key": "admin_from_internet", "type": "choice",
+         "choices": ["NONE", "VIEW", "FULL"], "live": True,
+         "choice_labels": ["Interdite", "Lecture seule (tableau de bord visible)",
+                           "Autorisée (lecture et modifications)"],
+         "label": "Administration d'Emby depuis Internet",
+         "help": "Interdite : tout le tableau de bord d'Emby est refusé depuis Internet "
+                 "(réglages, utilisateurs, lectures en cours, journaux…) ; un compte "
+                 "administrateur peut quand même regarder. Lecture seule : le tableau "
+                 "de bord s'affiche, aucune modification. Le réseau local n'est "
+                 "jamais limité."},
+        {"sec": "security", "key": "require_login", "type": "bool", "live": True,
+         "label": "Depuis Internet, connexion Emby obligatoire pour tout le reste",
+         "help": "Sans connexion Emby valable, un visiteur d'Internet n'a accès qu'à ce "
+                 "qui sert à se connecter (page de connexion, interface web, infos "
+                 "publiques du serveur). Tout le reste est refusé ; une adresse qui "
+                 "accumule les refus sans se connecter est bannie. Le réseau local "
+                 "n'est pas concerné."},
         {"sec": "security", "key": "ban_scanners", "type": "bool", "live": True,
          "label": "Bannir aussitôt les robots qui cherchent des failles",
          "help": "Une adresse d'Internet qui demande .env, wp-config, .git, .php… "
@@ -924,12 +953,12 @@ SCHEMA_FIELDS = {"%s.%s" % (f["sec"], f["key"]): f
 # attributs de Settings recopies a chaud apres un enregistrement
 LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "ttl_untagged", "serve_stale", "allowed", "denied", "local",
-              "block_admin", "login_max", "login_window", "ban_seconds", "rate",
+              "block_admin", "admin_mode", "login_max", "login_window", "ban_seconds", "rate",
               "burst", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
               "language", "forward_ip", "landing_page", "quota_delivery",
-              "ban_scanners")
+              "ban_scanners", "require_login")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -1173,6 +1202,16 @@ class DiskCache:
 #  SECURITE
 # =====================================================================
 # Administration d'Emby : refusee hors du reseau local.
+ADMIN_MODES = ("NONE", "VIEW", "FULL")
+# Tableau de bord d'Emby : donnees qu'il lit (refusees aux comptes
+# administrateurs en mode "interdite" ; les applis ordinaires ne les lisent
+# pas sans filtre).
+DASH_RE = re.compile(r"^/(?:Sessions/?$|Users/?$|Users/Query|System/Info/?$"
+                     r"|web/configurationpages|News/|Dashboard/)", re.I)
+# Modifications reservees a l'administration (comptes administrateurs).
+ADMIN_WRITE_RE = re.compile(r"^/(?:Users/[^/]+/?$|Items/[^/]+/?$|Items/[^/]+/Refresh"
+                            r"|Items/[^/]+/(?:ContentType|MetadataEditor)|Items/RemoteSearch"
+                            r"|Library/|Collections)", re.I)
 ADMIN_RE = re.compile(
     r"^/(?:"
     r"System/(?:Configuration|Restart|Shutdown|Logs|ActivityLog)|"
@@ -1199,6 +1238,15 @@ SCANNER_RE = re.compile(
     r"vendor/(?:composer|phpunit)|storage/logs|web\.config|"
     r"(?:credentials|secrets|dump|backup)\.(?:json|txt|xml|zip|tar|gz))(?:$|/)",
     re.I)
+# Ce qu'un visiteur d'Internet pas encore connecte peut demander : de quoi
+# afficher la page de connexion et se connecter. Rien d'autre.
+PUBLIC_RE = re.compile(
+    r"^/(?:$|web(?:/.*)?$|favicon\.ico$|robots\.txt$"
+    r"|System/Info/Public/?$|System/Ping/?$"
+    r"|Users/Public/?$|Users/AuthenticateByName/?$|Users/[^/]+/Authenticate/?$"
+    r"|Users/ForgotPassword(?:/Pin)?/?$"
+    r"|Users/[^/]+/Images/[A-Za-z]+(?:/\d+)?/?$"       # avatars de la page de connexion
+    r"|Branding/(?:Configuration|Css(?:\.css)?)/?$)", re.I)
 LOGIN_RE = re.compile(r"^/Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$", re.I)
 
 
@@ -1373,7 +1421,7 @@ class SecurityLog:
                 pass
 
     def add(self, kind, ip, local=False, user="", client="", device="", detail="",
-            ban_key=""):
+            ban_key="", merge_key=""):
         now = time.time()
         e = {"date": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
              "type": kind, "ip": ip, "local": bool(local), "user": (user or "")[:100],
@@ -1383,11 +1431,16 @@ class SecurityLog:
             e["ban_key"] = ban_key
         if kind == "refused" and self.events:
             last = self.events[-1]          # rafales de refus : une seule ligne
-            if last["type"] == "refused" and last["ip"] == ip and \
-                    last["detail"] == e["detail"] and now - last["t"] < 60:
+            same = last["detail"] == e["detail"] or (
+                merge_key and last.get("merge_key") == merge_key)
+            if last["type"] == "refused" and last["ip"] == ip and same and \
+                    now - last["t"] < 60:
                 last["count"] = last.get("count", 1) + 1
                 last["t"] = now
+                last["detail"] = e["detail"]        # derniere adresse demandee
                 return last
+        if merge_key:
+            e["merge_key"] = merge_key
         line = json.dumps(e, ensure_ascii=False)
         e["t"] = now
         self.events.append(e)
@@ -1584,6 +1637,7 @@ class Activity:
         self._log_lock = threading.Lock()
         self.on_delete = None
         self.on_play = None         # verification aupres d'Emby (posee par le proxy)
+        self.on_admin = None        # compte administrateur ou non (pose par le proxy)
 
     # -- identification ------------------------------------------------
     @staticmethod
@@ -1599,7 +1653,7 @@ class Activity:
         for src, dst in (("x-emby-client", "client"), ("x-emby-device-name", "device"),
                          ("x-emby-device-id", "deviceid"),
                          ("x-emby-client-version", "version"),
-                         ("x-emby-token", "token"), ("api_key", "token"),
+                         ("x-emby-token", "token"), ("api_key", "token"), ("apikey", "token"),
                          ("deviceid", "deviceid")):
             if q.get(src) and not f.get(dst):
                 f[dst] = q[src]
@@ -1651,18 +1705,22 @@ class Activity:
             return c
         if token:
             c.token = token
-        uid = f.get("userid", "")
-        m = RE_ANYUID.match(npath(request))
-        if m:
-            uid = m.group("uid")
-        if uid:
-            c.user_id = uid.lower()
-            if token:
-                if len(self.token_user) > 20000:
-                    self.token_user.clear()
-                self.token_user[token] = c.user_id
-        elif token and token in self.token_user:
+        if token and token in self.token_user:
+            # la cle de session appartient au compte qui s'est connecte avec : un
+            # administrateur qui ouvre la fiche d'un autre utilisateur
+            # (/Users/<autre>/...) reste lui-meme
             c.user_id = self.token_user[token]
+        else:
+            uid = f.get("userid", "")
+            m = RE_ANYUID.match(npath(request))
+            if m:
+                uid = m.group("uid")
+            if uid:
+                c.user_id = uid.lower()
+                if token:
+                    if len(self.token_user) > 20000:
+                        self.token_user.clear()
+                    self.token_user[token] = c.user_id
         if c.user_id and not c.user_name:
             c.user_name = self.info.users.get(c.user_id, "")
             if not c.user_name and len(self.info.pending_users) < 1000:
@@ -1874,6 +1932,21 @@ class Activity:
                 c.playing = None
                 self.event(c, "logout", "Deconnexion")
 
+    def end_play(self, c):
+        """Fin d'une lecture constatee aupres d'Emby (l'appli n'a pas envoye son
+        compte rendu d'arret, ou pas par le proxy)."""
+        pl = c.playing
+        if not pl:
+            return
+        c.playing = None
+        dur = self.info.runtime(pl["item"])
+        pos = pl.get("pos") or 0
+        if dur and (pos >= dur * 0.9 or dur - pos < 300):
+            self.event(c, "stop", "Fin de lecture : %s" % X, pl["item"])
+        else:
+            self.event(c, "stop", "Arret : %s a %s%s" % (
+                X, _hms(pos), " / %s" % _hms(dur) if dur else ""), pl["item"])
+
     def _start_play(self, c, item, mode, pos, paused):
         self.info.need(item, (c.token, c.user_id))
         c.playing = {"item": item, "mode": mode, "pos": pos, "paused": paused,
@@ -1988,6 +2061,8 @@ class Activity:
             if u.get("Id"):
                 uid = str(u["Id"]).lower()
                 self.info.users[uid] = u.get("Name") or ""
+                if isinstance(u.get("Policy"), dict) and self.on_admin:
+                    self.on_admin(uid, bool(u["Policy"].get("IsAdministrator")))
                 c.user_id, c.user_name = uid, u.get("Name") or c.user_name
                 if data.get("AccessToken"):
                     self.token_user[data["AccessToken"]] = uid
@@ -2000,6 +2075,8 @@ class Activity:
         if RE_USER.match(p) and isinstance(data, dict) and data.get("Name"):
             uid = RE_USER.match(p).group("uid").lower()
             self.info.users[uid] = data["Name"]
+            if isinstance(data.get("Policy"), dict) and self.on_admin:
+                self.on_admin(uid, bool(data["Policy"].get("IsAdministrator")))
             if c.user_id == uid:
                 c.user_name = data["Name"]
             return
@@ -2808,6 +2885,9 @@ class EmbyProxy:
         self.quota.notify = self._quota_event
         self.quota.pusher = self._quota_pusher
         self.ws_by_device = {}          # appareil -> connexions WebSocket ouvertes
+        self.auth_ips = {}              # adresse -> fin de validite (utilisateur connecte)
+        self.admin_cache = {}           # utilisateur -> (administrateur ?, fin)
+        self.anon_hits = {}             # adresse -> requetes refusees sans connexion
         self._emby_fail = 0
         self.restart_event = threading.Event()   # bouton Redemarrer de la page
         self.restart_error = ""
@@ -2826,6 +2906,8 @@ class EmbyProxy:
         if self.activity is not None:
             self.activity.on_delete = self._delete_event
             self.activity.on_play = self._schedule_play_check
+            self.activity.on_admin = lambda uid, adm: self.admin_cache.__setitem__(
+                uid, (adm, time.time() + 600))
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
@@ -2842,6 +2924,7 @@ class EmbyProxy:
             self._tasks.append(asyncio.create_task(self._resolve_loop()))
         self._tasks.append(asyncio.create_task(self._prune_loop()))
         self._tasks.append(asyncio.create_task(self._stats_loop()))
+        self._tasks.append(asyncio.create_task(self._sync_playing_loop()))
         log.info("reglages lus dans %s", self.cfg.path)
         for i, w in enumerate(self.cfg.config_warnings):
             self.warnings["config%d" % i] = "Reglages : " + w
@@ -2927,6 +3010,55 @@ class EmbyProxy:
                 if n:
                     log.info("journal %s : %d lignes anciennes effacees", path, n)
             await asyncio.sleep(6 * 3600)
+
+    async def _sync_playing_loop(self, every=30):
+        """Pendant qu'on regarde, Emby est interroge (cle API) : position, pause,
+        et fin de lecture meme si l'appli n'envoie pas son compte rendu
+        d'arret (sinon la fiche restait \"en pause\" apres la fin du film)."""
+        while True:
+            await asyncio.sleep(every)
+            try:
+                await self._sync_playing()
+            except Exception:
+                log.debug("suivi des lectures", exc_info=True)
+
+    async def _sync_playing(self):
+        if not (self.cfg.api_key and self.activity):
+            return
+        playing = [c for c in list(self.activity.clients.values())
+                   if c.playing and c.device_id]
+        if not playing:
+            return
+        try:
+            async with self.session.get("%s/emby/Sessions" % self.cfg.upstream,
+                                        params={"api_key": self.cfg.api_key},
+                                        timeout=ClientTimeout(total=10)) as r:
+                raw = await r.read()
+                if r.status != 200:
+                    return
+                sessions = json.loads(_decode(raw, r.headers.get("Content-Encoding")))
+        except (ClientError, asyncio.TimeoutError, OSError, ValueError):
+            return
+        by_dev = {}
+        for s in sessions if isinstance(sessions, list) else []:
+            if isinstance(s, dict) and s.get("DeviceId") and s.get("NowPlayingItem"):
+                by_dev[s["DeviceId"]] = s
+        now = time.time()
+        for c in playing:
+            pl = c.playing
+            s = by_dev.get(c.device_id)
+            item = str((s or {}).get("NowPlayingItem", {}).get("Id") or "")
+            if s and item == str(pl["item"]):
+                ps = s.get("PlayState") or {}
+                pl["pos"] = (ps.get("PositionTicks") or 0) / TICKS or pl["pos"]
+                pl["paused"] = bool(ps.get("IsPaused"))
+                pl["updated"] = now
+                pl["miss"] = 0
+            elif now - pl.get("started", now) > 60:
+                # absent deux fois de suite (Emby ne l'a pas encore vu au debut)
+                pl["miss"] = pl.get("miss", 0) + 1
+                if pl["miss"] >= 2:
+                    self.activity.end_play(c)
 
     async def _stats_loop(self):
         """Compteurs du cache sur disque : un service arrete brutalement ne
@@ -3203,6 +3335,11 @@ class EmbyProxy:
             return web.Response(status=refus[0], text=refus[1])
         if request.path.startswith("/__proxy/"):
             return await self._status_gate(request, handler, ip)
+        if getattr(self.cfg, "require_login", True) and not self._may_pass(request, ip, np):
+            return self._login_required(request, ip, np)
+        why = await self._admin_refusal(request, ip, np)
+        if why:
+            return self._refuse(request, ip, 403, why)
         return await handler(request)
 
     @web.middleware
@@ -3340,6 +3477,122 @@ class EmbyProxy:
         if not tok or tok not in self.activity.token_user:
             return None
         return self.activity.identify(request, trusted=True)
+
+    # -- administration d'Emby depuis Internet : interdite / lecture seule --
+    async def _admin_refusal(self, request, ip, np):
+        """-> raison du refus, ou "" si la requete passe."""
+        mode = getattr(self.cfg, "admin_mode", "NONE")
+        if mode == "FULL" or self.guard.is_local(ip):
+            return ""
+        write = request.method not in ("GET", "HEAD", "OPTIONS")
+        if mode == "VIEW" and write and ADMIN_RE.match(np):
+            return "Administration d'Emby en lecture seule depuis Internet."
+        dash = request.method == "GET" and DASH_RE.match(np) and not (
+            np.lower().startswith("/sessions") and
+            ({k.lower() for k in request.query} &
+             {"deviceid", "controllablebyuserid", "id"}))
+        if not (dash and mode == "NONE") and not (write and ADMIN_WRITE_RE.match(np)):
+            return ""
+        if await self._is_admin_request(request):
+            return ("Administration d'Emby interdite depuis Internet." if mode == "NONE"
+                    else "Administration d'Emby en lecture seule depuis Internet.")
+        return ""
+
+    async def _is_admin_request(self, request):
+        """La cle de session est-elle celle d'un compte administrateur ?"""
+        if not self.activity:
+            return False
+        tok = Activity._auth_fields(request).get("token", "")
+        uid = self.activity.token_user.get(tok, "") if tok else ""
+        if not uid:
+            m = RE_ANYUID.match(npath(request))
+            uid = m.group("uid").lower() if m else ""
+        if not uid:
+            return False
+        known = self.admin_cache.get(uid)
+        if known and known[1] > time.time():
+            return known[0]
+        params, headers = {}, {}
+        if self.cfg.api_key:
+            params["api_key"] = self.cfg.api_key
+        elif tok:
+            headers["X-Emby-Token"] = tok
+        else:
+            return False
+        try:
+            async with self.session.get("%s/emby/Users/%s" % (self.cfg.upstream, uid),
+                                        params=params, headers=headers,
+                                        timeout=ClientTimeout(total=8)) as r:
+                raw = await r.read()
+                if r.status != 200:
+                    return False
+                d = json.loads(_decode(raw, r.headers.get("Content-Encoding")))
+        except (ClientError, asyncio.TimeoutError, OSError, ValueError):
+            return False
+        admin = bool((d.get("Policy") or {}).get("IsAdministrator"))
+        self.admin_cache[uid] = (admin, time.time() + 600)
+        return admin
+
+    def _refuse(self, request, ip, status, why):
+        self.guard.blocked += 1
+        f = Activity._auth_fields(request)
+        self.seclog.add("refused", ip, self.guard.is_local(ip),
+                        client=f.get("client", ""), device=f.get("device", ""),
+                        detail="%s (%s %s)" % (why, request.method, request.path[:80]))
+        c = self._device_card(request)
+        if c is not None:
+            self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
+                why, request.method, request.path[:80]), merge=60)
+        return web.Response(status=status, text=why)
+
+    # -- connexion Emby obligatoire depuis Internet ------------------------
+    def _has_token(self, request):
+        return bool(Activity._auth_fields(request).get("token"))
+
+    def _may_pass(self, request, ip, np):
+        if self.guard.is_local(ip) or PUBLIC_RE.match(np):
+            return True
+        if request.method == "OPTIONS":
+            return True                      # pre-requete CORS des applis (sans jeton)
+        if self._has_token(request):
+            return True                      # Emby verifie lui-meme la cle de session
+        # adresse ou un utilisateur s'est connecte (images, flux video lus
+        # par le lecteur sans cle de session)
+        return self.auth_ips.get(self.guard.key(ip), 0) > time.time()
+
+    def _mark_authenticated(self, request):
+        ip = request.get(CLIENT_IP, "")
+        if ip and not self.guard.is_local(ip):
+            if len(self.auth_ips) > 20000:
+                now = time.time()
+                for k in [k for k, v in self.auth_ips.items() if v < now]:
+                    del self.auth_ips[k]
+            self.auth_ips[self.guard.key(ip)] = time.time() + max(
+                self.cfg.session_hours, 12) * 3600
+
+    def _login_required(self, request, ip, np):
+        """Visiteur d'Internet non connecte qui demande autre chose que la page
+        de connexion : refuse ; trop de refus sans jamais se connecter = banni."""
+        self.guard.blocked += 1
+        key = self.guard.key(ip)
+        now = time.time()
+        hits = self.anon_hits.setdefault(key, deque(maxlen=200))
+        hits.append(now)
+        while hits and now - hits[0] > 600:
+            hits.popleft()
+        self.seclog.add("refused", ip, False,
+                        client=request.headers.get("User-Agent", "")[:60],
+                        detail="Connexion Emby requise (%s %s)" % (
+                            _safe(request.method, 10), _safe(request.path, 80)),
+                        merge_key="login_required")
+        if len(hits) >= 30 and self.guard.banned.get(key, 0) <= now:
+            self.guard.banned[key] = now + self.cfg.ban_seconds
+            self.seclog.add("ban", ip, False, detail="robot : %d requetes sans "
+                            "connexion en 10 min" % len(hits), ban_key=key)
+            log.warning("robot banni : %s (%d requetes sans connexion)", ip, len(hits))
+        if len(self.anon_hits) > 20000:
+            self.anon_hits.clear()
+        return web.json_response({"error": "login required"}, status=401)
 
     def _scanner(self, request, ip):
         """Robot qui cherche des failles : banni des sa premiere tentative
@@ -3508,6 +3761,9 @@ class EmbyProxy:
         try:
             if is_login and up.status in (200, 401, 403):
                 self._record_login(request, body_json, up.status == 200)
+            if up.status < 400 and (is_login or (
+                    not PUBLIC_RE.match(np) and self._has_token(request))):
+                self._mark_authenticated(request)
             if request.method == "GET" and up.status == 200 and RE_SYSINFO.match(np) \
                     and "json" in up.headers.get("Content-Type", ""):
                 return await self._sysinfo(request, up)
@@ -3632,6 +3888,7 @@ class EmbyProxy:
             self.stats.upstream_errors += 1
             log.warning("WebSocket Emby injoignable : %s", exc)
             return web.Response(status=502, text="Serveur Emby injoignable.")
+        self._mark_authenticated(request)       # Emby a accepte la cle de session
         ws = web.WebSocketResponse(autoping=True,
                                    protocols=[up.protocol] if up.protocol else ())
         await ws.prepare(request)
@@ -3832,6 +4089,7 @@ class EmbyProxy:
                 self.quota.error else []),
             "emby_down": "emby" in self.warnings,
             "emby_admin_internet": not self.cfg.block_admin,
+            "emby_admin_mode": self.cfg.admin_mode,
             "lang": self.cfg.language,
             "active_users": sum(
                 1 for x in list(self.activity.clients.values())
@@ -4035,6 +4293,8 @@ class EmbyProxy:
                 values[k + ".hint"] = ("\u2022\u2022\u2022\u2022" + key[-4:]) if key else ""
             else:
                 values[k] = raw.get(k, "")
+        if not values.get("security.admin_from_internet"):
+            values["security.admin_from_internet"] = self.cfg.admin_mode
         return web.json_response({
             "schema": CONFIG_SCHEMA, "values": values,
             "locked": ["%s.%s" % sk for sk in self.cfg.env_locked],
@@ -4343,21 +4603,26 @@ class EmbyProxy:
             return web.json_response({"ok": False, "error": "Fixé par une variable "
                                       "d'environnement (docker-compose)."}, status=403)
         data = await request.json()
-        allow = data.get("allow") is True
+        mode = str(data.get("mode") or "").upper()
+        if mode not in ADMIN_MODES:                   # ancien bouton : allow vrai/faux
+            mode = "FULL" if data.get("allow") is True else "NONE"
         try:
+            update_ini(self.cfg.path, "security", "admin_from_internet", mode)
             update_ini(self.cfg.path, "security", "block_admin_from_internet",
-                       "false" if allow else "true")
-            if Settings(self.cfg.path).block_admin == allow:
+                       "true" if mode == "NONE" else "false")
+            if Settings(self.cfg.path).admin_mode != mode:
                 raise OSError("relu different")
         except Exception as exc:
             return web.json_response({"ok": False, "error": "Fichier %s non modifie : %s"
                                       % (self.cfg.path, exc)}, status=500)
-        self.cfg.block_admin = not allow
-        msg = ("administration d'Emby depuis Internet autorisee" if allow else
-               "administration d'Emby depuis Internet interdite")
+        self.cfg.admin_mode, self.cfg.block_admin = mode, mode == "NONE"
+        msg = {"FULL": "administration d'Emby depuis Internet autorisee",
+               "VIEW": "administration d'Emby depuis Internet en lecture seule",
+               "NONE": "administration d'Emby depuis Internet interdite"}[mode]
         self.seclog.add("config", ip, True, detail=msg)
         log.warning("%s par %s", msg, ip)
-        return web.json_response({"ok": True, "allow": allow})
+        return web.json_response({"ok": True, "mode": mode,
+                                  "allow": mode == "FULL"})
 
     # -- effacement des journaux (onglet Journaux) -------------------------
     LOG_KINDS = ("activity", "security", "quotas", "technical")
@@ -4705,7 +4970,7 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
 .fld label{display:block}.fld input:not([type=checkbox]),.fld select{width:100%;margin-top:3px}
 .hdr{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.hdr .row{margin:0;align-items:center}
 button.adm{border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;background:var(--card)}
-button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{border:1px solid var(--ok);color:var(--ok)}
+button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{border:1px solid var(--ok);color:var(--ok)}button.adm.view{border:1px solid var(--info);color:var(--info)}
 .tabs{flex-wrap:wrap}.lgk{display:flex;gap:8px;align-items:baseline;margin-top:6px}
 </style></head><body>
 <div class="hdr">
@@ -4923,11 +5188,17 @@ function renderStats(d){
   if(autoConf){autoConf=false;if(d.emby_down)document.querySelector('button[data-t=conf]').click()}
   $('g').replaceChildren(...F.map(([l,k,f])=>{const c=el('div','c');c.append(el('div','l',l),el('div','v',f?f(d[k]):String(d[k])));return c}));
   $('warn').replaceChildren(...(d.warnings||[]).map(w=>el('div','w','⚠ '+T(w))));
-  const a=$('embyAdm');a.hidden=false;a.dataset.allow=d.emby_admin_internet?'1':'';a.className='adm '+(d.emby_admin_internet?'on':'off');
-  a.textContent=T(d.emby_admin_internet?"Administration d'Emby depuis Internet : AUTORISÉE":"Administration d'Emby depuis Internet : INTERDITE")}
-$('embyAdm').onclick=()=>{const allow=!$('embyAdm').dataset.allow;
-  if(!confirm(T(allow?"Autoriser l'administration d'Emby (tableau de bord, réglages, utilisateurs, bibliothèques) depuis Internet ? Elle restera toujours possible depuis le réseau local.":"Interdire l'administration d'Emby depuis Internet ? Elle restera possible depuis le réseau local.")))return;
-  post('emby_admin',{allow}).then(r=>{if(!r.ok)alert(ko(r.error));tick()})};
+  const a=$('embyAdm'),m=d.emby_admin_mode||(d.emby_admin_internet?'FULL':'NONE');a.hidden=false;a.dataset.mode=m;
+  a.className='adm '+(m==='FULL'?'on':m==='VIEW'?'view':'off');
+  a.textContent=T(ADM_LBL[m])}
+const ADM_LBL={NONE:"Administration d'Emby depuis Internet : INTERDITE",VIEW:"Administration d'Emby depuis Internet : LECTURE SEULE",FULL:"Administration d'Emby depuis Internet : AUTORISÉE"};
+const ADM_ASK={VIEW:"Administration d'Emby depuis Internet en LECTURE SEULE : le tableau de bord s'affiche, aucune modification possible. Continuer ?",
+  FULL:"AUTORISER l'administration d'Emby depuis Internet (tableau de bord, réglages, utilisateurs, bibliothèques) ? Elle reste toujours possible depuis le réseau local.",
+  NONE:"INTERDIRE l'administration d'Emby depuis Internet (tout le tableau de bord refusé) ? Elle reste possible depuis le réseau local."};
+// interdite -> lecture seule -> autorisee -> interdite
+$('embyAdm').onclick=()=>{const next={NONE:'VIEW',VIEW:'FULL',FULL:'NONE'}[$('embyAdm').dataset.mode||'NONE'];
+  if(!confirm(T(ADM_ASK[next])))return;
+  post('emby_admin',{mode:next}).then(r=>{if(!r.ok)alert(ko(r.error));tick()})};
 $('purge').onclick=()=>{if(confirm(T('Vider le cache des vignettes ?')))fetch('purge',{method:'POST'}).then(tick)};
 
 let lastSec=null;
@@ -4978,7 +5249,7 @@ function fieldEl(f,G){
   if(f.type==='bool'){const lb=el('label');inp=el('input');inp.type='checkbox';inp.checked=(v==='true');lb.append(inp,el('span',null,' '+f.label));w.append(lb)}
   else{w.append(el('label',null,f.label+(f.live?'':'  ')),);
     if(!f.live)w.lastChild.append(el('span','tag','au redémarrage'));
-    if(f.type==='choice'){inp=el('select');f.choices.forEach(c=>{const o=el('option',null,c);o.value=c;inp.append(o)});inp.value=v}
+    if(f.type==='choice'){inp=el('select');f.choices.forEach((c,i)=>{const o=el('option',null,(f.choice_labels||[])[i]||c);o.value=c;inp.append(o)});inp.value=v}
     else{inp=el('input');inp.value=v;inp.spellcheck=false;inp.autocomplete='off';
       if(f.type==='secret'){inp.type='password';inp.placeholder=G.values[k+'.hint']?TF('enregistrée ({0}) : laisser vide pour la garder',G.values[k+'.hint']):T('aucune')}
       if(f.type==='int'||f.type==='float'){inp.inputMode='decimal'}

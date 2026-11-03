@@ -100,6 +100,6 @@ async def test_pas_de_mail_pour_chaque_robot(env):
 async def test_option_desactivable(env):
     proxy, c, seen = env
     proxy.cfg.ban_scanners = False
-    r = await c.get("/.env", headers=via(BOT))
+    r = await c.get("/.env", headers=dict(via(BOT), **{"X-Emby-Token": "TOK"}))
     assert r.status == 404 and seen == ["/.env"]       # transmis (Emby : 404)
     assert proxy.guard.check(BOT, "/") is None

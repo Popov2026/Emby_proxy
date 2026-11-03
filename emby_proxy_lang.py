@@ -335,6 +335,16 @@ EN = {
         "Refuse Internet connections that do not go through the relay",
     "Sinon elles contourneraient son HTTPS. Le réseau local reste accepté.":
         "Otherwise they would bypass its HTTPS. The local network stays accepted.",
+    "Depuis Internet, connexion Emby obligatoire pour tout le reste":
+        "From the Internet, an Emby login is required for everything else",
+    "Sans connexion Emby valable, un visiteur d'Internet n'a accès qu'à ce qui sert "
+    "à se connecter (page de connexion, interface web, infos publiques du serveur). "
+    "Tout le reste est refusé ; une adresse qui accumule les refus sans se connecter "
+    "est bannie. Le réseau local n'est pas concerné.":
+        "Without a valid Emby login, an Internet visitor only gets what is needed to "
+        "log in (login page, web interface, public server information). Everything "
+        "else is refused; an address piling up refusals without logging in is "
+        "banned. The local network is not affected.",
     "Bannir aussitôt les robots qui cherchent des failles":
         "Ban at once robots looking for security holes",
     "Une adresse d'Internet qui demande .env, wp-config, .git, .php… (fichiers qui "
@@ -342,6 +352,37 @@ EN = {
     "de bannissement ci-dessous.":
         "An Internet address asking for .env, wp-config, .git, .php… (files that never "
         "exist on Emby) is banned at its first attempt, for the ban duration below.",
+    "Administration d'Emby depuis Internet": "Emby administration from the Internet",
+    "Interdite": "Blocked",
+    "Lecture seule (tableau de bord visible)": "Read only (dashboard visible)",
+    "Autorisée (lecture et modifications)": "Allowed (view and changes)",
+    "Interdite : tout le tableau de bord d'Emby est refusé depuis Internet (réglages, "
+    "utilisateurs, lectures en cours, journaux…) ; un compte administrateur peut quand "
+    "même regarder. Lecture seule : le tableau de bord s'affiche, aucune modification. "
+    "Le réseau local n'est jamais limité.":
+        "Blocked: the whole Emby dashboard is refused from the Internet (settings, users, "
+        "current playback, logs…); an administrator account can still watch. Read only: "
+        "the dashboard is shown, no change possible. The local network is never "
+        "limited.",
+    "Administration d'Emby depuis Internet : LECTURE SEULE":
+        "Emby administration from the Internet: READ ONLY",
+    "Administration d'Emby depuis Internet en LECTURE SEULE : le tableau de bord "
+    "s'affiche, aucune modification possible. Continuer ?":
+        "Emby administration from the Internet in READ ONLY mode: the dashboard is "
+        "shown, no change possible. Continue?",
+    "AUTORISER l'administration d'Emby depuis Internet (tableau de bord, réglages, "
+    "utilisateurs, bibliothèques) ? Elle reste toujours possible depuis le réseau "
+    "local.":
+        "ALLOW Emby administration from the Internet (dashboard, settings, users, "
+        "libraries)? It always stays possible from the local network.",
+    "INTERDIRE l'administration d'Emby depuis Internet (tout le tableau de bord "
+    "refusé) ? Elle reste possible depuis le réseau local.":
+        "BLOCK Emby administration from the Internet (whole dashboard refused)? It stays "
+        "possible from the local network.",
+    "Administration d'Emby en lecture seule depuis Internet.":
+        "Emby administration is read only from the Internet.",
+    "administration d'Emby depuis Internet en lecture seule":
+        "Emby administration from the Internet read only",
     "Bloquer l'administration d'Emby depuis Internet":
         "Block Emby administration from the Internet",
     "Mots de passe faux avant bannissement": "Wrong passwords before a ban",
@@ -694,8 +735,11 @@ PATTERNS = [
     (r"^Lecture : (.*) \(([^()]*)\)$", "Playing: $1 ({2})"),
     (r"^Arret : (.*) a ([0-9:]+(?: / [0-9:]+)?)$", "Stopped: $1 at $2"),
     (r"^Pause : (.*)$", "Paused: $1"),
+    (r"^Fin de lecture : (.*)$", "Finished: $1"),
     (r"^Reprise : (.*)$", "Resumed: $1"),
     (r"^Refuse : (.*)$", "Refused: {1}"),
+    (r"^Connexion Emby requise \((.*)\)$", "Emby login required ($1)"),
+    (r"^robot : (\d+) requetes sans connexion en 10 min$", "robot: $1 requests without login in 10 min"),
     (r"^robot : recherche de failles \((.*)\)$", "robot: looking for security holes ($1)"),
     (r"^Message de quota \((direct|API)\) : (.*)$", "Quota message ($1): $2"),
     (r"^Erreur Emby HTTP (\d+) : (\S+) (.*)$", "Emby error HTTP $1: $2 $3"),

@@ -853,8 +853,8 @@ async def test_bannissement_ipv6_par_bloc(env):
                     headers={"X-Forwarded-For": "2a01:e0a:1:2:ffff::9"})
     assert r.status == 403                   # tout le bloc /64 est banni
     r = await c.get("/emby/Users/u1/Items",
-                    headers={"X-Forwarded-For": "2a01:e0a:1:3::1"})
-    assert r.status == 200                   # le voisin n'est pas touche
+                    headers={"X-Forwarded-For": "2a01:e0a:1:3::1", "X-Emby-Token": "TOKPAUL"})
+    assert r.status == 200                   # le voisin (connecte) n'est pas touche
     assert "2a01:e0a:1:2::/64" in proxy.guard.active_bans()
 
 
@@ -907,7 +907,7 @@ async def test_relais_https_devant_le_proxy(env):
                           security__local_networks="10.0.0.0/8")
     assert "http" not in proxy.warnings          # le relais fait le HTTPS
     relais = {"X-Forwarded-For": "82.64.10.20", "X-Forwarded-Proto": "https",
-              "X-Forwarded-Host": "emby.exemple.fr"}
+              "X-Forwarded-Host": "emby.exemple.fr", "X-Emby-Token": "TOKPAUL"}
     d = await (await c.get("/emby/Users/u1/Items", headers=relais)).json()
     assert d["xff"] == "82.64.10.20, 127.0.0.1"    # visiteur, puis relais
     assert d["proto"] == "https" and d["host"] == "emby.exemple.fr"
@@ -928,7 +928,8 @@ async def test_connexion_directe_sans_relais_refusee(env):
     _, c2 = await make(security__trusted_proxies="192.0.2.1/32",
                        security__local_networks="10.0.0.0/8",
                        security__require_relay="false")
-    assert (await c2.get("/emby/Users/u1/Items")).status == 200
+    assert (await c2.get("/emby/Users/u1/Items",
+                         headers={"X-Emby-Token": "TOKPAUL"})).status == 200
     # depuis le reseau local, la connexion directe reste permise
     _, c3 = await make(security__trusted_proxies="192.0.2.1/32")
     assert (await c3.get("/emby/Users/u1/Items")).status == 200

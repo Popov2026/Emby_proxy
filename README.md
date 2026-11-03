@@ -49,6 +49,8 @@ right).
 |---|---|
 | **Emby administration blocked from the Internet** | Dashboard, restart, API keys, plugins, users… refused outside the local network, however the address is written (`//emby/…`, `/mediabrowser/…`, `%2F`, `;…`, `..`). Button at the top of the page to allow / block it instantly. What normal apps need (login page, wake-on-LAN info, photo upload) stays allowed. |
 | **Wrong passwords** | 5 failures in 15 min ⇒ IP address banned for 1 hour |
+| **Emby login required from the Internet** | an Internet visitor without a valid Emby login only gets what is needed to log in (login page, web interface, public server information); everything else is refused before reaching Emby, and an address piling up refusals is banned. Setting "From the Internet, an Emby login is required for everything else" |
+| **Emby administration from the Internet: Blocked / Read only / Allowed** | Blocked: the whole dashboard is refused to administrator accounts (settings, users, current playback, logs…), they can still watch. Read only: the dashboard is shown, no change possible (settings, users, deletions, metadata). Button at the top of the page and Settings tab |
 | **Robots banned at once** | an Internet address looking for security holes (`.env`, `wp-config`, `.git`, `.php`…, files that never exist on Emby) is banned at its first attempt, never reaches Emby, gets no Activity card and triggers no mail (Security tab only) |
 | **Protected admin page** | **separate port** (8098): a flaw in Emby's web interface cannot reach it; local network **and** password; protected against malicious sites and framing; ban after wrong passwords |
 | **Activity cannot be faked** | an action is attributed to a user only if Emby accepted the request |
@@ -70,7 +72,9 @@ right).
   action, number of requests, data received.
 - **Where they browse**: home, library (type, genre, sort), movie or episode
   page, seasons and episodes, typed searches.
-- **What they watch**: title, position and length, percentage, pause.
+- **What they watch**: title, position and length, percentage, pause. With
+  the API key, Emby is asked every 30 s: the end of a movie is shown even when
+  the app does not report it.
 - **How it is played**, as Emby reports it: at Play, the "Playback request"
   line gives Emby's answer (direct play, or what is planned: container change,
   video and/or audio transcoded, with Emby's reasons, or a refusal with its
@@ -313,6 +317,8 @@ anglais** (bouton en haut à droite).
 |---|---|
 | **Administration d'Emby bloquée depuis Internet** | Tableau de bord, redémarrage, clés API, plugins, utilisateurs… refusés hors du réseau local, quelle que soit l'écriture de l'adresse (`//emby/…`, `/mediabrowser/…`, `%2F`, `;…`, `..`). Bouton en haut de la page pour l'autoriser / l'interdire tout de suite. Ce dont les applis ordinaires ont besoin (page de connexion, réveil du serveur, envoi des photos) reste autorisé. |
 | **Mots de passe faux** | 5 échecs en 15 min ⇒ adresse IP bannie 1 heure |
+| **Connexion Emby obligatoire depuis Internet** | un visiteur d'Internet sans connexion Emby valable n'a accès qu'à ce qui sert à se connecter (page de connexion, interface web, infos publiques du serveur) ; tout le reste est refusé avant d'atteindre Emby, et une adresse qui accumule les refus est bannie. Réglage « Depuis Internet, connexion Emby obligatoire pour tout le reste » |
+| **Administration d'Emby depuis Internet : Interdite / Lecture seule / Autorisée** | Interdite : tout le tableau de bord est refusé aux comptes administrateurs (réglages, utilisateurs, lectures en cours, journaux…), qui peuvent quand même regarder. Lecture seule : le tableau de bord s'affiche, aucune modification (réglages, utilisateurs, suppressions, métadonnées). Bouton en haut de la page et onglet Configuration |
 | **Robots bannis aussitôt** | une adresse d'Internet qui cherche des failles (`.env`, `wp-config`, `.git`, `.php`…, fichiers qui n'existent jamais sur Emby) est bannie dès sa première tentative, n'atteint jamais Emby, n'a pas de fiche dans l'Activité et ne déclenche pas de mail (onglet Sécurité seulement) |
 | **Page d'administration protégée** | **port à part** (8098) : une faille de l'interface web d'Emby ne peut pas l'atteindre ; réseau local **et** mot de passe ; protégée contre les sites piégés ; bannissement après mots de passe faux |
 | **Activité non falsifiable** | une action n'est attribuée à un utilisateur que si Emby a accepté sa requête |
@@ -334,7 +340,9 @@ Onglet **Activité**, rafraîchi toutes les 3 secondes :
   connexion, dernière action, nombre de requêtes, volume reçu.
 - **Où il navigue** : accueil, bibliothèque (type, genre, tri), fiche de film
   ou d'épisode, saisons et épisodes, recherches tapées.
-- **Ce qu'il regarde** : titre, position et durée, pourcentage, pause.
+- **Ce qu'il regarde** : titre, position et durée, pourcentage, pause. Avec
+  la clé API, Emby est interrogé toutes les 30 s : la fin d'un film s'affiche
+  même quand l'appli ne la signale pas.
 - **Comment c'est lu**, d'après Emby : au Play, la ligne « Demande de
   lecture » donne la réponse d'Emby (lecture directe, ou ce qui est prévu :
   changement de conteneur, vidéo et/ou son transcodés avec les raisons

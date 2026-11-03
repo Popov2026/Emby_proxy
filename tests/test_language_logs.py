@@ -197,7 +197,7 @@ async def test_bouton_administration_emby_depuis_internet(proxy_ini):
     st = await (await c.get("/__proxy/stats.json")).json()
     assert st["emby_admin_internet"] is False
     r = await c.post("/__proxy/emby_admin", json={"allow": True}, headers=own(c))
-    assert (await r.json()) == {"ok": True, "allow": True}
+    assert (await r.json()) == {"ok": True, "allow": True, "mode": "FULL"}
     assert g.check("8.8.8.8", "/System/Configuration") is None
     assert ep.Settings(ini).block_admin is False         # ecrit dans le fichier
     assert (await (await c.get("/__proxy/stats.json")).json())["emby_admin_internet"]
