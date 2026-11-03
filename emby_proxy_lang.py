@@ -682,9 +682,9 @@ EN = {
     "Préavis avant la coupure": "Notice before stopping",
     "Au moment de la coupure": "When stopping",
     "Variables : %pseudo%, %bonjour%, %resume%, %tempsrestant%, %periode_phrase%, "
-    "%reset%, %restant_film%, %manque%, %delai%…":
+    "%reset%, %film%, %duree_film%, %restant_film%, %manque%, %delai%…":
         "Variables: %pseudo%, %bonjour%, %resume%, %tempsrestant%, %periode_phrase%, "
-        "%reset%, %restant_film%, %manque%, %delai%…",
+        "%reset%, %film%, %duree_film%, %restant_film%, %manque%, %delai%…",
 
     # ---- onglet Journaux
     "Effacer des journaux": "Clear logs",

@@ -344,3 +344,19 @@ async def test_quotas_sans_cle_api(aiohttp_client, tmp_path, emby_mock):
     assert not proxy.quota.running and "cle API" in proxy.quota.error
     assert any("Quotas" in w for w in proxy.snapshot()["warnings"])
     proxy.quota.close()
+
+
+async def test_textes_par_defaut_affiches_avant_activation(proxy_env):
+    """Quotas pas encore actives (emby_quota.ini absent) : la page affiche
+    quand meme les textes livres (%pseudo%, %resume%...) pour les preparer."""
+    proxy, c, ini = proxy_env
+    assert not (ini.parent / "emby_quota.ini").exists()
+    await login(c, proxy)
+    d = await (await c.get("/__proxy/quotas.json")).json()
+    v = d["values"]
+    assert "%pseudo%" in v["enforcement.login_text"]
+    assert "%reset%" in v["enforcement.stopped_text"]
+    assert v["enforcement.login_header"]
+    assert v["quota.reset_time"] == "04:00"
+    assert not d.get("error")
+    assert not (ini.parent / "emby_quota.ini").exists()   # rien ecrit en lisant

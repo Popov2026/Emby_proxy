@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.5"
+__version__ = "2.5.6"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2378,7 +2378,7 @@ QUOTA_SCHEMA = [
             _qf("enforcement", kind + "_header", "%s : titre" % lbl, "text"),
             _qf("enforcement", kind + "_text", "%s : texte" % lbl, "textarea",
                 "Variables : %pseudo%, %bonjour%, %resume%, %tempsrestant%, "
-                "%periode_phrase%, %reset%, %restant_film%, %manque%, %delai%…"))]},
+                "%periode_phrase%, %reset%, %film%, %duree_film%, %restant_film%, %manque%, %delai%…"))]},
 ]
 QUOTA_FIELDS = {"%s.%s" % (f["sec"], f["key"]): f
                 for grp in QUOTA_SCHEMA for f in grp["fields"]}
@@ -2565,8 +2565,18 @@ class QuotaService:
         return out
 
     def values(self):
-        """Valeurs effectives a afficher dans le formulaire."""
-        cfg = self.qcfg or self._load()
+        """Valeurs effectives a afficher dans le formulaire.
+
+        Quotas pas encore actives (fichier absent) : les valeurs livrees, dont
+        les textes des messages, sont affichees pour qu'on puisse les preparer."""
+        cfg = self.qcfg
+        if cfg is None:
+            if os.path.exists(self.path):
+                cfg = self._load()
+            else:
+                example = APP_DIR / "emby_quota.ini.example"
+                cfg = (self._load(str(example)) if example.exists()
+                       else self.eq.Config())
         vals = {}
         for k, f in QUOTA_FIELDS.items():
             if f["key"] in ("daily_minutes", "weekly_minutes", "monthly_minutes"):
