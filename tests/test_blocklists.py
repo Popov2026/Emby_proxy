@@ -120,6 +120,8 @@ async def test_gardees_sur_disque_et_liste_injoignable(env):
         assert p.blocklists.match(CLOUD_BOT)
         lists["up"] = False                                # liste en panne
         p2, c2 = await make()                              # redemarrage
+        assert p2.blocklists.match(CLOUD_BOT) == ""        # rien lu au demarrage
+        p2.blocklists.load_missing()                       # ensuite, en arriere-plan
         assert p2.blocklists.match(CLOUD_BOT)              # depuis le disque
         await p2.blocklists.refresh(s, force=True)
         snap = p2.blocklists.snapshot()[0]

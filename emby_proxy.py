@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.6"
+__version__ = "2.6.7"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1378,7 +1378,13 @@ class Blocklists:
         with self._lock:
             for name in [n for n in self.tables if n not in self.sel]:
                 del self.tables[name]
-        for name in self.sel:
+        # rien n'est lu ici : les listes sont chargees apres le demarrage,
+        # en arriere-plan (load_missing), le proxy repond deja
+
+    def load_missing(self):
+        """Listes choisies pas encore en memoire : relues depuis le disque
+        (dans un fil a part, jamais pendant le demarrage)."""
+        for name in list(self.sel):
             if name not in self.tables:
                 self._load_cache(name)
 
@@ -3651,10 +3657,23 @@ class EmbyProxy:
                 banned.dirty = True
                 log.warning("bannissements : ecriture impossible : %s", exc)
 
+    async def _blocklists_apply(self):
+        """Reglages des listes changes : disque puis telechargement, en
+        arriere-plan (la page repond aussitot)."""
+        await asyncio.get_running_loop().run_in_executor(None,
+                                                         self.blocklists.load_missing)
+        await self.blocklists.refresh(self.session)
+
     async def _blocklists_loop(self):
         """Listes d'adresses a bloquer : peu apres le demarrage, puis les
         listes de plus de 6 h (ou en erreur) toutes les 30 min."""
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)                 # le proxy repond deja
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self.blocklists.load_missing)
+        except Exception:
+            log.exception("listes de blocage (disque)")
+        await asyncio.sleep(3)
         while True:
             try:
                 await self.blocklists.refresh(self.session)
@@ -5266,7 +5285,7 @@ class EmbyProxy:
                 setattr(self.cfg, a, getattr(fresh, a))
             self.blocklists.configure(self.cfg)
             self._tasks.append(asyncio.get_running_loop().create_task(
-                self.blocklists.refresh(self.session)))
+                self._blocklists_apply()))
             self.cfg.config_warnings = fresh.config_warnings
             self.cache.max_bytes = self.cfg.cache_max
             await asyncio.get_running_loop().run_in_executor(None, self.cache._evict)
