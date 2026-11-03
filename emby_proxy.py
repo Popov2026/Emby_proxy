@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.1"
+__version__ = "2.6.2"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2836,6 +2836,11 @@ class QuotaService:
     def reset(self, user_id):
         self.eq.reset_user(self.qcfg, self.store, user_id, self._user_name(user_id))
 
+    def wake(self, delay=1.0):
+        """Debut de lecture vu par le proxy : cycle des quotas avance."""
+        if self.monitor is not None and self.running:
+            self.monitor.wake(delay)
+
     def greet(self, user_name):
         return self.monitor.greet_now(user_name or "", journalise=True)
 
@@ -2853,6 +2858,13 @@ class _RoutedApi:
 
     def __getattr__(self, name):
         return getattr(self._api, name)
+
+    def __setattr__(self, name, value):
+        # adresse, cle, delai changes a chaud : sur le vrai client de l'API
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._api, name, value)
 
     def sessions(self):
         found = self._api.sessions()
@@ -4104,6 +4116,10 @@ class EmbyProxy:
         finally:
             if act and todo:
                 act.after(c, todo, up.status)
+            if request.method == "POST" and up.status < 400:
+                mp = RE_PLAYING.match(np)
+                if mp and not mp.group("what"):
+                    self.quota.wake()            # debut de lecture : quotas tout de suite
             if up.status == 401 and not is_login and self._has_token(request):
                 self._bad_token(request)
             if act and c is not None and c.user_id and up.status >= 400 \

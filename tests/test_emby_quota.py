@@ -2224,19 +2224,30 @@ class TestLoginGreeting(BaseCase):
         self.tick(20)
         self.assertEqual(self.emby.messages, [])
 
-    def test_no_duplicate_with_the_start_message(self):
-        """Connexion + lecture immediate : un seul message, pas deux."""
+    def test_start_message_follows_the_greeting(self):
+        """Connexion + lecture immediate : l'accueil d'abord, puis le message de
+        debut de lecture une fois l'accueil affiche (ni perdu, ni par-dessus)."""
         self.cfg.warn_on_start = True
         self.tick()
         self.emby.add_session("s1", "u-kid", "Enfant1", item="Le Grand Bleu")
         self.tick(20)
         self.assertEqual(len(self.emby.messages), 1)
         self.assertEqual(self.emby.messages[0][1]["Header"], "Temps de visionnage")
-        # le titre suivant declenche bien le message de debut de lecture
-        self.emby.sessions[0]["NowPlayingItem"] = {"Id": "item-2", "Name": "Suite"}
-        self.tick(20)
+        affiche = self.cfg.timeout_seconds("login")
+        self.clock.advance(affiche - 1)
+        self.monitor.flush_pending_messages()
+        self.assertEqual(len(self.emby.messages), 1)      # pas par-dessus l'accueil
+        self.clock.advance(3)
+        self.monitor.flush_pending_messages()
         self.assertEqual(len(self.emby.messages), 2)
         self.assertEqual(self.emby.messages[1][1]["Header"], "Bon film")
+        self.tick(20)                                      # pas de doublon ensuite
+        self.assertEqual(len(self.emby.messages), 2)
+        # le titre suivant declenche bien le message de debut de lecture, aussitot
+        self.emby.sessions[0]["NowPlayingItem"] = {"Id": "item-2", "Name": "Suite"}
+        self.tick(20)
+        self.assertEqual(len(self.emby.messages), 3)
+        self.assertEqual(self.emby.messages[2][1]["Header"], "Bon film")
 
     def test_custom_template_variables(self):
         self.cfg.login_header = "{greeting} {user}"

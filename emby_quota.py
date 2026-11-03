@@ -1063,6 +1063,7 @@ class Monitor:
         self._last_seen: Dict[str, float] = {}  # session_id -> horodatage
         self._pending_stop: Dict[str, float] = {}  # user_id -> echeance
         self._announced: Dict[str, str] = {}  # session_id -> item deja annonce
+        self._greeted_at: Dict[str, float] = {}  # session_id -> envoi de l'accueil
         self._known_sessions: Optional[set] = None  # None = amorcage au 1er cycle
         # sessions deja signalees comme incapables d'afficher un message
         self._muettes: set = set()
@@ -1394,6 +1395,9 @@ class Monitor:
         for sid in list(self._announced):
             if sid not in vues:
                 self._announced.pop(sid, None)
+        for sid in list(self._greeted_at):
+            if sid not in vues:
+                self._greeted_at.pop(sid, None)
 
         for user_id, (user_name, user_sessions, delta) in per_user.items():
             binding = self._account(user_id, user_name, delta, now_dt)
@@ -1785,10 +1789,9 @@ class Monitor:
             kind="login",
             session=session,
         )
-        # evite un doublon immediat avec le message de debut de lecture
-        item = session.get("NowPlayingItem") or {}
-        if item:
-            self._announced[session_id] = item.get("Id") or item.get("Name", "")
+        # le message de debut de lecture, s'il doit partir, attendra la fin de
+        # l'affichage de celui-ci (au lieu d'etre perdu ou de le recouvrir)
+        self._greeted_at[session_id] = self.clock()
         LOG.info("Recapitulatif de connexion pour %s : %s", user_name, resume)
         if journalise:
             self.store.log_event(now_ts, user_id, user_name, "login", resume)
@@ -1912,15 +1915,23 @@ class Monitor:
                 continue  # rien a envoyer pour ce titre
 
             self._announced[session_id] = item
-            self._send_message(
-                session_id,
-                self._format(header, row, scope, remaining, allowed, period_end,
-                             session, title_info),
-                self._format(text, row, scope, remaining, allowed, period_end,
-                             session, title_info),
-                kind=kind,
-                session=session,
-            )
+            entete = self._format(header, row, scope, remaining, allowed, period_end,
+                                  session, title_info)
+            corps = self._format(text, row, scope, remaining, allowed, period_end,
+                                 session, title_info)
+            accueil = self._greeted_at.pop(session_id, None)
+            attente = 0.0
+            if accueil is not None:
+                # accueil envoye a l'instant (appli ouverte et film lance aussitot) :
+                # ce message part juste apres la fin de son affichage
+                affiche = self.cfg.timeout_seconds("login") or 8
+                attente = accueil + min(affiche, 30) + 1 - self.clock()
+            if attente > 0:
+                self._pending_messages.append(
+                    (self.clock() + attente, session_id, entete, corps, kind))
+            else:
+                self._send_message(session_id, entete, corps, kind=kind,
+                                   session=session)
             if trop_court:
                 LOG.info(
                     "Quota insuffisant pour %s : reste %s, '%s' dure encore %s",
@@ -2161,6 +2172,15 @@ class Monitor:
 
     # -- boucle ------------------------------------------------------------
 
+    _wake_at = 0.0
+
+    def wake(self, delay: float = 1.0) -> None:
+        """Avance le prochain cycle (le proxy a vu un debut de lecture) : le
+        message de debut de film part tout de suite, pas au cycle suivant."""
+        at = time.time() + max(0.0, delay)
+        if not self._wake_at or at < self._wake_at:
+            self._wake_at = at
+
     def run_forever(self, stop_flag: Callable[[], bool]) -> None:
         LOG.info(
             "Demarrage : %s, quotas %s, scrutation %s s%s%s",
@@ -2176,6 +2196,7 @@ class Monitor:
         )
         while not stop_flag():
             started = time.time()
+            self._wake_at = 0.0
             try:
                 self.tick()
             except Exception:  # pragma: no cover - filet de securite du daemon
@@ -2184,7 +2205,9 @@ class Monitor:
             remaining = max(0.5, self.cfg.poll_interval - elapsed)
             end = time.time() + remaining
             while time.time() < end and not stop_flag():
-                time.sleep(0.5)
+                if self._wake_at and time.time() >= self._wake_at:
+                    break                 # debut de lecture vu par le proxy
+                time.sleep(0.25)
                 try:
                     self.flush_pending_messages()
                 except Exception:  # pragma: no cover - filet
