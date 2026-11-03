@@ -195,3 +195,45 @@ def test_ancien_fichier_nettoye(tmp_path):
                  encoding="utf-8")
     a = ep.Attempts(f)
     assert list(a.items["1.2.3.4"]["tried"]) == ["GET /emby/System/Info?api_key=***"]
+
+
+async def test_ancienne_cle_renvoyee_une_seule_cle_comptee(env):
+    """Cas reel (Shield d'un ami) : la meme ancienne cle refusee 3 fois par
+    Emby -> 1 seule cle, pas de bannissement ; 3 cles differentes -> banni."""
+    make, _ = env
+    proxy, c = await make()
+    shield = {"User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SHIELD Android TV)",
+              "X-Emby-Authorization": 'MediaBrowser Client="AndroidTv", Device="SHIELD", '
+                                      'DeviceId="abc", Token="ANCIENNE"'}
+    for _ in range(3):
+        r = await c.get("/emby/Users/%s/Items" % UID, headers=dict(via(FRIEND), **shield))
+        assert r.status == 401
+    a = card(proxy, FRIEND)
+    assert a["cats"] == {"bad_key": 3} and a["keys_n"] == 1
+    assert not a["banned_s"]
+    for k in ("K1", "K2", "K3"):
+        await c.get("/emby/Users/%s/Items" % UID, headers=via(GUESSER, **{"X-Emby-Token": k}))
+    g = card(proxy, GUESSER)
+    assert g["keys_n"] == 3 and g["banned_s"] > 0
+
+
+async def test_dernieres_requetes_de_l_appareil(env):
+    make, _ = env
+    proxy, c = await make()
+    r = await c.post("/emby/Users/AuthenticateByName", headers=via(FRIEND),
+                     json={"Username": "Bob", "Pw": "bon"})
+    tok = (await r.json())["AccessToken"]
+    h = dict(via(FRIEND), **{"X-Emby-Authorization": 'MediaBrowser Client="AndroidTv", '
+                             'Device="SHIELD", DeviceId="shield1", Token="%s"' % tok})
+    await c.get("/emby/Users/%s/Items?api_key=%s&Limit=5" % (UID, tok), headers=h)
+    await c.get("/emby/System/Configuration", headers=h)     # administration refusee
+    await c.get("/emby/system/info?format=json", headers=h)  # comme la Shield
+    snap = proxy.activity.snapshot()
+    card_ = [x for x in snap["clients"] if x["device"] == "SHIELD"][0]
+    lines = ["%s %s %s" % (r["m"], r["p"], r["s"]) for r in card_["recent"]]
+    assert any(l.startswith("GET /emby/Users/%s/Items?api_key=***&Limit=5 200" % UID)
+               for l in lines), lines
+    assert tok not in " ".join(lines)
+    assert any("system/info" in l and "adresse annoncee a l'appli : https://" in l
+               for l in lines), lines
+    assert card_["key"] and len(card_["key"]) == 12

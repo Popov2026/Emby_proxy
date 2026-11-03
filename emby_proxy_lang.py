@@ -782,6 +782,13 @@ EN = {
         "{0} address(es) · {1} banned right now · {2} attempt(s) in total",
     "Aucune tentative suspecte.": "No suspicious attempt.",
     "Appareils enregistrés dans Emby": "Devices registered in Emby",
+    "Dernières requêtes ({0})": "Latest requests ({0})",
+    "Clé de session refusée par Emby (périmée ou inventée)": "Session key refused by Emby (expired or invented)",
+    "Clés de session refusées par Emby (périmées ou inventées)": "Session keys refused by Emby (expired or invented)",
+    "1 seule clé refusée, renvoyée plusieurs fois : une appli avec une ancienne session, à reconnecter avec le mot de passe.":
+        "Only 1 key refused, sent again several times: an app with an old session, to log in again with the password.",
+    "{0} clés différentes refusées : quelqu'un essaie d'en deviner une (bannie dès 3).":
+        "{0} different keys refused: someone is trying to guess one (banned from 3).",
     "Listes d'adresses bloquées": "Blocked address lists",
     "Listes publiques d'adresses d'attaquants et d'hébergeurs, mises à jour toutes les 6 h. Choix des listes et exceptions : onglet Configuration, partie Sécurité.":
         "Public lists of attacker and hosting addresses, updated every 6 h. Lists and exceptions: Settings tab, Security part.",

@@ -382,6 +382,11 @@ async def main():
             await p.click("button[data-t=act]")
             await p.wait_for_timeout(3500)
             check("onglet Activite : paul affiche", "paul" in await p.inner_text("body"))
+            await p.click("details.rq summary >> nth=0")
+            await p.wait_for_timeout(300)
+            rq = await p.inner_text("details.rq >> nth=0")
+            check("fiche de l'appareil : dernieres requetes (lecture comprise, cles masquees)",
+                  "PlaybackInfo" in rq and "api_key=***" in rq and TOK not in rq, rq[:400])
             if os.environ.get("FUNC_SHOT"):
                 await p.set_viewport_size({"width": 1200, "height": 900})
                 await p.locator("h2:has-text('Tentatives suspectes')").scroll_into_view_if_needed()

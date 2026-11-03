@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.7"
+__version__ = "2.6.8"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1872,7 +1872,7 @@ class Attempts:
                 pass
 
     def record(self, key, ip, local, cat, what="", user="", agent="", now=None,
-               uid=""):
+               uid="", keyhash=""):
         now = now or time.time()
         a = self.items.get(key)
         if a is None:
@@ -1886,6 +1886,11 @@ class Attempts:
             for t, w in self.pending_seen.pop(key, ()):   # vu avant la 1re tentative
                 self._add_seen(a, w, t)
         a.setdefault("uids", [])
+        if keyhash:
+            ks = a.setdefault("keys", [])
+            if keyhash not in ks:
+                ks.append(keyhash)
+                del ks[:-20]
         if uid and uid not in a["uids"]:
             a["uids"].append(uid)
             del a["uids"][:-10]
@@ -1978,6 +1983,7 @@ class Attempts:
                 "agents": a["agents"], "ban": a.get("ban", ""),
                 "banned_s": int(banned) if banned > 0 else 0,
                 "ok_user": a.get("ok_user", ""), "uids": a.get("uids", []),
+                "keys_n": len(a.get("keys", [])),
                 "seen": [{"what": w, "n": v[0], "t": int(v[1])}
                          for w, v in reversed(list(a.get("seen", {}).items()))],
                 "tried": [{"what": w, "n": v[0], "t": int(v[1])}
@@ -2114,6 +2120,7 @@ class Client:
         self.location_at = 0.0
         self.playing = None         # lecture en cours
         self.events = deque(maxlen=300)
+        self.recent = deque(maxlen=80)   # dernieres requetes (diagnostic)
 
 
 class Activity:
@@ -2600,6 +2607,7 @@ class Activity:
                       "percent": round(100 * pos / dur, 1) if dur else None,
                       "since": int(now - p["started"])}
             out.append({
+                "key": hashlib.sha256(str(c.key).encode()).hexdigest()[:12],
                 "user": c.user_name or (c.user_id[:8] if c.user_id else "inconnu"),
                 "client": c.client, "device": c.device, "version": c.version,
                 "ip": c.ip, "local": c.local, "user_agent": c.user_agent,
@@ -2611,7 +2619,9 @@ class Activity:
                 if c.location_at else None, "playing": pl,
                 "events": [{"t": int(e["t"]), "kind": e["kind"],
                             "text": self.render(e["text"], e["item"])}
-                           for e in list(c.events)[-limit_events:]][::-1]})
+                           for e in list(c.events)[-limit_events:]][::-1],
+                "recent": [{"t": round(r[0], 1), "m": r[1], "p": r[2], "s": r[3],
+                            "ms": r[4]} for r in list(c.recent)][::-1]})
         feed = []
         for e in list(self.feed)[-300:][::-1]:
             c = self.clients.get(e["client"])
@@ -3949,6 +3959,7 @@ class EmbyProxy:
             if not (cat == "rate" and known is not None):   # vrai utilisateur trop rapide
                 self._attempt(request, ip, cat,
                               user=known.user_name if known is not None else "")
+            self._note_request(known, request, refus[0], time.time(), "  [refus du proxy]")
             if refus[0] == 429:
                 # debit depasse : note aussi (une ligne par minute et par adresse,
                 # les suivantes sont comptees), sinon invisible dans la page
@@ -4178,7 +4189,7 @@ class EmbyProxy:
         self.admin_cache[uid] = (admin, time.time() + 600)
         return admin
 
-    def _attempt(self, request, ip, cat, what=None, user=""):
+    def _attempt(self, request, ip, cat, what=None, user="", keyhash=""):
         """Note une tentative suspecte (onglet Activite, Tentatives suspectes)."""
         if not ip:
             return
@@ -4192,7 +4203,7 @@ class EmbyProxy:
                 and len(self.activity.info.pending_users) < 1000:
             self.activity.info.pending_users.add(uid)     # nom demande a Emby
         self.attempts.record(self.guard.key(ip), ip, self.guard.is_local(ip), cat,
-                             what, user, agent, uid=uid)
+                             what, user, agent, uid=uid, keyhash=keyhash)
 
     _PUBLIC_NOISE = re.compile(r"^/(?:$|web(?:/|$)|favicon\.ico$|robots\.txt$|"
                                r"System/Ping)", re.I)
@@ -4227,6 +4238,7 @@ class EmbyProxy:
             self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
                 why, request.method, request.path[:80]), merge=60)
         self._attempt(request, ip, "admin", user=c.user_name if c is not None else "")
+        self._note_request(c, request, status, time.time(), "  [refus du proxy]")
         return web.Response(status=status, text=why)
 
     # -- connexion Emby obligatoire depuis Internet ------------------------
@@ -4292,9 +4304,10 @@ class EmbyProxy:
         tok = Activity._auth_fields(request).get("token", "")
         key = self.guard.key(ip)
         now = time.time()
-        self._attempt(request, ip, "bad_key")
+        kh = hashlib.sha256(tok.encode()).hexdigest()[:16]
+        self._attempt(request, ip, "bad_key", keyhash=kh)
         tried = self.badtok_hits.setdefault(key, {})
-        tried[hashlib.sha256(tok.encode()).hexdigest()[:16]] = now
+        tried[kh] = now
         for k in [k for k, t in tried.items() if now - t > 600]:
             del tried[k]
         if len(tried) >= self.BAD_KEYS_MAX and self.guard.banned.get(key, 0) <= now:
@@ -4406,7 +4419,20 @@ class EmbyProxy:
         return value
 
     # -- HTTP generique (pages, API, video...) ---------------------------
+    @staticmethod
+    def _note_request(c, request, status, t0, note=""):
+        """Derniere requete d'un appareil (fiche Activite, pour comprendre ce
+        qu'une appli demande vraiment ; cles masquees)."""
+        if c is None:
+            return
+        if request.get("announced"):
+            note += "  [adresse annoncee a l'appli : %s]" % request["announced"]
+        c.recent.append((time.time(), _safe(request.method, 10),
+                         redact(request.path_qs)[:160] + note, status,
+                         int((time.time() - t0) * 1000)))
+
     async def proxy_http(self, request):
+        t_start = time.time()
         url = self.cfg.upstream + request.raw_path
         data = request.content if request.body_exists else None
         act, c, todo, tee = self.activity, None, [], False
@@ -4522,6 +4548,7 @@ class EmbyProxy:
             if up.status == 401 and not is_login and self._has_token(request):
                 self._bad_token(request)
             self._note_public(request, np, is_login, up.status)
+            self._note_request(c, request, up.status, t_start)
             if act and c is not None and c.user_id and up.status >= 400 \
                     and not is_login \
                     and not any(k in ("pbinfo", "stream", "login", "delete")
@@ -4635,6 +4662,7 @@ class EmbyProxy:
         # avec Android TV (version 2.1.3, essayee sur une box Android TV).
         proto, host, sure = self._public_origin(request, certain=True)
         origin = "%s://%s" % (proto, host)
+        request["announced"] = origin if sure else "aucune (relais sans X-Forwarded-Proto)"
         for k in ("LocalAddress", "WanAddress", "LocalAddresses", "RemoteAddresses"):
             if k not in data:
                 continue
@@ -4680,7 +4708,8 @@ class EmbyProxy:
     async def proxy_ws(self, request):
         if self.activity:
             tok = Activity._auth_fields(request).get("token", "")
-            self.activity.identify(request, trusted=tok in self.activity.token_user)
+            wc = self.activity.identify(request, trusted=tok in self.activity.token_user)
+            self._note_request(wc, request, 101, time.time(), "  [WebSocket]")
         ws_url = re.sub(r"^http", "ws", self.cfg.upstream) + request.raw_path
         keep = {"cookie", "authorization", "x-emby-authorization", "x-emby-token",
                 "user-agent", "origin"}
@@ -5925,7 +5954,8 @@ h1{font-size:19px;margin:0 0 12px}h2{font-size:15px;margin:22px 0 10px}
 .g{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
 .att .cat{display:inline-block;margin:3px 6px 0 0;padding:1px 7px;border-radius:10px;border:1px solid var(--line);font-size:12px}
 .att .cat.robot,.att .cat.bad_key,.att .cat.password,.att .cat.admin_password{border-color:var(--bad);color:var(--bad)}
-.att .tried{margin-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all}
+details.rq{margin-top:6px}details.rq summary{cursor:pointer;color:var(--mut);font-size:12px}
+.att .tried,details.rq .tried{margin-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all}
 .att .tried div{padding:1px 0;border-top:1px dashed var(--line)}.att .tried time{color:var(--mut);margin-right:6px}
 .att .st{margin-top:6px}.att .st.ban{color:var(--bad)}.att .st.ok{color:var(--ok)}
 .users{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
@@ -5977,7 +6007,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
       <option value="robot">Robots qui cherchent des failles</option>
       <option value="password">Mots de passe Emby faux</option>
       <option value="admin_password">Mots de passe de la page d'administration faux</option>
-      <option value="bad_key">Clés de session inventées</option>
+      <option value="bad_key">Clés de session refusées par Emby (périmées ou inventées)</option>
       <option value="anon">Accès sans connexion</option>
       <option value="admin">Administration d'Emby refusée</option>
       <option value="banned">Requêtes d'adresses bannies</option>
@@ -6160,6 +6190,7 @@ document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='logs')loadLogs();
   if(b.dataset.t==='conf')loadConf();});
 
+const openRq=new Set();
 function userCard(u){
   const c=el('div','c');
   const top=el('div');const dot=el('span','dot');dot.style.background=u.playing?'var(--ok)':u.active?'var(--info)':'#555';
@@ -6175,6 +6206,10 @@ function userCard(u){
     if(p.percent!=null){const bar=el('div','bar'),i=el('i');i.style.width=Math.min(100,p.percent)+'%';bar.append(i);b.append(bar)}
     c.append(b)}
   if(u.location){const l=el('div','loc');l.append(el('span','l',T('Où :')+' '),el('span',null,u.location),el('span','sub','  '+ago(u.location_s)));c.append(l)}
+  if((u.recent||[]).length){const det=el('details','rq'),sm=el('summary',null,TF('Dernières requêtes ({0})',u.recent.length));det.append(sm);
+    const box=el('div','tried');u.recent.forEach(r=>{const d=el('div');if(r.s>=400)d.style.color='var(--bad)';
+      d.append(el('time',null,hm(r.t)));d.append(document.createTextNode(r.m+' '+r.p+' → '+r.s+' ('+r.ms+' ms)'));box.append(d)});
+    det.append(box);det.open=openRq.has(u.key);det.ontoggle=()=>det.open?openRq.add(u.key):openRq.delete(u.key);c.append(det)}
   if(u.events.length){const ev=el('div','ev');
     u.events.forEach(e=>{const r=el('div','e k-'+e.kind);r.append(el('time',null,hm(e.t)),el('span',null,e.text));ev.append(r)});c.append(ev)}
   return c}
@@ -6182,7 +6217,7 @@ function userCard(u){
 const PERM=10*365*86400;
 const banLeft=s=>s>PERM?T('définitif'):s>=86400?TF('{0} j',Math.ceil(s/86400)):s>=3600?TF('{0} h',Math.ceil(s/3600)):Math.ceil(s/60)+' min';
 const ACAT={robot:'Robot (recherche de failles)',password:'Mot de passe Emby faux',
-  admin_password:"Mot de passe de la page d'administration faux",bad_key:'Clé de session inventée',
+  admin_password:"Mot de passe de la page d'administration faux",bad_key:'Clé de session refusée par Emby (périmée ou inventée)',
   anon:'Accès sans connexion',admin:"Administration d'Emby refusée",banned:'Requête alors que bannie',
   rate:'Trop de requêtes',blocklist:'Adresse sur une liste de blocage',direct:'Connexion directe sans le relais HTTPS',refused:'Accès refusé'};
 let lastDev=null,devDel=null;
@@ -6218,6 +6253,8 @@ function attCard(a){
   c.append(el('div','sub',TF('{0} tentative(s) · première {1} · dernière {2}',a.total,day(a.first),day(a.last))));
   const cats=el('div');Object.entries(a.cats).sort((x,y)=>y[1]-x[1]).forEach(([k,n])=>cats.append(el('span','cat '+k,T(ACAT[k]||k)+' ×'+n)));c.append(cats);
   if(a.users.length)c.append(el('div','sub',TF('Comptes essayés : {0}',a.users.join(', '))));
+  if(a.cats.bad_key&&a.keys_n)c.append(el('div','sub',a.keys_n===1?T('1 seule clé refusée, renvoyée plusieurs fois : une appli avec une ancienne session, à reconnecter avec le mot de passe.')
+    :TF('{0} clés différentes refusées : quelqu\'un essaie d\'en deviner une (bannie dès 3).',a.keys_n)));
   (a.accounts||[]).forEach(u=>{const box=el('div','st');
     box.append(el('div',null,TF('Compte Emby visé : {0}',(u.name||T('nom inconnu'))+' ('+u.id.slice(0,8)+'…)')));
     const dv=devicesOf(u.id,u.name);
