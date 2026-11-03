@@ -17,6 +17,8 @@ async def env(aiohttp_server, tmp_path):
     async def any_(request):
         if "X-Forwarded-Proto" in request.headers:
             seen.append(request.path)
+        if request.headers.get("X-Emby-Token", "").startswith("FAKE"):
+            return web.Response(status=401)          # cle inconnue d'Emby
         return web.Response(status=404)
 
     async def info(request):
@@ -103,3 +105,21 @@ async def test_option_desactivable(env):
     r = await c.get("/.env", headers=dict(via(BOT), **{"X-Emby-Token": "TOK"}))
     assert r.status == 404 and seen == ["/.env"]       # transmis (Emby : 404)
     assert proxy.guard.check(BOT, "/") is None
+
+
+def test_adresse_encodee_plusieurs_fois_controlee_sous_sa_vraie_forme():
+    """Trouve par la simulation d'attaques : /web/%252e%252e/Items passait
+    pour une page de l'interface web."""
+    for p in ("/web/%2e%2e/Items", "/web/%252e%252e/Items", "/web/%25252e%25252e/Items",
+              "/web/..%252fItems"):
+        assert ep.norm_path(p) == "/Items", p
+    assert not ep.PUBLIC_RE.match(ep.norm_path("/web/%252e%252e/Items"))
+
+
+async def test_cles_de_session_inventees_bannies(env):
+    """Trouve par la simulation d'attaques : 40 fausses cles depuis la meme
+    adresse n'entrainaient pas de bannissement."""
+    proxy, c, _ = env
+    for i in range(25):
+        await c.get("/emby/Items", headers=dict(via(BOT), **{"X-Emby-Token": "FAKE%d" % i}))
+    assert proxy.guard.check(BOT, "/")[0] == 403

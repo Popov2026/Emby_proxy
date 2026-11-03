@@ -271,6 +271,15 @@ Docker environment variables: `EMBY_PROXY_UPSTREAM`, `EMBY_PROXY_PORT`,
 pip install -r requirements-dev.txt
 pytest
 ```
+
+Attack simulation: `python tools/attack_simulation.py` starts a proxy and a fake
+Emby locally (never your real server) and replays 59 attacks (access without
+login, address tricks towards the administration and past the login, invented
+session keys, password brute force including IPv6, address spoofing, admin page
+brute force and malicious-site requests, scanners, WebSocket, request
+smuggling, giant requests, header injection, information leaks) plus a
+legitimate user who must not be blocked. An attack counts as successful if a
+forbidden request reaches Emby. Run on GitHub before every release.
 The tests run the proxy against a fake Emby server: cache, security (bypass
 attempts, bans, admin page), activity, settings, mail alerts (fake SMTP),
 quotas, translation, log clearing, what the Android TV and iPhone apps send
@@ -558,6 +567,16 @@ Variables d'environnement (Docker) : `EMBY_PROXY_UPSTREAM`,
 pip install -r requirements-dev.txt
 pytest
 ```
+
+Simulation d'attaques : `python tools/attack_simulation.py` lance un proxy et un
+faux Emby en local (jamais ton vrai serveur) et rejoue 59 attaques (accès sans
+connexion, adresses piégées vers l'administration et pour contourner la
+connexion, clés de session inventées, force brute des mots de passe y compris
+en IPv6, usurpation d'adresse, force brute et sites piégés sur la page
+d'administration, robots, WebSocket, contrebande de requêtes, requêtes géantes,
+injection d'en-têtes, fuites d'informations) plus un utilisateur légitime qui
+ne doit pas être bloqué. Une attaque réussit si une requête interdite arrive
+jusqu'à Emby. Lancée sur GitHub avant chaque version.
 Les tests font tourner le proxy contre un faux serveur Emby : cache, sécurité
 (tentatives de contournement, bannissements, page d'administration),
 activité, configuration, alertes par mail (faux serveur SMTP), quotas,

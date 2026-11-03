@@ -57,15 +57,15 @@ import webbrowser
 import zlib
 from collections import deque
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
-from aiohttp import ClientError
+from aiohttp import ClientError, WSServerHandshakeError
 
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.2"
+__version__ = "2.5.3"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1060,7 +1060,15 @@ def norm_path(path):
     fin de segment et prefixes /emby ou /mediabrowser retires. Toutes les
     regles de securite et de suivi portent sur cette forme : on ne peut pas
     les contourner en ecrivant //emby/System/... ou /mediabrowser/...."""
-    p = (path or "/").replace("\\", "/")
+    p = path or "/"
+    # adresse encodee plusieurs fois (%252e%252e = ..) : decodee jusqu'a ce
+    # qu'elle ne change plus, pour que les controles voient sa vraie forme
+    for _ in range(4):
+        q = unquote(p)
+        if q == p:
+            break
+        p = q
+    p = p.replace("\\", "/")
     segs = [seg.split(";", 1)[0].strip() for seg in p.split("/")]
     p = posixpath.normpath("/" + "/".join(x for x in segs if x))
     if p.startswith("//"):
@@ -2921,6 +2929,7 @@ class EmbyProxy:
         self.auth_ips = {}              # adresse -> fin de validite (utilisateur connecte)
         self.admin_cache = {}           # utilisateur -> (administrateur ?, fin)
         self.anon_hits = {}             # adresse -> requetes refusees sans connexion
+        self.badtok_hits = {}           # adresse -> cles de session refusees par Emby
         self._emby_fail = 0
         self.restart_event = threading.Event()   # bouton Redemarrer de la page
         self.restart_error = ""
@@ -3631,6 +3640,28 @@ class EmbyProxy:
             self.anon_hits.clear()
         return web.json_response({"error": "login required"}, status=401)
 
+    def _bad_token(self, request):
+        """Cle de session refusee par Emby. Une adresse d'Internet qui en essaie
+        beaucoup (20 en 10 min) cherche a en deviner une : bannie. Une appli
+        dont la session a expire n'en envoie que quelques-unes avant de se
+        reconnecter."""
+        ip = request.get(CLIENT_IP, "")
+        if not ip or self.guard.is_local(ip):
+            return
+        key = self.guard.key(ip)
+        now = time.time()
+        hits = self.badtok_hits.setdefault(key, deque(maxlen=100))
+        hits.append(now)
+        while hits and now - hits[0] > 600:
+            hits.popleft()
+        if len(hits) >= 20 and self.guard.banned.get(key, 0) <= now:
+            self.guard.banned[key] = now + self.cfg.ban_seconds
+            self.seclog.add("ban", ip, False, detail="robot : %d cles de session "
+                            "refusees en 10 min" % len(hits), ban_key=key)
+            log.warning("robot banni : %s (%d cles de session refusees)", ip, len(hits))
+        if len(self.badtok_hits) > 20000:
+            self.badtok_hits.clear()
+
     def _scanner(self, request, ip):
         """Robot qui cherche des failles : banni des sa premiere tentative
         (jamais une adresse du reseau local, qui peut etre le relais HTTPS)."""
@@ -3839,6 +3870,8 @@ class EmbyProxy:
         finally:
             if act and todo:
                 act.after(c, todo, up.status)
+            if up.status == 401 and not is_login and self._has_token(request):
+                self._bad_token(request)
             if act and c is not None and c.user_id and up.status >= 400 \
                     and not is_login \
                     and not any(k in ("pbinfo", "stream", "login", "delete")
@@ -4009,6 +4042,13 @@ class EmbyProxy:
         try:
             up = await self.session.ws_connect(ws_url, headers=headers,
                                                protocols=protos, autoping=True)
+        except WSServerHandshakeError as exc:          # cle refusee par Emby
+            if exc.status in (401, 403):
+                self._bad_token(request)
+                return web.Response(status=exc.status, text="Unauthorized")
+            self.stats.upstream_errors += 1
+            log.warning("WebSocket Emby refuse : %s", exc)
+            return web.Response(status=502, text="Serveur Emby injoignable.")
         except (ClientError, asyncio.TimeoutError, OSError) as exc:
             self.stats.upstream_errors += 1
             log.warning("WebSocket Emby injoignable : %s", exc)

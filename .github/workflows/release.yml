@@ -26,6 +26,8 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest -q -p no:anyio
+      - name: Simulation d'attaques (59 attaques + utilisateur temoin)
+        run: python tools/attack_simulation.py
 
   windows:
     needs: tests

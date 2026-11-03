@@ -758,6 +758,7 @@ PATTERNS = [
     (r"^Refuse : (.*)$", "Refused: {1}"),
     (r"^Connexion Emby requise \((.*)\)$", "Emby login required ($1)"),
     (r"^robot : (\d+) requetes sans connexion en 10 min$", "robot: $1 requests without login in 10 min"),
+    (r"^robot : (\d+) cles de session refusees en 10 min$", "robot: $1 session keys refused in 10 min"),
     (r"^robot : recherche de failles \((.*)\)$", "robot: looking for security holes ($1)"),
     (r"^Message de quota \((direct|API)\) : (.*)$", "Quota message ($1): $2"),
     (r"^Coupure de quota \((direct|API)\)$", "Quota stop ($1)"),
