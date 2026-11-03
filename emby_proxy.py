@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.8"
+__version__ = "2.6.9"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3285,6 +3285,8 @@ FORWARD_HDRS = {"x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarde
 # pour se reconnecter, en contournant le proxy
 RE_BRANDING = re.compile(r"^/Branding/Configuration/?$", re.I)
 RE_SYSINFO = re.compile(r"^/System/Info(?:/Public)?/?$", re.I)
+# "suis-je sur le reseau local ?" : Emby ne voit que le proxy (ou le relais)
+RE_ENDPOINT = re.compile(r"^/System/Endpoint/?$", re.I)
 CHUNK = 256 * 1024
 try:                                     # aiohttp >= 3.11
     CLIENT_IP = web.RequestKey("client_ip", str)
@@ -4426,7 +4428,8 @@ class EmbyProxy:
         if c is None:
             return
         if request.get("announced"):
-            note += "  [adresse annoncee a l'appli : %s]" % request["announced"]
+            note += ("  [%s]" % request["announced"] if request["announced"].startswith(
+                "reseau local") else "  [adresse annoncee a l'appli : %s]" % request["announced"])
         c.recent.append((time.time(), _safe(request.method, 10),
                          redact(request.path_qs)[:160] + note, status,
                          int((time.time() - t0) * 1000)))
@@ -4506,6 +4509,9 @@ class EmbyProxy:
             if request.method == "GET" and up.status == 200 and RE_SYSINFO.match(np) \
                     and "json" in up.headers.get("Content-Type", ""):
                 return await self._sysinfo(request, up)
+            if request.method == "GET" and up.status == 200 and RE_ENDPOINT.match(np) \
+                    and not self.guard.is_local(request[CLIENT_IP]):
+                return await self._endpoint(request, up)
             if request.method == "GET" and up.status == 200 and RE_BRANDING.match(np) \
                     and "json" in up.headers.get("Content-Type", "") \
                     and self._admin_notice(request):
@@ -4643,6 +4649,32 @@ class EmbyProxy:
         except (ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError):
             return False
 
+    async def _endpoint(self, request, up):
+        """Appli venue d'Internet : Emby, qui ne voit que le proxy, lui repond
+        "reseau local". Une appli Android TV (Shield, Sony...) qui se croit a la
+        maison essaie alors de lire le fichier directement, sans rien demander
+        au serveur : ecran noir. La verite est rendue a l'appli (Emby, lui,
+        garde sa vision pour ses limites de debit)."""
+        raw = await up.read()
+        try:
+            data = json.loads(_decode(raw, up.headers.get("Content-Encoding")))
+        except (ValueError, OSError, zlib.error):
+            data = None
+        if not isinstance(data, dict):
+            data = {}
+        before = (data.get("IsLocal"), data.get("IsInNetwork"))
+        data["IsLocal"] = False
+        data["IsInNetwork"] = False
+        request["announced"] = "reseau local : non (Emby disait IsLocal=%s, IsInNetwork=%s)" \
+            % before
+        resp = web.json_response(data)
+        for k, v in up.headers.items():
+            if k.lower() not in HOP and k.lower() not in (
+                    "content-length", "content-encoding", "content-type"):
+                resp.headers.add(k, v)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
     async def _sysinfo(self, request, up):
         """Infos du serveur : les adresses d'Emby remplacees par celle du proxy,
         vue par l'utilisateur (sinon les applis se reconnectent en direct)."""
@@ -4709,7 +4741,9 @@ class EmbyProxy:
         if self.activity:
             tok = Activity._auth_fields(request).get("token", "")
             wc = self.activity.identify(request, trusted=tok in self.activity.token_user)
-            self._note_request(wc, request, 101, time.time(), "  [WebSocket]")
+        else:
+            wc = None
+        t_ws = time.time()
         ws_url = re.sub(r"^http", "ws", self.cfg.upstream) + request.raw_path
         keep = {"cookie", "authorization", "x-emby-authorization", "x-emby-token",
                 "user-agent", "origin"}
@@ -4725,6 +4759,7 @@ class EmbyProxy:
             up = await self.session.ws_connect(ws_url, headers=headers,
                                                protocols=protos, autoping=True)
         except WSServerHandshakeError as exc:          # cle refusee par Emby
+            self._note_request(wc, request, exc.status, t_ws, "  [WebSocket refuse par Emby]")
             if exc.status in (401, 403):
                 self._bad_token(request)
                 return web.Response(status=exc.status, text="Unauthorized")
@@ -4732,6 +4767,7 @@ class EmbyProxy:
             log.warning("WebSocket Emby refuse : %s", exc)
             return web.Response(status=502, text="Serveur Emby injoignable.")
         except (ClientError, asyncio.TimeoutError, OSError) as exc:
+            self._note_request(wc, request, 502, t_ws, "  [WebSocket : Emby injoignable]")
             self.stats.upstream_errors += 1
             log.warning("WebSocket Emby injoignable : %s", exc)
             return web.Response(status=502, text="Serveur Emby injoignable.")
@@ -4756,10 +4792,14 @@ class EmbyProxy:
             if not dst.closed:
                 await dst.close()
 
+        self._note_request(wc, request, 101, t_ws, "  [WebSocket ouvert]")
         try:
             await asyncio.gather(pump(ws, up), pump(up, ws),
                                  return_exceptions=True)
         finally:
+            if wc is not None:
+                wc.recent.append((time.time(), "WS", "fermee apres %d s" % int(
+                    time.time() - t_ws), 0, int((time.time() - t_ws) * 1000)))
             self.stats.ws_open -= 1
             if dev:
                 self.ws_by_device.get(dev, set()).discard(ws)
