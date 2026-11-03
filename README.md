@@ -103,6 +103,17 @@ before, the proxy asks Emby with the API key from the settings (optional) or
 with the user's token. User names are resolved the same way.
 
 #### Security tab
+- **Blocked address lists**, downloaded from GitHub and updated every 6 h,
+  kept on disk (folder `blocklists`, works at startup without Internet):
+  known malicious networks (FireHOL level 1: Spamhaus DROP, DShield,
+  abuse.ch…), addresses that attacked in the last 48 h (FireHOL level 2:
+  blocklist.de, DShield, GreenSnow) and **hosting providers / rented servers**
+  (DigitalOcean, Google Cloud, AWS, Azure, OVH…, where almost all bots come
+  from; also blocks a paid VPN or Safari's iCloud Private Relay). Requests
+  from these addresses are refused before Emby. Your own lists (https://
+  addresses) and exceptions in the Settings tab; the local network, the
+  HTTPS relay and non-public addresses are never blocked. Status of each
+  list (networks, last update, error) and an "Update now" button.
 - **Devices registered in Emby** (with the API key): account, device, app,
   last activity, filter by account. **Delete** a device (local network,
   admin password): its login is cancelled, it must type the password again.
@@ -410,6 +421,18 @@ ouvert, le proxy demande son nom à Emby avec la clé API des réglages
 (facultative) ou le jeton de l'utilisateur. Idem pour les noms d'utilisateurs.
 
 #### Onglet Sécurité
+- **Listes d'adresses bloquées**, téléchargées sur GitHub et mises à jour
+  toutes les 6 h, gardées sur disque (dossier `blocklists`, actives dès le
+  démarrage même sans Internet) : réseaux malveillants connus (FireHOL niveau
+  1 : Spamhaus DROP, DShield, abuse.ch…), adresses qui ont attaqué ces
+  dernières 48 h (FireHOL niveau 2 : blocklist.de, DShield, GreenSnow) et
+  **hébergeurs / serveurs loués** (DigitalOcean, Google Cloud, AWS, Azure,
+  OVH…, d'où viennent presque tous les robots ; bloque aussi un VPN payant ou
+  le Relais privé iCloud de Safari). Ces adresses sont refusées avant Emby.
+  Tes propres listes (adresses https://) et les exceptions dans l'onglet
+  Configuration ; le réseau local, le relais HTTPS et les adresses non
+  publiques ne sont jamais bloqués. État de chaque liste (réseaux, mise à
+  jour, erreur) et bouton « Mettre à jour maintenant ».
 - **Appareils enregistrés dans Emby** (avec la clé API) : compte, appareil,
   application, dernière activité, filtre par compte. **Supprimer** un
   appareil (réseau local, mot de passe de la page) : sa connexion est

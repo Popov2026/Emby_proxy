@@ -36,6 +36,7 @@ Page d'etat (port a part, reseau local + mot de passe) : http://<proxy>:8098/
 
 import argparse
 import asyncio
+import bisect
 import base64
 import configparser
 import gzip
@@ -65,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.5"
+__version__ = "2.6.6"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -104,6 +105,11 @@ DEFAULTS = {
         "block_admin_from_internet": "true",
         "admin_from_internet": "",
         "ban_scanners": "true",
+        "blocklist_known_attackers": "true",
+        "blocklist_recent_attacks": "true",
+        "blocklist_datacenters": "true",
+        "blocklist_urls": "",
+        "blocklist_exceptions": "",
         "require_login": "true",
         "login_max_failures": "5",
         "login_window_minutes": "15",
@@ -329,6 +335,22 @@ def migrate_plain_secrets(path):
     return done
 
 
+# Listes publiques d'adresses a bloquer (mises a jour en continu, sur GitHub) :
+# (nom, cle du reglage, libelle, adresse)
+BUILTIN_BLOCKLISTS = (
+    ("known_attackers", "blocklist_known_attackers",
+     "Réseaux malveillants connus (FireHOL niveau 1 : Spamhaus DROP, DShield, abuse.ch…)",
+     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"),
+    ("recent_attacks", "blocklist_recent_attacks",
+     "Adresses qui ont attaqué ces dernières 48 h (FireHOL niveau 2 : blocklist.de, "
+     "DShield, GreenSnow)",
+     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level2.netset"),
+    ("datacenters", "blocklist_datacenters",
+     "Hébergeurs et serveurs loués (DigitalOcean, Google Cloud, AWS, Azure, OVH…)",
+     "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv4.txt"),
+)
+
+
 def _nets(txt):
     out = []
     for part in re.split(r"[,\s;]+", txt or ""):
@@ -503,6 +525,15 @@ class Settings:
         self.burst = s.getfloat("rate_burst")
         self.trusted = _nets(s.get("trusted_proxies"))
         self.require_relay = s.getboolean("require_relay")
+        # listes d'adresses a bloquer : nom -> adresse de la liste
+        self.blocklist_sel = {}
+        for name, key, _label, url in BUILTIN_BLOCKLISTS:
+            if s.getboolean(key):
+                self.blocklist_sel[name] = url
+        for url in re.split(r"[,\s;]+", s.get("blocklist_urls") or ""):
+            if url.lower().startswith(("https://", "http://")):
+                self.blocklist_sel["perso:" + url[:300]] = url[:300]
+        self.blocklist_exceptions = _nets(s.get("blocklist_exceptions"))
 
         self.log_file = self._path(base, cp["log"].get("file"))
         self.log_level = cp["log"].get("level", "INFO").upper()
@@ -636,6 +667,19 @@ admin_from_internet = NONE
 # Bannir aussitot une adresse d'Internet qui cherche des failles (.env,
 # wp-config, .git, .php...) : ces fichiers n'existent jamais sur Emby.
 ban_scanners = true
+# Listes publiques d'adresses a bloquer, telechargees sur GitHub et mises a
+# jour toutes les 6 h (gardees sur disque dans le dossier blocklists).
+# Reseaux malveillants connus (FireHOL niveau 1 : Spamhaus DROP, DShield...) :
+blocklist_known_attackers = true
+# Adresses qui ont attaque ces dernieres 48 h (FireHOL niveau 2) :
+blocklist_recent_attacks = true
+# Hebergeurs et serveurs loues (d'ou viennent presque tous les robots ; bloque
+# aussi un VPN payant ou le Relais prive iCloud de Safari) :
+blocklist_datacenters = true
+# Autres listes (adresses https:// separees par des espaces) :
+blocklist_urls =
+# Adresses jamais bloquees par les listes (ex. un VPN que tu utilises) :
+blocklist_exceptions =
 # Depuis Internet, refuser toute requete d'un visiteur non connecte a Emby
 # (sauf ce qui sert a se connecter : page de connexion, interface web...).
 require_login = true
@@ -824,6 +868,26 @@ CONFIG_SCHEMA = [
          "label": "Seules adresses autorisées (vide = toutes)", "help": ""},
         {"sec": "security", "key": "denied_networks", "type": "nets", "live": True,
          "label": "Adresses toujours refusées", "help": ""},
+        {"sec": "security", "key": "blocklist_known_attackers", "type": "bool", "live": True,
+         "label": "Bloquer les réseaux malveillants connus (FireHOL niveau 1 : Spamhaus "
+                  "DROP, DShield, abuse.ch…)", "help": ""},
+        {"sec": "security", "key": "blocklist_recent_attacks", "type": "bool", "live": True,
+         "label": "Bloquer les adresses qui ont attaqué ces dernières 48 h (FireHOL "
+                  "niveau 2 : blocklist.de, DShield, GreenSnow)", "help": ""},
+        {"sec": "security", "key": "blocklist_datacenters", "type": "bool", "live": True,
+         "label": "Bloquer les hébergeurs et serveurs loués (DigitalOcean, Google Cloud, "
+                  "AWS, Azure, OVH…)",
+         "help": "D'où viennent presque tous les robots. Bloque aussi un VPN payant ou "
+                 "Safari avec le Relais privé iCloud : ajoute alors l'adresse aux "
+                 "exceptions ci-dessous."},
+        {"sec": "security", "key": "blocklist_urls", "type": "urls", "live": True,
+         "label": "Autres listes d'adresses à bloquer (adresses des listes)",
+         "help": "Une liste par adresse https://, séparées par des espaces ; une "
+                 "adresse IP ou un réseau par ligne dans la liste."},
+        {"sec": "security", "key": "blocklist_exceptions", "type": "nets", "live": True,
+         "label": "Adresses jamais bloquées par les listes",
+         "help": "ex. l'adresse d'un VPN que tu utilises ; le réseau local n'est "
+                 "jamais bloqué."},
         {"sec": "security", "key": "trusted_proxies", "type": "nets", "live": True,
          "label": "Relais HTTPS de confiance (proxy inverse devant ce proxy)",
          "help": "Adresse du relais vue par le proxy, ex. 127.0.0.1/32, 192.168.1.123/32"},
@@ -960,7 +1024,7 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
               "language", "forward_ip", "landing_page", "quota_delivery",
-              "ban_scanners", "require_login")
+              "ban_scanners", "require_login", "blocklist_sel", "blocklist_exceptions")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -1001,6 +1065,11 @@ def validate_field(f, value):
         except ValueError:
             return None, "liste d'adresses invalide, ex. 192.168.1.0/24, 127.0.0.1/32"
         return ", ".join(str(n) for n in nets), ""
+    if t == "urls":
+        urls = [x for x in re.split(r"[,\s]+", v) if x]
+        bad = [x for x in urls if not re.match(r"^https?://[^\s;#]+$", x, re.I)]
+        return (" ".join(urls), "") if not bad else (
+            None, "adresse de liste invalide (https://...) : " + bad[0][:60])
     if t == "choice":
         return (v.upper(), "") if v.upper() in f["choices"] else (None, "choix invalide")
     if t == "email":
@@ -1281,6 +1350,169 @@ def is_permanent(until):
     return until >= PERMANENT_BAN - 1
 
 
+_LIST_ENTRY = re.compile(r"^\s*([0-9A-Fa-f:.]+(?:/\d{1,3})?)")
+
+
+class Blocklists:
+    """Listes publiques d'adresses a bloquer : telechargees, gardees sur disque
+    (le proxy les a des le demarrage, meme sans Internet), mises a jour toutes
+    les 6 h. Recherche par dichotomie (quelques microsecondes par requete).
+    Jamais le reseau local, les relais de confiance ni les exceptions."""
+    REFRESH = 6 * 3600
+    MAX_BYTES = 30 * 1024 * 1024
+
+    def __init__(self, folder):
+        self.folder = Path(folder)
+        self.sel = {}                # nom -> adresse de la liste
+        self.exceptions = []
+        self.keep_out = []           # reseau local, relais : jamais bloques
+        self.tables = {}             # nom -> {4: (debuts, fins), 6: (...)}
+        self.status = {}             # nom -> {count, updated, error}
+        self._lock = threading.Lock()
+
+    # -- reglages --------------------------------------------------------
+    def configure(self, cfg):
+        self.sel = dict(cfg.blocklist_sel)
+        self.exceptions = list(cfg.blocklist_exceptions)
+        self.keep_out = list(cfg.local) + list(cfg.trusted)
+        with self._lock:
+            for name in [n for n in self.tables if n not in self.sel]:
+                del self.tables[name]
+        for name in self.sel:
+            if name not in self.tables:
+                self._load_cache(name)
+
+    def _file(self, name):
+        return self.folder / ("%s.txt" % hashlib.sha256(
+            self.sel.get(name, name).encode()).hexdigest()[:16])
+
+    def _load_cache(self, name):
+        f = self._file(name)
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        self._install(name, text, f.stat().st_mtime, "")
+
+    # -- lecture d'une liste ------------------------------------------------
+    def parse(self, text):
+        nets = {4: [], 6: []}
+        for line in text.splitlines():
+            m = _LIST_ENTRY.match(line)
+            if not m or line.lstrip().startswith(("#", ";", "//")):
+                continue
+            try:
+                n = ipaddress.ip_network(m.group(1), strict=False)
+            except ValueError:
+                continue
+            if n.prefixlen < (8 if n.version == 4 else 16):
+                continue                        # trop large : erreur de liste
+            if n.is_private or n.is_loopback or n.is_link_local or n.is_multicast \
+                    or n.is_reserved or n.is_unspecified:
+                continue
+            if any(n.version == k.version and n.overlaps(k) for k in self.keep_out):
+                continue
+            nets[n.version].append((int(n.network_address), int(n.broadcast_address)))
+        tables = {}
+        for v, ranges in nets.items():
+            ranges.sort()
+            merged = []
+            for a, b in ranges:
+                if merged and a <= merged[-1][1] + 1:
+                    if b > merged[-1][1]:
+                        merged[-1][1] = b
+                else:
+                    merged.append([a, b])
+            tables[v] = ([a for a, _ in merged], [b for _, b in merged])
+        tables["n"] = len(nets[4]) + len(nets[6])     # reseaux retenus
+        return tables
+
+    def _install(self, name, text, when, error):
+        tables = self.parse(text)
+        count = tables.pop("n")
+        with self._lock:
+            self.tables[name] = tables
+            self.status[name] = {"count": count, "updated": int(when), "error": error}
+
+    # -- recherche ------------------------------------------------------------
+    def match(self, ip):
+        """-> nom de la liste qui contient l'adresse, ou "" """
+        if not self.tables:
+            return ""
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return ""
+        if a.is_private or a.is_reserved or a.is_loopback or a.is_link_local:
+            return ""                      # jamais une adresse non publique
+        if any(a in n for n in self.exceptions) or any(a in n for n in self.keep_out):
+            return ""
+        x = int(a)
+        for name, tables in list(self.tables.items()):
+            starts, ends = tables.get(a.version, ((), ()))
+            i = bisect.bisect_right(starts, x) - 1
+            if i >= 0 and x <= ends[i]:
+                return name
+        return ""
+
+    # -- mise a jour -----------------------------------------------------------
+    async def refresh(self, session, force=False):
+        now = time.time()
+        for name, url in list(self.sel.items()):
+            st = self.status.get(name) or {}
+            if not force and st.get("updated") and now - st["updated"] < self.REFRESH \
+                    and not st.get("error"):
+                continue
+            try:
+                async with session.get(url, timeout=ClientTimeout(total=90),
+                                       headers={"User-Agent": "EmbyProxy/" + __version__,
+                                                "Accept-Encoding": "gzip"}) as r:
+                    if r.status != 200:
+                        raise ValueError("la liste a repondu %d" % r.status)
+                    raw = bytearray()                # jusqu'au bout (pas un seul morceau)
+                    async for chunk in r.content.iter_chunked(65536):
+                        raw += chunk
+                        if len(raw) > self.MAX_BYTES:
+                            raise ValueError("liste trop grosse")
+                # la session du proxy ne decompresse pas (reponses d'Emby
+                # transmises telles quelles) : GitHub envoie la liste en gzip
+                text = _decode(bytes(raw), r.headers.get("Content-Encoding")).decode(
+                    "utf-8", "replace")
+                tables = await asyncio.get_running_loop().run_in_executor(
+                    None, self.parse, text)
+                if not tables["n"] and \
+                        (self.status.get(name) or {}).get("count"):
+                    raise ValueError("liste recue vide : l'ancienne est gardee")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self._install, name, text, time.time(), "")
+                try:
+                    self.folder.mkdir(parents=True, exist_ok=True)
+                    f = self._file(name)
+                    tmp = str(f) + ".tmp"
+                    Path(tmp).write_text(text, encoding="utf-8")
+                    os.replace(tmp, f)
+                except OSError as exc:
+                    log.warning("liste de blocage %s : ecriture impossible : %s", name, exc)
+                log.info("liste de blocage %s : %d reseaux", name,
+                         self.status[name]["count"])
+            except (ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                st = dict(self.status.get(name) or {"count": 0, "updated": 0})
+                st["error"] = str(exc)[:200] or exc.__class__.__name__
+                st["tried"] = int(time.time())
+                self.status[name] = st
+                log.warning("liste de blocage %s : mise a jour impossible : %s", name, exc)
+
+    def snapshot(self):
+        labels = {n: lbl for n, _k, lbl, _u in BUILTIN_BLOCKLISTS}
+        out = []
+        for name, url in self.sel.items():
+            st = self.status.get(name) or {}
+            out.append({"name": name, "label": labels.get(name, url), "url": url,
+                        "count": st.get("count", 0), "updated": st.get("updated", 0),
+                        "error": st.get("error", "")})
+        return out
+
+
 class BanTable(dict):
     """Adresses bannies -> fin du bannissement. Note chaque changement pour
     l'ecrire sur disque (emby_bans.json)."""
@@ -1315,6 +1547,7 @@ class Guard:
         self.cfg = cfg
         self.failures = {}          # ip -> deque d'horodatages
         self.banned = BanTable()    # ip -> fin du bannissement
+        self.blocklists = None      # listes d'adresses a bloquer (Blocklists)
         self.buckets = {}           # ip -> [jetons, horodatage]
         self.blocked = 0
 
@@ -1367,6 +1600,9 @@ class Guard:
             self.banned.pop(k, None)
         if self.cfg.denied and self._in(ip, self.cfg.denied):
             return 403, "Adresse refusee."
+        if self.blocklists is not None and not self.is_local(ip) \
+                and self.blocklists.match(ip):
+            return 403, "Adresse sur une liste de blocage."
         if self.cfg.allowed and not self._in(ip, self.cfg.allowed):
             return 403, "Adresse non autorisee."
         if self.cfg.block_admin and ADMIN_RE.match(path) and not self.is_local(ip):
@@ -1751,6 +1987,10 @@ class Attempts:
             self.flush(background=True)
 
     def flush(self, background=False):
+        if not background:                 # arret : attendre l'ecriture en cours
+            t = getattr(self, "_writer", None)
+            if t is not None and t.is_alive():
+                t.join(10)
         if not self.path or not self._dirty:
             return
         self._dirty = False
@@ -1766,7 +2006,8 @@ class Attempts:
                 except OSError as exc:
                     log.warning("tentatives : ecriture impossible : %s", exc)
         if background:
-            threading.Thread(target=write, daemon=True).start()
+            self._writer = threading.Thread(target=write, daemon=True)
+            self._writer.start()
         else:
             write()
 
@@ -3162,6 +3403,9 @@ class EmbyProxy:
         self.seclog.restore_bans(self.guard, cfg.ban_seconds)
         # bannissements : fichier a part, a cote des reglages, jamais efface
         # par une nouvelle version ni par la taille du journal de securite
+        self.blocklists = Blocklists(Path(cfg.path).parent / "blocklists")
+        self.blocklists.configure(cfg)
+        self.guard.blocklists = self.blocklists
         self.bans_path = Path(cfg.path).parent / "emby_bans.json"
         self._bans_lock = threading.Lock()
         self._load_bans()
@@ -3232,6 +3476,7 @@ class EmbyProxy:
         self._tasks.append(asyncio.create_task(self._prune_loop()))
         self._tasks.append(asyncio.create_task(self._stats_loop()))
         self._tasks.append(asyncio.create_task(self._bans_loop()))
+        self._tasks.append(asyncio.create_task(self._blocklists_loop()))
         self._tasks.append(asyncio.create_task(self._sync_playing_loop()))
         log.info("reglages lus dans %s", self.cfg.path)
         for i, w in enumerate(self.cfg.config_warnings):
@@ -3405,6 +3650,17 @@ class EmbyProxy:
             except OSError as exc:
                 banned.dirty = True
                 log.warning("bannissements : ecriture impossible : %s", exc)
+
+    async def _blocklists_loop(self):
+        """Listes d'adresses a bloquer : peu apres le demarrage, puis les
+        listes de plus de 6 h (ou en erreur) toutes les 30 min."""
+        await asyncio.sleep(5)
+        while True:
+            try:
+                await self.blocklists.refresh(self.session)
+            except Exception:
+                log.exception("listes de blocage")
+            await asyncio.sleep(1800)
 
     async def _bans_loop(self):
         while True:
@@ -3602,6 +3858,7 @@ class EmbyProxy:
         app.router.add_get("/__proxy/security.json", self.security_json)
         app.router.add_get("/__proxy/attempts.json", self.attempts_json)
         app.router.add_get("/__proxy/devices.json", self.devices_json)
+        app.router.add_post("/__proxy/blocklists/refresh", self.blocklists_refresh)
         app.router.add_post("/__proxy/devices/delete", self.devices_delete)
         app.router.add_post("/__proxy/purge", self.purge)
         app.router.add_post("/__proxy/unban", self.unban)
@@ -3668,6 +3925,7 @@ class EmbyProxy:
             known = self._device_card(request)
             cat = ("rate" if refus[0] == 429 else
                    "banned" if refus[1].startswith("Adresse bannie") else
+                   "blocklist" if refus[1].startswith("Adresse sur une liste") else
                    "direct" if refus[1].startswith("Connexion directe") else "refused")
             if not (cat == "rate" and known is not None):   # vrai utilisateur trop rapide
                 self._attempt(request, ip, cat,
@@ -5006,6 +5264,9 @@ class EmbyProxy:
             old_up = self.cfg.upstream
             for a in LIVE_ATTRS:
                 setattr(self.cfg, a, getattr(fresh, a))
+            self.blocklists.configure(self.cfg)
+            self._tasks.append(asyncio.get_running_loop().create_task(
+                self.blocklists.refresh(self.session)))
             self.cfg.config_warnings = fresh.config_warnings
             self.cache.max_bytes = self.cfg.cache_max
             await asyncio.get_running_loop().run_in_executor(None, self.cache._evict)
@@ -5406,7 +5667,16 @@ class EmbyProxy:
                                   f.listen_port})
 
     async def security_json(self, request):
-        return web.json_response(self.seclog.snapshot(self.guard))
+        snap = self.seclog.snapshot(self.guard)
+        snap["blocklists"] = self.blocklists.snapshot()
+        return web.json_response(snap)
+
+    async def blocklists_refresh(self, request):
+        if not self.guard.is_local(request[CLIENT_IP]):
+            return web.json_response({"ok": False, "error": "reseau local seulement"},
+                                     status=403)
+        await self.blocklists.refresh(self.session, force=True)
+        return web.json_response({"ok": True, "blocklists": self.blocklists.snapshot()})
 
     async def attempts_json(self, request):
         snap = self.attempts.snapshot(self.guard)
@@ -5692,6 +5962,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
       <option value="anon">Accès sans connexion</option>
       <option value="admin">Administration d'Emby refusée</option>
       <option value="banned">Requêtes d'adresses bannies</option>
+      <option value="blocklist">Adresses sur une liste de blocage</option>
       <option value="rate">Trop de requêtes</option>
       <option value="direct,refused">Autres refus</option></select>
     <select id="aNet"><option value="">Internet et réseau local</option><option value="net">Internet seulement</option><option value="local">Réseau local seulement</option></select>
@@ -5717,6 +5988,10 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   <div class="g" id="secg"></div>
   <h2>Adresses bannies</h2>
   <div class="tw"><table><thead><tr><th>Adresse IP</th><th>Encore</th><th></th></tr></thead><tbody id="bans"></tbody></table></div>
+  <h2>Listes d'adresses bloquées</h2>
+  <div class="sub">Listes publiques d'adresses d'attaquants et d'hébergeurs, mises à jour toutes les 6 h. Choix des listes et exceptions : onglet Configuration, partie Sécurité.</div>
+  <div class="bar2"><button class="ghost" id="blRefresh">Mettre à jour maintenant</button></div>
+  <div class="tw"><table><thead><tr><th>Liste</th><th>Réseaux</th><th>Mise à jour</th><th>État</th></tr></thead><tbody id="bls"></tbody></table></div>
   <h2 id="devH">Appareils enregistrés dans Emby</h2>
   <div class="sub">Chaque appareil qui s'est connecté à Emby, avec le compte et la dernière activité. Supprimer un appareil annule sa connexion : il devra retaper le mot de passe.</div>
   <div class="bar2"><select id="dUser"><option value="">Tous les comptes</option></select>
@@ -5890,7 +6165,7 @@ const banLeft=s=>s>PERM?T('définitif'):s>=86400?TF('{0} j',Math.ceil(s/86400)):
 const ACAT={robot:'Robot (recherche de failles)',password:'Mot de passe Emby faux',
   admin_password:"Mot de passe de la page d'administration faux",bad_key:'Clé de session inventée',
   anon:'Accès sans connexion',admin:"Administration d'Emby refusée",banned:'Requête alors que bannie',
-  rate:'Trop de requêtes',direct:'Connexion directe sans le relais HTTPS',refused:'Accès refusé'};
+  rate:'Trop de requêtes',blocklist:'Adresse sur une liste de blocage',direct:'Connexion directe sans le relais HTTPS',refused:'Accès refusé'};
 let lastDev=null,devDel=null;
 function loadDevices(fresh){return fetch('devices.json'+(fresh?'?fresh=1':'')).then(r=>r.json()).then(d=>{lastDev=d;renderDevices();renderAtt()}).catch(()=>{})}
 function devicesOf(uid,name){return ((lastDev&&lastDev.devices)||[]).filter(x=>(uid&&x.user_id===uid)||(!uid&&name&&x.user===name))}
@@ -5905,6 +6180,7 @@ function renderDevices(){
     const td=el('td');td.append(b);
     tr.append(el('td',null,x.user||'-'),el('td',null,x.name),el('td','sub',[x.app,x.version].filter(Boolean).join(' ')),el('td',null,x.last?day(x.last):'-'),td);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun appareil.');td.colSpan=5;tr.append(td);return tr})()]))}
+$('blRefresh').onclick=()=>{$('blRefresh').disabled=true;post('blocklists/refresh',{}).then(()=>{$('blRefresh').disabled=false;tick()})};
 $('dUser').onchange=renderDevices;$('dRefresh').onclick=()=>loadDevices(true);
 $('dCancel').onclick=()=>{$('dConfirm').hidden=true;devDel=null};
 $('dPwd').onkeydown=e=>{if(e.key==='Enter')$('dDo').click()};
@@ -6011,6 +6287,11 @@ function renderSec(d){
     bt.onclick=()=>{if(confirm(TF('Débannir {0} ?',b.ip)))fetch('unban',{method:'POST',body:new URLSearchParams({ip:b.ip})}).then(tick)};
     const td=el('td');td.append(bt);tr.append(el('td',null,b.ip),el('td',null,banLeft(b.remaining_s)),td);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune adresse bannie.');td.colSpan=3;tr.append(td);return tr})()]));
+  const bl=d.blocklists||[];
+  $('bls').replaceChildren(...(bl.length?bl.map(b=>{const tr=el('tr');
+    tr.append(el('td',null,T(b.label)),el('td',null,String(b.count)),el('td',null,b.updated?day(b.updated):'-'),
+      el('td',b.error?'sub':'',b.error?ko(b.error):(b.count?T('✔ chargée'):T('en attente du téléchargement'))));return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune liste choisie.');td.colSpan=4;tr.append(td);return tr})()]));
   $('topfail').textContent=d.top_fail_ips.length?d.top_fail_ips.map(([ip,c])=>ip+' : '+c).join('   ·   '):T('aucune');
   renderSecFeed()}
 function renderSecFeed(){
@@ -6053,7 +6334,8 @@ function fieldEl(f,G){
       if(f.type==='secret'){inp.type='password';inp.placeholder=G.values[k+'.hint']?TF('enregistrée ({0}) : laisser vide pour la garder',G.values[k+'.hint']):T('aucune')}
       if(f.type==='int'||f.type==='float'){inp.inputMode='decimal'}
       if(f.type==='nets')inp.placeholder=T('ex. 192.168.1.0/24, 127.0.0.1/32');
-      if(f.type==='url')inp.placeholder='http://192.168.1.234:8096'}
+      if(f.type==='url')inp.placeholder='http://192.168.1.234:8096';
+      if(f.type==='urls')inp.placeholder='https://…/liste.txt'}
     w.append(inp)}
   inp.dataset.k=k;inp.dataset.orig=f.type==='bool'?String(v==='true'):(f.type==='secret'?'':v);
   inp.oninput=inp.onchange=dirty;

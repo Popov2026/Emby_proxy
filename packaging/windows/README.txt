@@ -46,6 +46,7 @@ FILES
   emby_quota.ini / .db        quota settings and counters
   emby_bans.json              banned addresses (kept across restarts)
   emby_attempts.json          suspicious attempts (Activity tab)
+  blocklists\                 blocked address lists (downloaded copies)
   emby_security.log           security log (logins, refusals, bans)
   emby_activity.log           activity log
   emby_proxy.log              proxy log
@@ -102,6 +103,7 @@ FICHIERS
   emby_quota.ini / .db        reglages et compteurs des quotas
   emby_bans.json              adresses bannies (gardees au redemarrage)
   emby_attempts.json          tentatives suspectes (onglet Activite)
+  blocklists\                 listes d'adresses bloquees (copies telechargees)
   emby_security.log           journal de securite (connexions, refus, bannissements)
   emby_activity.log           journal d'activite
   emby_proxy.log              journal du proxy

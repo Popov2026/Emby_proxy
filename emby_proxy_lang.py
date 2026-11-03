@@ -782,6 +782,40 @@ EN = {
         "{0} address(es) · {1} banned right now · {2} attempt(s) in total",
     "Aucune tentative suspecte.": "No suspicious attempt.",
     "Appareils enregistrés dans Emby": "Devices registered in Emby",
+    "Listes d'adresses bloquées": "Blocked address lists",
+    "Listes publiques d'adresses d'attaquants et d'hébergeurs, mises à jour toutes les 6 h. Choix des listes et exceptions : onglet Configuration, partie Sécurité.":
+        "Public lists of attacker and hosting addresses, updated every 6 h. Lists and exceptions: Settings tab, Security part.",
+    "Mettre à jour maintenant": "Update now",
+    "Liste": "List",
+    "Réseaux": "Networks",
+    "Mise à jour": "Updated",
+    "État": "Status",
+    "✔ chargée": "✔ loaded",
+    "en attente du téléchargement": "waiting for download",
+    "Aucune liste choisie.": "No list chosen.",
+    "Adresses sur une liste de blocage": "Addresses on a block list",
+    "Adresse sur une liste de blocage": "Address on a block list",
+    "Adresse sur une liste de blocage.": "Address on a block list.",
+    "Réseaux malveillants connus (FireHOL niveau 1 : Spamhaus DROP, DShield, abuse.ch…)":
+        "Known malicious networks (FireHOL level 1: Spamhaus DROP, DShield, abuse.ch…)",
+    "Adresses qui ont attaqué ces dernières 48 h (FireHOL niveau 2 : blocklist.de, DShield, GreenSnow)":
+        "Addresses that attacked in the last 48 h (FireHOL level 2: blocklist.de, DShield, GreenSnow)",
+    "Hébergeurs et serveurs loués (DigitalOcean, Google Cloud, AWS, Azure, OVH…)":
+        "Hosting providers and rented servers (DigitalOcean, Google Cloud, AWS, Azure, OVH…)",
+    "Bloquer les réseaux malveillants connus (FireHOL niveau 1 : Spamhaus DROP, DShield, abuse.ch…)":
+        "Block known malicious networks (FireHOL level 1: Spamhaus DROP, DShield, abuse.ch…)",
+    "Bloquer les adresses qui ont attaqué ces dernières 48 h (FireHOL niveau 2 : blocklist.de, DShield, GreenSnow)":
+        "Block addresses that attacked in the last 48 h (FireHOL level 2: blocklist.de, DShield, GreenSnow)",
+    "Bloquer les hébergeurs et serveurs loués (DigitalOcean, Google Cloud, AWS, Azure, OVH…)":
+        "Block hosting providers and rented servers (DigitalOcean, Google Cloud, AWS, Azure, OVH…)",
+    "D'où viennent presque tous les robots. Bloque aussi un VPN payant ou Safari avec le Relais privé iCloud : ajoute alors l'adresse aux exceptions ci-dessous.":
+        "Where almost all bots come from. Also blocks a paid VPN or Safari with iCloud Private Relay: then add the address to the exceptions below.",
+    "Autres listes d'adresses à bloquer (adresses des listes)": "Other address lists to block (list addresses)",
+    "Une liste par adresse https://, séparées par des espaces ; une adresse IP ou un réseau par ligne dans la liste.":
+        "One list per https:// address, separated by spaces; one IP address or network per line in the list.",
+    "Adresses jamais bloquées par les listes": "Addresses never blocked by the lists",
+    "ex. l'adresse d'un VPN que tu utilises ; le réseau local n'est jamais bloqué.":
+        "e.g. the address of a VPN you use; the local network is never blocked.",
     "Chaque appareil qui s'est connecté à Emby, avec le compte et la dernière activité. Supprimer un appareil annule sa connexion : il devra retaper le mot de passe.":
         "Every device that has logged in to Emby, with the account and last activity. Deleting a device cancels its login: it will have to type the password again.",
     "Tous les comptes": "All accounts",
@@ -812,6 +846,8 @@ EN = {
 
 PATTERNS = [
     # tentatives suspectes
+    (r"^adresse de liste invalide \(https://\.\.\.\) : (.*)$", "invalid list address (https://...): $1"),
+    (r"^la liste a repondu (\d+)$", "the list answered $1"),
     (r"^Emby a repondu (\d+)$", "Emby answered $1"),
     (r"^Emby injoignable : (.*)$", "Emby unreachable: $1"),
     (r"^appareil Emby supprime : (.*)$", "Emby device deleted: $1"),

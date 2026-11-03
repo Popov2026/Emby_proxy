@@ -109,7 +109,7 @@ async def emby(request):
         return web.Response(status=204)
     if p == "/sessions" and request.method == "GET":
         s = {"Id": "s1", "UserId": UID, "UserName": "paul", "Client": "Emby Web",
-             "DeviceName": "Chrome", "DeviceId": DEV, "RemoteEndPoint": "203.0.113.50",
+             "DeviceName": "Chrome", "DeviceId": DEV, "RemoteEndPoint": "90.12.34.56",
              "SupportsRemoteControl": True, "SupportedCommands": ["DisplayMessage"],
              "PlayState": {"IsPaused": False, "PositionTicks": 0}}
         if state["playing"]:
@@ -171,7 +171,7 @@ async def main():
     asyncio.ensure_future(ep.serve(proxy))
     await asyncio.sleep(2)
     U, A = "http://127.0.0.1:%d" % USERS, "http://127.0.0.1:%d" % ADMINP
-    NET = {"X-Forwarded-For": "203.0.113.50", "X-Forwarded-Proto": "https",
+    NET = {"X-Forwarded-For": "90.12.34.56", "X-Forwarded-Proto": "https",
            "X-Forwarded-Host": "emby.exemple.fr"}
     EMB = 'MediaBrowser Client="Emby Web", Device="Chrome", DeviceId="%s", Version="4.9"' % DEV
 
@@ -320,6 +320,22 @@ async def main():
         async with s.post(A + "/__proxy/settings", json={"values": {}},
                           headers={"Origin": "http://piege.example"}) as r:
             check("site piege (autre origine) refuse", r.status == 403, r.status)
+        print("   (telechargement des listes d'adresses a bloquer, jusqu'a 90 s)")
+        bl = []
+        for _ in range(90):
+            async with s.get(A + "/__proxy/security.json") as r:
+                bl = (await r.json()).get("blocklists", [])
+            if bl and all(b["count"] > 0 or b["error"] for b in bl):
+                break
+            await asyncio.sleep(1)
+        check("listes de blocage telechargees (3 listes, des milliers de reseaux)",
+              len(bl) == 3 and all(b["count"] > 1000 for b in bl), bl)
+        async with s.get(U + "/emby/System/Info/Public",
+                         headers=dict(NET, **{"X-Forwarded-For": "64.227.35.235"})) as r:
+            check("robot d'un hebergeur (DigitalOcean) refuse par les listes",
+                  r.status == 403 and "liste de blocage" in await r.text(), r.status)
+        async with s.get(U + "/emby/System/Info/Public", headers=NET) as r:
+            check("visiteur ordinaire non bloque par les listes", r.status == 200, r.status)
         ini_text = ini.read_text(encoding="utf-8")
         check("cle API chiffree dans le fichier", APIKEY not in ini_text)
 
@@ -383,6 +399,13 @@ async def main():
                   "92.184.104.7" in phone and "Compte Emby visé : paul" in phone
                   and "Ses appareils dans Emby : Chrome" in phone
                   and "GET /emby/Users/Public -> 200" in phone, phone[:900])
+            await p.click("button[data-t=sec]")
+            await p.wait_for_timeout(3500)
+            bls = await p.inner_text("#bls")
+            check("onglet Securite : listes de blocage affichees",
+                  "Hébergeurs et serveurs loués" in bls and "✔ chargée" in bls, bls[:300])
+            await p.click("button[data-t=act]")
+            await p.wait_for_timeout(1500)
             await p.click("text=Voir ses appareils")
             await p.wait_for_timeout(1500)
             devs = await p.inner_text("#devs")
@@ -395,7 +418,7 @@ async def main():
             await p.wait_for_timeout(200)
             only = await p.inner_text("#attempts")
             check("filtre Robots : seulement le robot", "198.51.100.7" in only
-                  and "203.0.113.50" not in only, only[:200])
+                  and "90.12.34.56" not in only, only[:200])
             lb = await p.query_selector("text=English")
             if lb:
                 await lb.click()
@@ -409,7 +432,7 @@ async def main():
                       and "Emby login refused for “paul”" in en, en[:300])
             check("aucune erreur JavaScript en fin de parcours", not errs, errs[:3])
 
-            pu = await b.new_page(extra_http_headers={"X-Forwarded-For": "203.0.113.60",
+            pu = await b.new_page(extra_http_headers={"X-Forwarded-For": "90.12.34.57",
                                                       "X-Forwarded-Proto": "https"})
             await pu.goto(U + "/")
             await pu.wait_for_timeout(2500)
