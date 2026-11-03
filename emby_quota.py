@@ -769,6 +769,10 @@ def load_config(path: str, require_api_key: bool = True) -> Config:
             if quotas:
                 cfg.user_quotas[name.strip().lower()] = quotas
 
+    # les textes ecrits dans le fichier sont lus apres la langue : un texte
+    # reste identique a un texte livre (FR ou EN) suit la langue choisie ; un
+    # texte personnalise n'est jamais touche
+    cfg.apply_language(cfg.language)
     cfg.validate(require_api_key=require_api_key)
     return cfg
 

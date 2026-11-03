@@ -3348,3 +3348,24 @@ class TestFormatting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_textes_livres_suivent_la_langue_meme_ecrits_dans_le_fichier(tmp_path):
+    """Le fichier cree depuis l'exemple ecrit les textes francais en toutes
+    lettres : avec language = en ils doivent passer en anglais ; un texte
+    modifie a la main reste tel quel."""
+    import emby_quota as eq
+    import emby_quota_i18n as i18n
+    from pathlib import Path
+    ex = (Path(eq.__file__).parent / "emby_quota.ini.example").read_text(encoding="utf-8")
+    ex = ex.replace("language = fr", "language = en")
+    ex = ex.replace("%grace%.", "%delai%.")      # ancienne forme de l'exemple
+    ex = ex.replace("start_header = Bon film", "start_header = Salut la compagnie")
+    f = tmp_path / "q.ini"
+    f.write_text(ex, encoding="utf-8")
+    cfg = eq.load_config(str(f), require_api_key=False)
+    for name, en in i18n.DEFAULT_TEMPLATES["en"].items():
+        if name == "start_header":
+            assert cfg.start_header == "Salut la compagnie"
+        else:
+            assert getattr(cfg, name) == en, name

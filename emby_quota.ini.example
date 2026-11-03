@@ -248,7 +248,7 @@ warn_header = Temps de visionnage
 warn_text = Il te reste %tempsrestant% de visionnage pour %periode_phrase% (%pourcentage% % consomme).
 ; preavis, envoye quand le quota est atteint - uniquement si grace_seconds > 0
 stop_header = Quota atteint
-stop_text = Quota de %periode_phrase% atteint (%tempsconsomme% vues). Le film va s'arreter dans %delai%.
+stop_text = Quota de %periode_phrase% atteint (%tempsconsomme% vues). Le film va s'arreter dans %grace%.
 
 ; message final, envoye juste avant la commande d'arret
 stopped_header = Quota epuise

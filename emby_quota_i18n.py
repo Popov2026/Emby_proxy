@@ -13,7 +13,7 @@ l'affichage, elle ne casse jamais le service.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
 LANGS = ("fr", "en")
 DEFAULT_LANG = "fr"
@@ -466,12 +466,22 @@ def default_template(name: str, lang: str = DEFAULT_LANG) -> str:
     )
 
 
+# anciennes formes livrees (fichier d'exemple des versions precedentes) :
+# reconnues comme textes par defaut, donc traduites avec la langue choisie
+LEGACY_TEMPLATES: Dict[str, List[str]] = {
+    "stop_text": [
+        "Quota de %periode_phrase% atteint (%tempsconsomme% vues). "
+        "Le film va s'arreter dans %delai%.",
+    ],
+}
+
+
 def is_default_template(value: str, name: str) -> bool:
     """Le texte correspond-il encore a un gabarit livre (dans une des langues) ?"""
+    v = (value or "").strip()
     return any(
-        (value or "").strip() == DEFAULT_TEMPLATES[lang].get(name, "").strip()
-        for lang in LANGS
-    )
+        v == DEFAULT_TEMPLATES[lang].get(name, "").strip() for lang in LANGS
+    ) or v in (x.strip() for x in LEGACY_TEMPLATES.get(name, []))
 
 
 # --- etats de session et motifs d'exemption ---------------------------------

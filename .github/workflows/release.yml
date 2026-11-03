@@ -28,6 +28,11 @@ jobs:
       - run: python -m pytest -q -p no:anyio
       - name: Simulation d'attaques (59 attaques + utilisateur temoin)
         run: python tools/attack_simulation.py
+      - name: Essai de bout en bout (utilisateur, quotas, page d'administration dans Chromium)
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+          python tools/functional_check.py
 
   windows:
     needs: tests

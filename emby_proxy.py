@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.6"
+__version__ = "2.5.7"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2353,7 +2353,7 @@ QUOTA_SCHEMA = [
         _qf("daemon", "dry_run", "Mode à blanc : compter sans rien envoyer ni couper",
             "bool", "Pour roder pendant quelques jours"),
         _qf("daemon", "poll_interval", "Intervalle de comptage (secondes)", "int",
-            min=2, max=3600),
+            min=5, max=3600),
         _qf("daemon", "language", "Langue des messages", "choice",
             choices=["fr", "en"], choice_labels=["français", "anglais"]),
     ]},
@@ -4739,6 +4739,10 @@ class EmbyProxy:
         except Exception as exc:
             values, users = {}, []
             snap["error"] = snap["error"] or "reglages illisibles : %s" % exc
+        i18n_q = self.quota.eq.i18n
+        snap["default_texts"] = {
+            lang: dict(i18n_q.DEFAULT_TEMPLATES[lang]) for lang in i18n_q.LANGS}
+        snap["legacy_texts"] = i18n_q.LEGACY_TEMPLATES
         snap.update(schema=QUOTA_SCHEMA, values=values, user_quotas=users,
                     api_key_set=bool(self.cfg.api_key))
         return web.json_response(snap)
@@ -5149,7 +5153,7 @@ def _html_escape(txt):
 
 
 LOGIN_HTML = """<!doctype html><html lang="@@LANG@@"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy</title><link rel="icon" href="data:,">
 <style>body{font:15px system-ui,Segoe UI,sans-serif;background:#16181f;color:#e4e6ec;
 display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px}
 form{background:#1f222b;border:1px solid #2e323d;border-radius:10px;padding:24px;width:100%;max-width:340px}
@@ -5165,7 +5169,7 @@ padding:9px;border:0;border-radius:6px;background:#e94560;color:#fff;font:inheri
 
 STATUS_HTML = r"""<!doctype html><html lang="@@LANG@@"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Emby Proxy</title><style>
+<title>Emby Proxy</title><link rel="icon" href="data:,"><style>
 :root{--bg:#16181f;--card:#1f222b;--line:#2e323d;--fg:#e4e6ec;--mut:#9aa0aa;--acc:#e94560;--ok:#2ecc71;--warn:#eb8c14;--bad:#e05555;--info:#5aaaeb}
 *{box-sizing:border-box}[hidden]{display:none!important}body{font:14px/1.45 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:18px 16px}
 h1{font-size:19px;margin:0 0 12px}h2{font-size:15px;margin:22px 0 10px}
@@ -5570,6 +5574,10 @@ function loadQuota(full){return fetch('quotas.json').then(r=>{if(r.status===401)
   if(full||!Q){Q=d;
     $('qForm').replaceChildren(...d.schema.map(grp=>{const box=el('div');box.append(el('h2',null,grp.title));const c=el('div','c form');
       grp.fields.forEach(f=>c.append(qFieldEl(f,d.values)));box.append(c);return box}));
+    const ql=document.querySelector('#qForm select[data-k="daemon.language"]');
+    if(ql&&d.default_texts)ql.addEventListener('change',()=>{const dt=d.default_texts,lg=d.legacy_texts||{};
+      Object.keys(dt[ql.value]||{}).forEach(n=>{const i=document.querySelector('#qForm [data-k="enforcement.'+n+'"]:not(div)');if(!i)return;
+        const v=i.value.trim();if(Object.values(dt).some(L=>(L[n]||'').trim()===v)||(lg[n]||[]).some(x=>x.trim()===v)){i.value=dt[ql.value][n]}});qDirty()});
     $('qUq').replaceChildren(...d.user_quotas.map(qUqRow));qDirty()}
   const st=[];
   if(!d.enabled)st.push(el('div','w','Les quotas sont désactivés : active-les dans l\'onglet Configuration, section « Quotas de lecture ». Tu peux déjà préparer les réglages ci-dessous.'));

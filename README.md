@@ -272,6 +272,13 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
+Functional check: `python tools/functional_check.py` starts a proxy, a fake
+Emby and (if Playwright is installed) Chromium, and plays a whole session: home
+page, login, library, thumbnails from the cache, playback with byte ranges,
+WebSocket, quota messages DIRECT (both delivery methods) and by API, quota
+stop, admin page tab by tab without JavaScript error, message texts and their
+language, Emby down. Both scripts run on GitHub before every release.
+
 Attack simulation: `python tools/attack_simulation.py` starts a proxy and a fake
 Emby locally (never your real server) and replays 59 attacks (access without
 login, address tricks towards the administration and past the login, invented
@@ -567,6 +574,14 @@ Variables d'environnement (Docker) : `EMBY_PROXY_UPSTREAM`,
 pip install -r requirements-dev.txt
 pytest
 ```
+
+Essai de bout en bout : `python tools/functional_check.py` lance un proxy, un
+faux Emby et (si Playwright est installé) Chromium, et joue une session
+complète : page d'accueil, connexion, bibliothèque, vignettes du cache, lecture
+par plages d'octets, WebSocket, messages de quota en DIRECT (les deux méthodes)
+et par l'API, coupure, page d'administration onglet par onglet sans erreur
+JavaScript, textes des messages et leur langue, Emby arrêté. Les deux scripts
+sont lancés sur GitHub avant chaque version.
 
 Simulation d'attaques : `python tools/attack_simulation.py` lance un proxy et un
 faux Emby en local (jamais ton vrai serveur) et rejoue 59 attaques (accès sans
