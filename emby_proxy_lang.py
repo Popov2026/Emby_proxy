@@ -781,6 +781,28 @@ EN = {
     "{0} adresse(s) · {1} bannie(s) en ce moment · {2} tentative(s) au total":
         "{0} address(es) · {1} banned right now · {2} attempt(s) in total",
     "Aucune tentative suspecte.": "No suspicious attempt.",
+    "Appareils enregistrés dans Emby": "Devices registered in Emby",
+    "Chaque appareil qui s'est connecté à Emby, avec le compte et la dernière activité. Supprimer un appareil annule sa connexion : il devra retaper le mot de passe.":
+        "Every device that has logged in to Emby, with the account and last activity. Deleting a device cancels its login: it will have to type the password again.",
+    "Tous les comptes": "All accounts",
+    "Actualiser": "Refresh",
+    "Supprimer l'appareil": "Delete the device",
+    "Compte": "Account",
+    "Application": "App",
+    "Dernière activité": "Last activity",
+    "Supprimer": "Delete",
+    "Aucun appareil.": "No device.",
+    "Supprimer {0} ({1}) du compte {2} ?": "Delete {0} ({1}) of the account {2}?",
+    "✔ Appareil supprimé.": "✔ Device deleted.",
+    "Compte Emby visé : {0}": "Emby account targeted: {0}",
+    "nom inconnu": "unknown name",
+    "Ses appareils dans Emby : {0}": "Its devices in Emby: {0}",
+    "Aucun appareil de ce compte dans Emby.": "No device of this account in Emby.",
+    "Voir ses appareils": "See its devices",
+    "Ce qu'elle a obtenu sans connexion (laissé passer par le proxy) :":
+        "What it got without login (let through by the proxy):",
+    "Cle API Emby requise : onglet Configuration.": "Emby API key required: Settings tab.",
+    "appareil inconnu": "unknown device",
     "page d'administration du proxy : mot de passe faux": "proxy admin page: wrong password",
     "page d'administration : mot de passe de confirmation faux":
         "admin page: wrong confirmation password",
@@ -790,6 +812,9 @@ EN = {
 
 PATTERNS = [
     # tentatives suspectes
+    (r"^Emby a repondu (\d+)$", "Emby answered $1"),
+    (r"^Emby injoignable : (.*)$", "Emby unreachable: $1"),
+    (r"^appareil Emby supprime : (.*)$", "Emby device deleted: $1"),
     (r"^connexion Emby refusee pour « (.*) »$", "Emby login refused for “$1”"),
     # activite
     (r"^Fiche : (.*)$", "Details: $1"),

@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.3"
+__version__ = "2.6.4"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1593,9 +1593,12 @@ class Attempts:
             "banned", "rate", "direct", "refused")
     MAX_KEYS, MAX_TRIED, MAX_USERS, MAX_IPS = 500, 40, 15, 8
 
+    MAX_SEEN = 30
+
     def __init__(self, path):
         self.path = path
         self.items = {}
+        self.pending_seen = {}      # adresse sans fiche -> ce qu'elle a vu (memoire)
         self._dirty = False
         self._saved = 0.0
         self._wlock = threading.Lock()
@@ -1607,7 +1610,8 @@ class Attempts:
             except (OSError, ValueError):
                 pass
 
-    def record(self, key, ip, local, cat, what="", user="", agent="", now=None):
+    def record(self, key, ip, local, cat, what="", user="", agent="", now=None,
+               uid=""):
         now = now or time.time()
         a = self.items.get(key)
         if a is None:
@@ -1616,7 +1620,14 @@ class Attempts:
                 del self.items[oldest]
             a = self.items[key] = {"ips": [], "local": bool(local), "first": now,
                                    "last": now, "total": 0, "cats": {}, "users": [],
-                                   "agents": [], "tried": {}, "ban": "", "ok_user": ""}
+                                   "agents": [], "tried": {}, "ban": "", "ok_user": "",
+                                   "uids": [], "seen": {}}
+            for t, w in self.pending_seen.pop(key, ()):   # vu avant la 1re tentative
+                self._add_seen(a, w, t)
+        a.setdefault("uids", [])
+        if uid and uid not in a["uids"]:
+            a["uids"].append(uid)
+            del a["uids"][:-10]
         a["last"] = now
         a["total"] += 1
         a["cats"][cat] = a["cats"].get(cat, 0) + 1
@@ -1635,6 +1646,39 @@ class Attempts:
             while len(tried) > self.MAX_TRIED:
                 tried.pop(next(iter(tried)))
         self._changed(now)
+
+    @classmethod
+    def _add_seen(cls, a, what, t):
+        seen = a.setdefault("seen", {})
+        n = seen.pop(what, [0, t])[0] + 1
+        seen[what] = [n, t]
+        while len(seen) > cls.MAX_SEEN:
+            seen.pop(next(iter(seen)))
+
+    def saw(self, key, what, now=None):
+        """Requete sans connexion LAISSEE PASSER (page de connexion, liste des
+        comptes, infos du serveur...) : notee sur la fiche de l'adresse si elle
+        en a une, sinon gardee en memoire une heure (au cas ou elle en aurait
+        une ensuite)."""
+        now = now or time.time()
+        what = str(what or "")[:160]
+        a = self.items.get(key)
+        if a is not None:
+            self._add_seen(a, what, now)
+            self._changed(now)
+            return
+        q = self.pending_seen.get(key)
+        if q is None:
+            if len(self.pending_seen) >= 5000:
+                for k in [k for k, v in self.pending_seen.items()
+                          if not v or now - v[-1][0] > 3600]:
+                    del self.pending_seen[k]
+                if len(self.pending_seen) >= 5000:
+                    self.pending_seen.clear()
+            q = self.pending_seen[key] = deque(maxlen=self.MAX_SEEN)
+        while q and now - q[0][0] > 3600:
+            q.popleft()
+        q.append((now, what))
 
     def mark_ban(self, key, reason):
         a = self.items.get(key)
@@ -1672,7 +1716,9 @@ class Attempts:
                 "total": a["total"], "cats": a["cats"], "users": a["users"],
                 "agents": a["agents"], "ban": a.get("ban", ""),
                 "banned_s": int(banned) if banned > 0 else 0,
-                "ok_user": a.get("ok_user", ""),
+                "ok_user": a.get("ok_user", ""), "uids": a.get("uids", []),
+                "seen": [{"what": w, "n": v[0], "t": int(v[1])}
+                         for w, v in reversed(list(a.get("seen", {}).items()))],
                 "tried": [{"what": w, "n": v[0], "t": int(v[1])}
                           for w, v in reversed(list(a["tried"].items()))]})
             if len(out) >= limit:
@@ -3536,6 +3582,8 @@ class EmbyProxy:
         app.router.add_get("/__proxy/activity.json", self.activity_json)
         app.router.add_get("/__proxy/security.json", self.security_json)
         app.router.add_get("/__proxy/attempts.json", self.attempts_json)
+        app.router.add_get("/__proxy/devices.json", self.devices_json)
+        app.router.add_post("/__proxy/devices/delete", self.devices_delete)
         app.router.add_post("/__proxy/purge", self.purge)
         app.router.add_post("/__proxy/unban", self.unban)
         app.router.add_get("/__proxy/config.json", self.config_json)
@@ -3842,8 +3890,34 @@ class EmbyProxy:
             or request.headers.get("User-Agent", "")
         if what is None:
             what = "%s %s" % (_safe(request.method, 10), _safe(request.path_qs, 120))
+        uid = self._target_uid(request)
+        if uid and self.activity and uid not in self.activity.info.users \
+                and len(self.activity.info.pending_users) < 1000:
+            self.activity.info.pending_users.add(uid)     # nom demande a Emby
         self.attempts.record(self.guard.key(ip), ip, self.guard.is_local(ip), cat,
-                             what, user, agent)
+                             what, user, agent, uid=uid)
+
+    _PUBLIC_NOISE = re.compile(r"^/(?:$|web(?:/|$)|favicon\.ico$|robots\.txt$|"
+                               r"System/Ping)", re.I)
+
+    def _note_public(self, request, np, is_login, status):
+        """Ce qu'une adresse d'Internet SANS connexion a obtenu (liste des
+        comptes, infos du serveur...) : visible sur sa fiche de tentatives."""
+        ip = request.get(CLIENT_IP, "")
+        if not ip or is_login or self.guard.is_local(ip) or self._has_token(request) \
+                or not PUBLIC_RE.match(np) or self._PUBLIC_NOISE.match(np):
+            return
+        self.attempts.saw(self.guard.key(ip), "%s %s -> %s" % (
+            _safe(request.method, 10), _safe(request.path_qs, 120), status))
+
+    @staticmethod
+    def _target_uid(request):
+        """Compte Emby designe par la requete (adresse ou parametre UserId)."""
+        m = RE_ANYUID.match(npath(request))
+        uid = (m.group("uid") if m else "") or next(
+            (v for k, v in request.query.items() if k.lower() == "userid"), "")
+        uid = str(uid).lower()
+        return uid if re.fullmatch(r"[0-9a-f]{32}", uid) else ""
 
     def _refuse(self, request, ip, status, why):
         self.guard.blocked += 1
@@ -4150,6 +4224,7 @@ class EmbyProxy:
                     self.quota.wake()            # debut de lecture : quotas tout de suite
             if up.status == 401 and not is_login and self._has_token(request):
                 self._bad_token(request)
+            self._note_public(request, np, is_login, up.status)
             if act and c is not None and c.user_id and up.status >= 400 \
                     and not is_login \
                     and not any(k in ("pbinfo", "stream", "login", "delete")
@@ -5314,7 +5389,90 @@ class EmbyProxy:
         return web.json_response(self.seclog.snapshot(self.guard))
 
     async def attempts_json(self, request):
-        return web.json_response(self.attempts.snapshot(self.guard))
+        snap = self.attempts.snapshot(self.guard)
+        names = self.activity.info.users if self.activity else {}
+        for a in snap["attempts"]:
+            a["accounts"] = [{"id": u, "name": names.get(u, "")} for u in a["uids"]]
+        return web.json_response(snap)
+
+    # -- appareils enregistres dans Emby (onglet Securite) ----------------
+    @staticmethod
+    def _emby_date(value):
+        m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)", str(value or ""))
+        if not m:
+            return 0
+        import calendar
+        return calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 0, 0))
+
+    async def devices_json(self, request):
+        if not self.cfg.api_key:
+            return web.json_response({"ok": False, "devices": [], "error":
+                                      "Cle API Emby requise : onglet Configuration."})
+        cached = getattr(self, "_devices_cache", None)
+        if cached and time.time() - cached[0] < 20 and not request.query.get("fresh"):
+            return web.json_response(cached[1])
+        try:
+            async with self.session.get("%s/emby/Devices" % self.cfg.upstream,
+                                        params={"api_key": self.cfg.api_key},
+                                        timeout=ClientTimeout(total=15)) as r:
+                raw = await r.read()
+                if r.status != 200:
+                    return web.json_response({"ok": False, "devices": [], "error":
+                                              "Emby a repondu %d" % r.status})
+                data = json.loads(_decode(raw, r.headers.get("Content-Encoding")))
+        except (ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            return web.json_response({"ok": False, "devices": [],
+                                      "error": "Emby injoignable : %s" % exc})
+        items = data.get("Items") if isinstance(data, dict) else data
+        out = []
+        for d in items or []:
+            if not isinstance(d, dict) or not d.get("Id"):
+                continue
+            uid = str(d.get("LastUserId") or "").lower()
+            if uid and d.get("LastUserName") and self.activity:
+                self.activity.info.users.setdefault(uid, d["LastUserName"])
+            out.append({"id": str(d["Id"]), "name": str(d.get("Name") or ""),
+                        "app": str(d.get("AppName") or ""),
+                        "version": str(d.get("AppVersion") or ""),
+                        "user": str(d.get("LastUserName") or ""), "user_id": uid,
+                        "last": self._emby_date(d.get("DateLastActivity"))})
+        out.sort(key=lambda d: (d["user"].lower(), -d["last"]))
+        res = {"ok": True, "devices": out}
+        self._devices_cache = (time.time(), res)
+        return web.json_response(res)
+
+    async def devices_delete(self, request):
+        ip = request[CLIENT_IP]
+        if not self.guard.is_local(ip):
+            return web.json_response({"ok": False, "error": "Modification possible "
+                                      "uniquement depuis le reseau local."}, status=403)
+        data = await request.json()
+        bad = self._confirm(request, data.get("password"))
+        if bad:
+            return bad
+        dev = str(data.get("id", ""))[:100]
+        if not dev or not self.cfg.api_key:
+            return web.json_response({"ok": False, "error": "appareil inconnu"},
+                                     status=400)
+        try:
+            async with self.session.delete("%s/emby/Devices" % self.cfg.upstream,
+                                           params={"Id": dev,
+                                                   "api_key": self.cfg.api_key},
+                                           timeout=ClientTimeout(total=15)) as r:
+                ok = r.status < 300
+                status = r.status
+        except (ClientError, asyncio.TimeoutError, OSError) as exc:
+            return web.json_response({"ok": False, "error": "Emby injoignable : %s"
+                                      % exc}, status=502)
+        if not ok:
+            return web.json_response({"ok": False, "error": "Emby a repondu %d"
+                                      % status}, status=502)
+        label = str(data.get("label", ""))[:120]
+        self.seclog.add("config", ip, True, detail="appareil Emby supprime : %s"
+                        % (label or dev))
+        log.warning("appareil Emby supprime par %s : %s", ip, label or dev)
+        self._devices_cache = None
+        return web.json_response({"ok": True})
 
     async def unban(self, request):
         data = await request.post()
@@ -5537,6 +5695,15 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   <div class="g" id="secg"></div>
   <h2>Adresses bannies</h2>
   <div class="tw"><table><thead><tr><th>Adresse IP</th><th>Encore</th><th></th></tr></thead><tbody id="bans"></tbody></table></div>
+  <h2 id="devH">Appareils enregistrés dans Emby</h2>
+  <div class="sub">Chaque appareil qui s'est connecté à Emby, avec le compte et la dernière activité. Supprimer un appareil annule sa connexion : il devra retaper le mot de passe.</div>
+  <div class="bar2"><select id="dUser"><option value="">Tous les comptes</option></select>
+    <button class="ghost" id="dRefresh">Actualiser</button></div>
+  <div class="sub" id="dErr"></div>
+  <div class="confirm" id="dConfirm" hidden><span id="dWhat"></span>
+    <input id="dPwd" type="password" placeholder="Mot de passe de la page d'état" autocomplete="current-password">
+    <div class="row"><button id="dDo">Supprimer l'appareil</button><button class="ghost" id="dCancel">Annuler</button></div></div>
+  <div class="tw"><table><thead><tr><th>Compte</th><th>Appareil</th><th>Application</th><th>Dernière activité</th><th></th></tr></thead><tbody id="devs"></tbody></table></div>
   <h2>Adresses avec le plus de mots de passe faux (24 h)</h2>
   <div class="sub" id="topfail">-</div>
   <h2>Tentatives de connexion et accès refusés</h2>
@@ -5672,6 +5839,7 @@ document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
   ['act','sec','quota','cache','conf','logs'].forEach(t=>$(t).hidden=b.dataset.t!==t);
   if(b.dataset.t==='quota')loadQuota(true);
+  if(b.dataset.t==='sec')loadDevices(false);
   if(b.dataset.t==='logs')loadLogs();
   if(b.dataset.t==='conf')loadConf();});
 
@@ -5700,6 +5868,27 @@ const ACAT={robot:'Robot (recherche de failles)',password:'Mot de passe Emby fau
   admin_password:"Mot de passe de la page d'administration faux",bad_key:'Clé de session inventée',
   anon:'Accès sans connexion',admin:"Administration d'Emby refusée",banned:'Requête alors que bannie',
   rate:'Trop de requêtes',direct:'Connexion directe sans le relais HTTPS',refused:'Accès refusé'};
+let lastDev=null,devDel=null;
+function loadDevices(fresh){return fetch('devices.json'+(fresh?'?fresh=1':'')).then(r=>r.json()).then(d=>{lastDev=d;renderDevices();renderAtt()}).catch(()=>{})}
+function devicesOf(uid,name){return ((lastDev&&lastDev.devices)||[]).filter(x=>(uid&&x.user_id===uid)||(!uid&&name&&x.user===name))}
+function renderDevices(){
+  const d=lastDev;if(!d)return;$('dErr').textContent=d.ok?'':ko(d.error);
+  const sel=$('dUser'),cur=sel.value,names=[...new Set(d.devices.map(x=>x.user).filter(Boolean))].sort();
+  sel.replaceChildren(el('option',null,'Tous les comptes'),...names.map(n=>{const o=el('option',null,n);o.value=n;return o}));
+  sel.firstChild.value='';sel.value=names.includes(cur)?cur:'';
+  const rows=d.devices.filter(x=>!sel.value||x.user===sel.value);
+  $('devs').replaceChildren(...(rows.length?rows.map(x=>{const tr=el('tr'),b=el('button','small','Supprimer');
+    b.onclick=()=>{devDel=x;$('dWhat').textContent=TF('Supprimer {0} ({1}) du compte {2} ?',x.name,x.app,x.user||'?');$('dConfirm').hidden=false;$('dPwd').value='';$('dPwd').focus()};
+    const td=el('td');td.append(b);
+    tr.append(el('td',null,x.user||'-'),el('td',null,x.name),el('td','sub',[x.app,x.version].filter(Boolean).join(' ')),el('td',null,x.last?day(x.last):'-'),td);return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun appareil.');td.colSpan=5;tr.append(td);return tr})()]))}
+$('dUser').onchange=renderDevices;$('dRefresh').onclick=()=>loadDevices(true);
+$('dCancel').onclick=()=>{$('dConfirm').hidden=true;devDel=null};
+$('dPwd').onkeydown=e=>{if(e.key==='Enter')$('dDo').click()};
+$('dDo').onclick=()=>{if(!devDel)return;post('devices/delete',{id:devDel.id,label:devDel.name+' / '+devDel.app+' ('+(devDel.user||'?')+')',password:$('dPwd').value}).then(r=>{
+  $('dConfirm').hidden=true;$('dErr').textContent=r.ok?T('✔ Appareil supprimé.'):ko(r.error);devDel=null;loadDevices(true);tick()})};
+function showDevicesOf(name){document.querySelector('button[data-t=sec]').click();loadDevices(true).then(()=>{$('dUser').value=name;renderDevices();$('devH').scrollIntoView()})}
+
 let lastAtt=null;const attOpen=new Set();
 function attCard(a){
   const c=el('div','c att'),top=el('div');
@@ -5711,6 +5900,12 @@ function attCard(a){
   c.append(el('div','sub',TF('{0} tentative(s) · première {1} · dernière {2}',a.total,day(a.first),day(a.last))));
   const cats=el('div');Object.entries(a.cats).sort((x,y)=>y[1]-x[1]).forEach(([k,n])=>cats.append(el('span','cat '+k,T(ACAT[k]||k)+' ×'+n)));c.append(cats);
   if(a.users.length)c.append(el('div','sub',TF('Comptes essayés : {0}',a.users.join(', '))));
+  (a.accounts||[]).forEach(u=>{const box=el('div','st');
+    box.append(el('div',null,TF('Compte Emby visé : {0}',(u.name||T('nom inconnu'))+' ('+u.id.slice(0,8)+'…)')));
+    const dv=devicesOf(u.id,u.name);
+    if(lastDev&&lastDev.ok)box.append(el('div','sub',dv.length?TF('Ses appareils dans Emby : {0}',dv.slice(0,6).map(x=>x.name+' · '+x.app+' · '+(x.last?day(x.last):'?')).join(' | ')):T('Aucun appareil de ce compte dans Emby.')));
+    if(u.name){const b=el('button','small','Voir ses appareils');b.onclick=()=>showDevicesOf(u.name);box.append(b)}
+    c.append(box)});
   if(a.agents.length)c.append(el('div','sub',TF('Appareil / logiciel : {0}',a.agents.join(' | '))));
   if(a.banned_s){const st=el('div','st ban',(a.banned_s>PERM?T('⛔ Bannie définitivement'):TF('⛔ Bannie encore {0}',banLeft(a.banned_s)))+(a.ban?' — '+a.ban:''));
     const bt=el('button','small','Débannir');bt.style.marginLeft='8px';
@@ -5718,6 +5913,10 @@ function attCard(a){
     st.append(bt);c.append(st)}
   else if(a.ban)c.append(el('div','st sub',TF('A été bannie : {0}',a.ban)));
   if(a.ok_user)c.append(el('div','st ok',TF('✔ S\'est ensuite connecté avec le compte {0}',a.ok_user)));
+  if((a.seen||[]).length){const box=el('div','tried');
+    box.append(el('div','sub',T('Ce qu\'elle a obtenu sans connexion (laissé passer par le proxy) :')));
+    a.seen.slice(0,10).forEach(x=>{const r=el('div');r.append(el('time',null,day(x.t)));r.append(document.createTextNode(x.what+(x.n>1?'  ×'+x.n:'')));box.append(r)});
+    c.append(box)}
   if(a.tried.length){const box=el('div','tried'),open=attOpen.has(a.key),list=open?a.tried:a.tried.slice(0,8);
     box.append(el('div','sub',T('Ce qui a été tenté (le plus récent en premier) :')));
     list.forEach(x=>{const r=el('div');r.append(el('time',null,day(x.t)));r.append(document.createTextNode(T(x.what)+(x.n>1?'  ×'+x.n:'')));box.append(r)});
@@ -5985,11 +6184,13 @@ $('lDo').onclick=()=>{const logs=[...document.querySelectorAll('.lgc:checked')].
     if(!r.ok)box.append(el('div','res bad',ko(r.error)));$('lOut').replaceChildren(box);
     if(r.ok)document.querySelectorAll('.lgc').forEach(c=>c.checked=false);loadLogs();tick()})};
 
+let tickN=0;
 function tick(){
   const j=u=>fetch(u).then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()});
   j('activity.json').then(renderAct).catch(()=>{});
   j('security.json').then(renderSec).catch(()=>{});
   j('attempts.json').then(renderAtt).catch(()=>{});
+  if(!(tickN++%10))loadDevices(false);
   j('stats.json').then(renderStats).catch(()=>{})}
 tick();setInterval(tick,3000);
 </script></body></html>

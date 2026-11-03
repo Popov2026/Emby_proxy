@@ -93,12 +93,19 @@ right).
   banned (with an **Unban** button) or later logged in successfully (a
   simple typo). Filters by kind, network and ban. Kept across restarts in
   `emby_attempts.json`; cleared with the security log (Logs tab).
+  When the requests name an Emby account (its 32-character identifier),
+  the card shows **the account's name and its devices registered in Emby**
+  (button "See its devices"), and **what the address got without login**
+  (account list, server info: what the proxy let through).
 
 Movie names are read from Emby's own answers. For an item never opened
 before, the proxy asks Emby with the API key from the settings (optional) or
 with the user's token. User names are resolved the same way.
 
 #### Security tab
+- **Devices registered in Emby** (with the API key): account, device, app,
+  last activity, filter by account. **Delete** a device (local network,
+  admin password): its login is cancelled, it must type the password again.
 - **Every login attempt** to Emby, successful or not: date, name typed, IP
   address (local or Internet), app and device. The password typed is
   **never** recorded.
@@ -392,12 +399,21 @@ Onglet **Activité**, rafraîchi toutes les 3 secondes :
   normalement (simple faute de frappe). Filtres par type, réseau et
   bannissement. Gardées au redémarrage dans `emby_attempts.json` ; effacées
   avec le journal de sécurité (onglet Journaux).
+  Quand les requêtes désignent un compte Emby (son identifiant de 32
+  caractères), la fiche montre **le nom du compte et ses appareils
+  enregistrés dans Emby** (bouton « Voir ses appareils »), et **ce que
+  l'adresse a obtenu sans connexion** (liste des comptes, infos du serveur :
+  ce que le proxy a laissé passer).
 
 Les noms des films sont lus dans les réponses d'Emby. Pour un élément jamais
 ouvert, le proxy demande son nom à Emby avec la clé API des réglages
 (facultative) ou le jeton de l'utilisateur. Idem pour les noms d'utilisateurs.
 
 #### Onglet Sécurité
+- **Appareils enregistrés dans Emby** (avec la clé API) : compte, appareil,
+  application, dernière activité, filtre par compte. **Supprimer** un
+  appareil (réseau local, mot de passe de la page) : sa connexion est
+  annulée, il devra retaper le mot de passe.
 - **Toutes les tentatives de connexion** à Emby : date, nom tapé, adresse IP
   (locale ou Internet), application et appareil. Le mot de passe tapé n'est
   **jamais** enregistré.

@@ -68,10 +68,17 @@ async def emby(request):
                                       "User": {"Id": UID, "Name": "paul",
                                                "Policy": {"IsAdministrator": False}}})
         return web.Response(status=401)
+    if p == "/users/public":
+        return web.json_response([{"Id": UID, "Name": "paul", "HasPassword": True}])
     if p.startswith("/web"):
         return web.Response(text="<html>Emby web</html>", content_type="text/html")
     if t not in (TOK, APIKEY):
         return web.Response(status=401)
+    if p == "/devices" and request.method == "GET" and t == APIKEY:
+        return web.json_response({"Items": [
+            {"Id": "dev-paul", "Name": "Chrome", "AppName": "Emby Web", "AppVersion": "4.9",
+             "LastUserName": "paul", "LastUserId": UID,
+             "DateLastActivity": "2026-11-03T12:00:00.0000000Z"}]})
     if p == "/users":
         return web.json_response([{"Id": UID, "Name": "paul", "Policy": {"IsAdministrator": False}}])
     if p == "/users/" + UID:
@@ -178,6 +185,8 @@ async def main():
         async with s.get(U + "/.env", headers=dict(NET, **{"X-Forwarded-For": "198.51.100.7",
                                                            "User-Agent": "zgrab/0.x"})) as r:
             check("robot qui cherche .env : 404 et banni", r.status == 404, r.status)
+        PHONE = dict(NET, **{"X-Forwarded-For": "92.184.104.7",
+                             "User-Agent": "Emby/3 CFNetwork/3896.100.1.2.1 Darwin/27.0.0"})
         async with s.get(U + "/emby/System/Info/Public", headers=NET) as r:
             d = await r.json()
             check("infos publiques : nom du serveur", d.get("ServerName") == "NAS-ESSAI", d)
@@ -195,6 +204,10 @@ async def main():
             d = await r.json()
             check("connexion de paul", r.status == 200 and d.get("AccessToken") == TOK, r.status)
         H = dict(NET, **{"X-Emby-Token": TOK, "X-Emby-Authorization": EMB + ', Token="%s"' % TOK})
+        async with s.get(U + "/emby/Users/Public", headers=PHONE) as r:
+            check("iPhone inconnu : liste publique des comptes laissee passer", r.status == 200)
+        async with s.get(U + "/emby/Users/%s/Views" % UID, headers=PHONE) as r:
+            check("iPhone inconnu sans cle : vues de paul refusees", r.status == 401, r.status)
         async with s.get(U + "/emby/Users/%s/Items" % UID, headers=H) as r:
             d = await r.json()
             check("bibliotheque apres connexion", d.get("TotalRecordCount") == 1, d)
@@ -365,6 +378,19 @@ async def main():
             check("Tentatives suspectes : mot de passe faux de paul puis connexion reussie",
                   "connexion Emby refusee pour « paul »" in att and "ensuite connecté" in att,
                   att[:600])
+            phone = await p.inner_text("#attempts")
+            check("fiche de l'iPhone inconnu : compte vise, ses appareils, ce qu'il a obtenu",
+                  "92.184.104.7" in phone and "Compte Emby visé : paul" in phone
+                  and "Ses appareils dans Emby : Chrome" in phone
+                  and "GET /emby/Users/Public -> 200" in phone, phone[:900])
+            await p.click("text=Voir ses appareils")
+            await p.wait_for_timeout(1500)
+            devs = await p.inner_text("#devs")
+            check("bouton Voir ses appareils : liste des appareils du compte (onglet Securite)",
+                  "Chrome" in devs and "paul" in devs and "Emby Web" in devs, devs[:300])
+            check("aucune erreur JavaScript (appareils)", not errs, errs[:3])
+            await p.click("button[data-t=act]")
+            await p.wait_for_timeout(500)
             await p.select_option("#aCat", "robot")
             await p.wait_for_timeout(200)
             only = await p.inner_text("#attempts")
