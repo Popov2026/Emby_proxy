@@ -6,7 +6,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import emby_proxy as ep
 
 UID = "e" * 32
-VISITOR = "83.204.193.128"
+VISITOR = "198.51.100.77"
 STRANGER = "45.148.10.21"
 
 

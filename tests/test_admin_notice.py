@@ -9,7 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import emby_proxy as ep
 
 ADMIN = "a" * 32
-NET = "83.204.193.128"
+NET = "198.51.100.77"
 AUTH = ('MediaBrowser Client="Emby Web", Device="Chrome", DeviceId="pc1", '
         'Version="4.10"')
 

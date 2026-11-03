@@ -10,7 +10,7 @@ from test_proxy import login
 
 UID = "e" * 32
 ROBOT = "45.148.10.21"
-GUESSER = "83.204.193.128"
+GUESSER = "198.51.100.77"
 FRIEND = "90.12.34.56"
 
 
@@ -170,3 +170,28 @@ def test_taille_bornee():
     for i in range(200):
         a.record("k", "1.2.3.4", False, "robot", "GET /p%d" % i)
     assert len(a.items["k"]["tried"]) == ep.Attempts.MAX_TRIED
+
+
+async def test_cles_de_session_jamais_affichees(env):
+    """Cas reel : la fiche montrait GET /emby/System/Info?api_key=<cle> en clair."""
+    make, tmp = env
+    proxy, c = await make()
+    await c.get("/emby/Users/%s/Items?api_key=SECRETKEY1&X-Emby-Client=Emby" % UID,
+                headers=via(GUESSER))
+    await c.get("/emby/Items?X-Emby-Token=SECRETKEY2&pw=MotDePasse", headers=via(GUESSER))
+    a = card(proxy, GUESSER)
+    tried = " ".join(x["what"] for x in a["tried"])
+    assert "SECRETKEY" not in tried and "MotDePasse" not in tried
+    assert "api_key=***" in tried and "X-Emby-Client=Emby" in tried
+    proxy.attempts.flush()
+    assert "SECRETKEY" not in (tmp / "emby_attempts.json").read_text(encoding="utf-8")
+
+
+def test_ancien_fichier_nettoye(tmp_path):
+    f = tmp_path / "emby_attempts.json"
+    f.write_text('{"1.2.3.4": {"ips": [], "local": false, "first": 1, "last": 1, "total": 1,'
+                 ' "cats": {}, "users": [], "agents": [], "ban": "", "ok_user": "",'
+                 ' "tried": {"GET /emby/System/Info?api_key=0f1e2d3c": [1, 1]}}}',
+                 encoding="utf-8")
+    a = ep.Attempts(f)
+    assert list(a.items["1.2.3.4"]["tried"]) == ["GET /emby/System/Info?api_key=***"]

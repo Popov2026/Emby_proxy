@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.4"
+__version__ = "2.6.5"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1223,7 +1223,7 @@ ADMIN_NOTICE = {
 # Tableau de bord d'Emby : donnees qu'il lit (refusees aux comptes
 # administrateurs en mode "interdite" ; les applis ordinaires ne les lisent
 # pas sans filtre).
-DASH_RE = re.compile(r"^/(?:Sessions/?$|Users/?$|Users/Query|System/Info/?$"
+DASH_RE = re.compile(r"^/(?:Sessions/?$|Users/?$|Users/Query"
                      r"|web/configurationpages|News/|Dashboard/)", re.I)
 # Modifications reservees a l'administration (comptes administrateurs).
 ADMIN_WRITE_RE = re.compile(r"^/(?:Users/[^/]+/?$|Items/[^/]+/?$|Items/[^/]+/Refresh"
@@ -1245,9 +1245,12 @@ ADMIN_RE = re.compile(
 # Recherches de failles des robots d'Internet : fichiers qui n'existent jamais
 # sur Emby (configuration d'autres logiciels, sauvegardes, scripts PHP...).
 SCANNER_RE = re.compile(
-    r"(?:^|/)\.(?:env|git|svn|hg|bzr|aws|ssh|docker|vscode|idea|htaccess|htpasswd|"
+    r"(?:^|/)\.(?:env|git|svn|hg|bzr|aws|ssh|docker|vscode|idea|htaccess|htpasswd|config|"
     r"ds_store|npmrc|travis|circleci|well-known/acme-challenge/\.\.)(?:$|[/.~])"
     r"|(?:^|/)wp-(?:admin|login|config|content|includes|json|cron)"
+    # fichiers de cles de services en ligne (Google, Firebase, AWS...)
+    r"|(?:^|/)(?:[\w.-]*credentials?[\w.-]*|firebase[\w.-]*|[\w.-]*adminsdk[\w.-]*|"
+    r"(?:google|gcp|gcloud|aws|service[-_]?account)[\w.-]*|key(?:file)?)\.json$"
     r"|\.(?:php\d?|phtml|asp|aspx|ashx|jsp|jspx|cgi|bak|old|orig|save|swp|sql|"
     r"sqlite|tgz|rar|7z|pem|key|env)$"
     r"|(?:^|/)(?:phpmyadmin|myadmin|pma|cgi-bin|actuator|boaform|hnap1|xmlrpc|"
@@ -1264,6 +1267,8 @@ PUBLIC_RE = re.compile(
     r"|Users/ForgotPassword(?:/Pin)?/?$"
     r"|Users/[^/]+/Images/[A-Za-z]+(?:/\d+)?/?$"       # avatars de la page de connexion
     r"|Branding/(?:Configuration|Css(?:\.css)?)/?$)", re.I)
+# dans les parametres : API REST de WordPress par l'adresse racine
+SCANNER_QS_RE = re.compile(r"(?:^|&)rest_route=", re.I)
 LOGIN_RE = re.compile(r"^/Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$", re.I)
 
 
@@ -1584,6 +1589,16 @@ TICKS = 10_000_000
 X = "\x00"            # remplace par le nom de l'element a l'affichage
 
 
+_SECRET_QS = re.compile(r"(?i)((?:^|[?&;])(?:api_?key|x-emby-token|x-mediabrowser-token|"
+                        r"x-emby-authorization|access_?token|token|pw|password|passwd)=)"
+                        r"[^&;\s]*")
+
+
+def redact(text):
+    """Cles de session et mots de passe d'une adresse remplaces par ***."""
+    return _SECRET_QS.sub(r"\1***", str(text or ""))
+
+
 class Attempts:
     """Tentatives suspectes regroupees par adresse (IPv4, ou bloc /64 en IPv6) :
     robots, mots de passe faux, cles de session inventees, acces sans connexion,
@@ -1607,6 +1622,10 @@ class Attempts:
                 data = json.loads(Path(path).read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     self.items = {k: v for k, v in data.items() if isinstance(v, dict)}
+                for a in self.items.values():        # fichiers ecrits avant le masquage
+                    for f in ("tried", "seen"):
+                        if isinstance(a.get(f), dict):
+                            a[f] = {redact(w): v for w, v in a[f].items()}
             except (OSError, ValueError):
                 pass
 
@@ -1638,7 +1657,7 @@ class Attempts:
             if value and value not in a[field]:
                 a[field].append(value)
                 del a[field][:-cap]
-        what = str(what or "")[:140]
+        what = redact(what)[:140]
         if what:
             tried = a["tried"]
             n = tried.pop(what, [0, now])[0] + 1
@@ -1661,7 +1680,7 @@ class Attempts:
         en a une, sinon gardee en memoire une heure (au cas ou elle en aurait
         une ensuite)."""
         now = now or time.time()
-        what = str(what or "")[:160]
+        what = redact(what)[:160]
         a = self.items.get(key)
         if a is not None:
             self._add_seen(a, what, now)
@@ -3204,8 +3223,8 @@ class EmbyProxy:
             connector=TCPConnector(limit=0, ttl_dns_cache=300),
             timeout=ClientTimeout(total=None, connect=15, sock_connect=15),
             auto_decompress=False, cookie_jar=None)
-        log.info("proxy pret : %s -> %s  (cache %s, %d vignettes, %.1f Mo)",
-                 "%s:%d" % (self.cfg.listen_host, self.cfg.listen_port),
+        log.info("Emby Proxy %s pret : %s -> %s  (cache %s, %d vignettes, %.1f Mo)",
+                 __version__, "%s:%d" % (self.cfg.listen_host, self.cfg.listen_port),
                  self.cfg.upstream, self.cfg.cache_dir, len(self.cache.index),
                  self.cache.total / 1048576)
         if self.activity:
@@ -3635,7 +3654,8 @@ class EmbyProxy:
             # (sinon impossible de debannir sa propre adresse)
             return await self._status_gate(request, handler, ip)
         if getattr(self.cfg, "ban_scanners", True) and (
-                SCANNER_RE.search(np) or SCANNER_RE.search(request.path)):
+                SCANNER_RE.search(np) or SCANNER_RE.search(request.path)
+                or SCANNER_QS_RE.search(request.query_string)):
             return self._scanner(request, ip)
         refus = self.guard.check(ip, np)
         remote = request.remote or ""
@@ -5491,6 +5511,7 @@ class EmbyProxy:
         t = lambda x: _html_escape(tr(x, lang))      # noqa: E731
         other = "fr" if lang == "en" else "en"
         html = (LOGIN_HTML.replace("@@LANG@@", lang)
+                .replace("@@VER@@", _html_escape(__version__))
                 .replace("@@PH@@", t("Mot de passe"))
                 .replace("@@BTN@@", t("Se connecter"))
                 .replace("@@SUB@@", t("Mot de passe : section [status] du fichier "
@@ -5547,6 +5568,7 @@ class EmbyProxy:
 
     async def status_page(self, request):
         html = STATUS_HTML.replace("@@LANG@@", self.cfg.language) \
+            .replace("@@VER@@", _html_escape(__version__)) \
             .replace("@@I18N@@", js_table())
         return web.Response(text=html, content_type="text/html")
 
@@ -5598,7 +5620,7 @@ border:1px solid #2e323d;background:#16181f;color:#e4e6ec;font:inherit}button{ma
 padding:9px;border:0;border-radius:6px;background:#e94560;color:#fff;font:inherit;cursor:pointer}
 .err{color:#e05555;margin-top:10px;min-height:1em}.sub{color:#9aa0aa;font-size:12px;margin-top:12px}
 .lg{float:right;color:#9aa0aa;font-size:12px;text-decoration:none;border:1px solid #2e323d;border-radius:5px;padding:2px 7px}</style>
-</head><body><form method="post" action="/__proxy/login"><a class="lg" href="?lang=@@OTHER@@">@@OTHERLBL@@</a><h1>Emby Proxy</h1>
+</head><body><form method="post" action="/__proxy/login"><a class="lg" href="?lang=@@OTHER@@">@@OTHERLBL@@</a><h1>Emby Proxy <small style="font-size:12px;font-weight:400;opacity:.7">v@@VER@@</small></h1>
 <input type="password" name="password" placeholder="@@PH@@" autofocus autocomplete="current-password">
 <button type="submit">@@BTN@@</button><div class="err">@@ERR@@</div>
 <div class="sub">@@SUB@@</div></form></body></html>"""
@@ -5647,10 +5669,10 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
 .hdr{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.hdr .row{margin:0;align-items:center}
 button.adm{border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;background:var(--card)}
 button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{border:1px solid var(--ok);color:var(--ok)}button.adm.view{border:1px solid var(--info);color:var(--info)}
-.tabs{flex-wrap:wrap}.lgk{display:flex;gap:8px;align-items:baseline;margin-top:6px}
+.tabs{flex-wrap:wrap}h1 .ver{font-size:13px;font-weight:400;color:var(--mut);margin-left:6px}.lgk{display:flex;gap:8px;align-items:baseline;margin-top:6px}
 </style></head><body>
 <div class="hdr">
-<h1>Emby Proxy</h1><div class="row"><button class="adm" id="embyAdm" hidden></button><button class="ghost" id="langBtn" title="Langue / Language"></button><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div></div>
+<h1>Emby Proxy <span class="ver" id="ver" data-v="@@VER@@"></span></h1><div class="row"><button class="adm" id="embyAdm" hidden></button><button class="ghost" id="langBtn" title="Langue / Language"></button><form method="post" action="/__proxy/logout"><button class="ghost">Se déconnecter</button></form></div></div>
 <div id="warn"></div>
 <div class="tabs"><button data-t="act" class="on">Activité</button><button data-t="sec">Sécurité</button><button data-t="quota">Quotas</button><button data-t="cache">Cache</button><button data-t="conf">Configuration</button><button data-t="logs">Journaux</button></div>
 
@@ -5828,6 +5850,7 @@ const $=id=>document.getElementById(id);
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=T(text);return e}
 trDom(document.body);
 $('langBtn').textContent=LANG==='en'?'Français':'English';
+$('ver').textContent='v'+$('ver').dataset.v;
 $('langBtn').onclick=()=>post('lang',{lang:LANG==='en'?'fr':'en'}).then(r=>{if(r.ok)location.reload();else alert('✖ '+T(r.error))});
 const mo=b=>b>=1073741824?(b/1073741824).toFixed(2)+(LANG==='en'?' GB':' Go'):b>=1048576||!b?(b/1048576).toFixed(1)+(LANG==='en'?' MB':' Mo'):Math.max(1,Math.round(b/1024))+(LANG==='en'?' KB':' Ko');
 const dur=s=>s<60?s+' s':s<3600?Math.floor(s/60)+' min':Math.floor(s/3600)+' h '+Math.floor(s%3600/60)+' min';
@@ -6359,7 +6382,7 @@ def run_gui(cfg):
         c = holder["proxy"].cfg if holder["proxy"] else cfg
         return "%s://127.0.0.1:%d/__proxy/" % (scheme, c.status_port or c.listen_port)
     root = tk.Tk()
-    root.title("Emby Proxy")
+    root.title("Emby Proxy " + __version__)
     root.configure(bg="#16181f")
     root.resizable(False, False)
     fg, mut, bg = "#e4e6ec", "#9aa0aa", "#16181f"

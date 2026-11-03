@@ -8,7 +8,7 @@ import emby_proxy as ep
 ADMIN = "a" * 32
 USER = "b" * 32
 TOKENS = {"TOKADMIN": ADMIN, "TOKUSER": USER}
-NET = "83.204.193.128"
+NET = "198.51.100.77"
 
 
 @pytest.fixture
@@ -49,7 +49,7 @@ def h(tok, ip=NET):
 
 DASH = ["/emby/System/Configuration", "/emby/ScheduledTasks", "/emby/Plugins/SecurityInfo",
         "/emby/System/ActivityLog/Entries", "/emby/Sessions", "/emby/Users",
-        "/emby/System/Info", "/emby/Devices"]
+        "/emby/Devices"]
 
 
 @pytest.mark.parametrize("path", DASH)
@@ -62,8 +62,11 @@ async def test_interdite_tout_le_tableau_de_bord_refuse(env, path):
 
 async def test_interdite_l_admin_peut_quand_meme_regarder(env):
     proxy, c, seen, _ = env
+    # /System/Info : demande par les applis (iPhone, Android TV, Xbox) au
+    # demarrage et avant la lecture ; ce n'est pas de l'administration
     for p in ("/emby/Users/%s/Items" % ADMIN, "/emby/Videos/1/stream.mkv",
-              "/emby/Sessions?DeviceId=tv1", "/emby/Sessions/Playing"):
+              "/emby/Sessions?DeviceId=tv1", "/emby/Sessions/Playing", "/emby/System/Info",
+              "/emby/System/Info?X-Emby-Client=Emby+for+iOS&X-Emby-Device-Name=iPhone"):
         assert (await c.get(p, headers=h("TOKADMIN"))).status == 200, p
 
 
@@ -140,3 +143,22 @@ async def test_admin_qui_ouvre_la_fiche_d_un_autre_reste_admin(env):
     assert proxy.activity.token_user["TOKADMIN"] == ADMIN
     r = await c.delete("/emby/Items/123", headers=h("TOKADMIN"))
     assert r.status == 403
+
+
+async def test_version_affichee_dans_la_page_d_administration(tmp_path):
+    from aiohttp.test_utils import TestClient, TestServer
+    from test_proxy import login
+    cfg = ep.Settings(tmp_path / "absent.ini", overrides={
+        ("proxy", "upstream"): "http://127.0.0.1:9", ("cache", "dir"): str(tmp_path / "c"),
+        ("log", "file"): "", ("status", "port"): "0"})
+    p = ep.EmbyProxy(cfg)
+    c = TestClient(TestServer(p.build_app()))
+    await c.start_server()
+    try:
+        page = await (await c.get("/__proxy/login")).text()
+        assert "v" + ep.__version__ in page
+        await login(c, p)
+        page = await (await c.get("/__proxy/")).text()
+        assert 'id="ver" data-v="%s"' % ep.__version__ in page
+    finally:
+        await c.close()

@@ -129,7 +129,7 @@ async def test_tv_sur_internet_via_le_relais_https(env):
     proxy, c, _ = env
     proxy.cfg.trusted = ep._nets("127.0.0.1/32")
     r = await c.get("/emby/System/Info/Public", headers={
-        "X-Forwarded-For": "83.204.193.128", "X-Forwarded-Proto": "https",
+        "X-Forwarded-For": "198.51.100.77", "X-Forwarded-Proto": "https",
         "Host": "emby.example.com"})
     d = json.loads(await r.read())
     for k in ("LocalAddress", "WanAddress"):
@@ -296,7 +296,7 @@ async def test_demande_de_lecture_visible_dans_l_activite(aiohttp_server, tmp_pa
 def test_administration_depuis_internet(tmp_path, path, bloque):
     cfg = ep.Settings(tmp_path / "absent.ini")
     g = ep.Guard(cfg)
-    r = g.check("83.204.193.128", ep.norm_path(path))
+    r = g.check("198.51.100.77", ep.norm_path(path))
     assert (r is not None and r[0] == 403) == bloque
 
 
@@ -317,10 +317,10 @@ async def test_option_emby_voit_tout_le_monde_en_local(env):
     distante. Le proxy, lui, connait toujours la vraie adresse."""
     proxy, c, seen = env
     proxy.cfg.trusted = ep._nets("127.0.0.1/32")
-    hdr = {"X-Forwarded-For": "83.204.193.128", "X-Forwarded-Proto": "https",
+    hdr = {"X-Forwarded-For": "198.51.100.77", "X-Forwarded-Proto": "https",
            "Host": "emby.example.com"}
     await c.get("/emby/System/Info/Public", headers=hdr)
-    assert seen["info_headers"]["X-Forwarded-For"].startswith("83.204.193.128")
+    assert seen["info_headers"]["X-Forwarded-For"].startswith("198.51.100.77")
     proxy.cfg.forward_ip = False
     await c.get("/emby/System/Info/Public", headers=hdr)
     h = seen["info_headers"]
@@ -329,7 +329,7 @@ async def test_option_emby_voit_tout_le_monde_en_local(env):
     # le proxy voit toujours le visiteur (bannissements, activite)
     await c.post("/emby/Users/AuthenticateByName", data="Username=tv&Pw=faux",
                  headers=dict(hdr, **{"Content-Type": "application/x-www-form-urlencoded"}))
-    assert proxy.seclog.events[-1]["ip"] == "83.204.193.128"
+    assert proxy.seclog.events[-1]["ip"] == "198.51.100.77"
 
 
 async def test_infos_serveur_gardent_les_autorisations_cors(aiohttp_server, tmp_path):

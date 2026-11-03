@@ -138,7 +138,25 @@ async def test_appli_avec_session_expiree_jamais_bannie(env):
     """Une vraie appli dont la session a expire renvoie sa MEME ancienne cle,
     souvent des dizaines de fois d'un coup (ecran d'accueil) : pas un robot."""
     proxy, c, _ = env
-    home = "83.204.193.128"
+    home = "198.51.100.77"
     for _ in range(60):
         await c.get("/emby/Items", headers=dict(via(home), **{"X-Emby-Token": "FAKEOLD"}))
     assert proxy.guard.check(home, "/") is None
+
+
+@pytest.mark.parametrize("path", [
+    "/key.json", "/keyfile.json", "/firebase-key.json", "/firebase-adminsdk.json",
+    "/application_default_credentials.json", "/.config/gcloud/application_default_credentials.json",
+    "/google-key.json", "/service-account.json", "/aws-credentials.json",
+    "/?rest_route=/batch/v1"])
+def test_robots_cles_et_wordpress_reconnus(path):
+    """Cas reels vus dans l'onglet Activite (robots de serveurs loues)."""
+    raw, _, qs = path.partition("?")
+    assert ep.SCANNER_RE.search(ep.norm_path(raw)) or ep.SCANNER_QS_RE.search(qs)
+
+
+@pytest.mark.parametrize("path", [
+    "/web/manifest.json", "/web/strings/fr.json", "/web/config.json",
+    "/emby/Items/1/Images/Primary", "/emby/System/Info"])
+def test_fichiers_d_emby_jamais_pris_pour_des_robots(path):
+    assert not ep.SCANNER_RE.search(ep.norm_path(path))

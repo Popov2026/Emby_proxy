@@ -157,12 +157,15 @@ jobs:
           $out = cmd /c "echo.| install_service.bat" 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch "Admin page is ready: http://localhost:8098/") { throw "page d'administration non signalee prete" }
+          if ($out -notmatch "Installing Emby Proxy \d+\.\d+\.\d+ as a Windows service") { throw "version absente de la console" }
+          if ($out -notmatch "Emby Proxy \d+\.\d+\.\d+ installed and started") { throw "version absente du resume" }
           foreach ($fr in "Installation d'Emby", "Dossier", "Mot de passe", "Page d'administration", "Etape suivante") {
             if ($out -match [regex]::Escape($fr)) { throw "texte francais dans la console : $fr" }
           }
           if ((Get-Service EmbyProxy).Status -ne "Running") { throw "service non demarre" }
           $r = Invoke-WebRequest http://127.0.0.1:8098/__proxy/login -UseBasicParsing
           if ($r.StatusCode -ne 200) { throw "page d'administration injoignable" }
+          if ($r.Content -notmatch "v\d+\.\d+\.\d+") { throw "version absente de la page" }
           if (-not (Get-NetFirewallRule -DisplayName "Emby Proxy - users" -ErrorAction SilentlyContinue)) { throw "regle de pare-feu absente" }
           if (-not (Get-NetFirewallRule -DisplayName "Emby Proxy - admin" -ErrorAction SilentlyContinue)) { throw "regle de pare-feu admin absente" }
           if (-not (Test-Path image_cache)) { throw "dossier image_cache absent" }

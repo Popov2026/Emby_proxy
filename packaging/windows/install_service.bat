@@ -16,15 +16,17 @@ if errorlevel 1 (
 )
 cd /d "%~dp0"
 
-echo.
-echo  Installing Emby Proxy as a Windows service
-echo  Folder: %~dp0
-echo.
-
 if not exist "emby_proxy.exe" (
     echo  ERROR: emby_proxy.exe not found in this folder.
     goto :failed
 )
+set "VERSION=Emby Proxy"
+for /f "delims=" %%v in ('emby_proxy.exe --version 2^>nul') do set "VERSION=%%v"
+
+echo.
+echo  Installing %VERSION% as a Windows service
+echo  Folder: %~dp0
+echo.
 
 rem -- a previous installation is replaced
 EmbyProxy-service.exe stop >nul 2>&1
@@ -58,7 +60,7 @@ for /f "tokens=1,* delims==" %%a in ('findstr /b /c:"password = " emby_proxy.ini
 
 echo.
 echo  ============================================================
-echo   Service installed and started (it starts with Windows).
+echo   %VERSION% installed and started (it starts with Windows).
 echo.
 if defined ADMIN_PORT (
     echo   Admin page is ready: http://localhost:%ADMIN_PORT%/
