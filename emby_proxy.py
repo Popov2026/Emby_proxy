@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.8"
+__version__ = "2.6.0"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1543,6 +1543,120 @@ TICKS = 10_000_000
 X = "\x00"            # remplace par le nom de l'element a l'affichage
 
 
+class Attempts:
+    """Tentatives suspectes regroupees par adresse (IPv4, ou bloc /64 en IPv6) :
+    robots, mots de passe faux, cles de session inventees, acces sans connexion,
+    refus... avec ce qui a ete demande. Gardees sur disque (survivent au
+    redemarrage) ; les 500 adresses les plus recentes."""
+    CATS = ("robot", "password", "admin_password", "bad_key", "anon", "admin",
+            "banned", "rate", "direct", "refused")
+    MAX_KEYS, MAX_TRIED, MAX_USERS, MAX_IPS = 500, 40, 15, 8
+
+    def __init__(self, path):
+        self.path = path
+        self.items = {}
+        self._dirty = False
+        self._saved = 0.0
+        self._wlock = threading.Lock()
+        if path and Path(path).exists():
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.items = {k: v for k, v in data.items() if isinstance(v, dict)}
+            except (OSError, ValueError):
+                pass
+
+    def record(self, key, ip, local, cat, what="", user="", agent="", now=None):
+        now = now or time.time()
+        a = self.items.get(key)
+        if a is None:
+            if len(self.items) >= self.MAX_KEYS:
+                oldest = min(self.items, key=lambda k: self.items[k].get("last", 0))
+                del self.items[oldest]
+            a = self.items[key] = {"ips": [], "local": bool(local), "first": now,
+                                   "last": now, "total": 0, "cats": {}, "users": [],
+                                   "agents": [], "tried": {}, "ban": "", "ok_user": ""}
+        a["last"] = now
+        a["total"] += 1
+        a["cats"][cat] = a["cats"].get(cat, 0) + 1
+        for field, value, cap, size in (("ips", ip, self.MAX_IPS, 64),
+                                         ("users", user, self.MAX_USERS, 64),
+                                         ("agents", agent, 4, 120)):
+            value = str(value or "")[:size]
+            if value and value not in a[field]:
+                a[field].append(value)
+                del a[field][:-cap]
+        what = str(what or "")[:140]
+        if what:
+            tried = a["tried"]
+            n = tried.pop(what, [0, now])[0] + 1
+            tried[what] = [n, now]                  # le plus recent a la fin
+            while len(tried) > self.MAX_TRIED:
+                tried.pop(next(iter(tried)))
+        self._changed(now)
+
+    def mark_ban(self, key, reason):
+        a = self.items.get(key)
+        if a is not None:
+            a["ban"] = str(reason or "")[:200]
+            self._changed()
+
+    def login_ok(self, key, user):
+        a = self.items.get(key)
+        if a is not None and user:
+            a["ok_user"] = str(user)[:64]
+            self._changed()
+
+    def clear(self):
+        self.items.clear()
+        self._dirty = True
+        self.flush()
+
+    def snapshot(self, guard, limit=300):
+        now = time.time()
+        out = []
+        for key, a in sorted(self.items.items(), key=lambda kv: -kv[1].get("last", 0)):
+            banned = guard.banned.get(key, 0) - now
+            out.append({
+                "key": key, "ip": (a["ips"] or [key])[-1], "ips": a["ips"],
+                "local": a["local"], "first": int(a["first"]), "last": int(a["last"]),
+                "total": a["total"], "cats": a["cats"], "users": a["users"],
+                "agents": a["agents"], "ban": a.get("ban", ""),
+                "banned_s": int(banned) if banned > 0 else 0,
+                "ok_user": a.get("ok_user", ""),
+                "tried": [{"what": w, "n": v[0], "t": int(v[1])}
+                          for w, v in reversed(list(a["tried"].items()))]})
+            if len(out) >= limit:
+                break
+        return {"attempts": out, "total": len(self.items)}
+
+    # -- disque : ecrit au plus toutes les 15 s, hors de la boucle -------------
+    def _changed(self, now=None):
+        self._dirty = True
+        if (now or time.time()) - self._saved >= 15:
+            self.flush(background=True)
+
+    def flush(self, background=False):
+        if not self.path or not self._dirty:
+            return
+        self._dirty = False
+        self._saved = time.time()
+        text = json.dumps(self.items, ensure_ascii=False)
+
+        def write():
+            with self._wlock:
+                try:
+                    tmp = str(self.path) + ".tmp"
+                    Path(tmp).write_text(text, encoding="utf-8")
+                    os.replace(tmp, self.path)
+                except OSError as exc:
+                    log.warning("tentatives : ecriture impossible : %s", exc)
+        if background:
+            threading.Thread(target=write, daemon=True).start()
+        else:
+            write()
+
+
 # Raisons de transcodage d'Emby : ce qu'elles obligent a convertir
 # (ContainerBitrateExceedsLimit n'en fait pas partie : Emby copie souvent la
 # video telle quelle dans ce cas, seul le conteneur change)
@@ -2920,6 +3034,8 @@ class EmbyProxy:
         self.activity = Activity(cfg, self.guard) if cfg.activity_enabled else None
         self.seclog = SecurityLog(cfg.security_log)
         self.seclog.restore_bans(self.guard, cfg.ban_seconds)
+        self.attempts = Attempts(Path(cfg.security_log).with_name("emby_attempts.json")
+                                 if cfg.security_log else None)
         self.sessions = {}          # jeton de la page d'etat -> expiration
         self.warnings = {}
         if not cfg.tls_cert and not cfg.trusted and \
@@ -2954,6 +3070,7 @@ class EmbyProxy:
                 self.activity.cfg, self.activity.guard = cfg, self.guard
             if previous.cfg.security_log == cfg.security_log:
                 self.seclog = previous.seclog
+                self.attempts = previous.attempts
         self.seclog.on_event = self._security_event
         if self.activity is not None:
             self.activity.on_delete = self._delete_event
@@ -2991,6 +3108,11 @@ class EmbyProxy:
     # -- evenements -> alertes par mail -------------------------------------
     def _security_event(self, e):
         t, ip, who = e["type"], e["ip"], e.get("user") or "?"
+        if t == "ban":
+            self.attempts.mark_ban(e.get("ban_key") or self.guard.key(ip),
+                                   e.get("detail", ""))
+        elif t == "login_ok":
+            self.attempts.login_ok(self.guard.key(ip), e.get("user", ""))
         if t == "ban" and not str(e.get("detail", "")).startswith("robot"):
             self.alerts.add("on_ban", "Adresse bannie : %s" % ip,
                             "%s ; nom tape : %s" % (e.get("detail", ""), who))
@@ -3124,6 +3246,7 @@ class EmbyProxy:
         for t in self._tasks:
             t.cancel()
         self.stats.save()
+        self.attempts.flush()
         if self.alerts.pending:
             await self.alerts.flush()          # ne pas perdre les dernieres alertes
         await asyncio.get_running_loop().run_in_executor(None, self.quota.close)
@@ -3299,6 +3422,7 @@ class EmbyProxy:
         app.router.add_get("/__proxy/stats.json", self.status_json)
         app.router.add_get("/__proxy/activity.json", self.activity_json)
         app.router.add_get("/__proxy/security.json", self.security_json)
+        app.router.add_get("/__proxy/attempts.json", self.attempts_json)
         app.router.add_post("/__proxy/purge", self.purge)
         app.router.add_post("/__proxy/unban", self.unban)
         app.router.add_get("/__proxy/config.json", self.config_json)
@@ -3360,6 +3484,13 @@ class EmbyProxy:
             refus = (403, "Connexion directe refusee : passe par l'adresse HTTPS.")
         if refus:
             self.guard.blocked += 1
+            known = self._device_card(request)
+            cat = ("rate" if refus[0] == 429 else
+                   "banned" if refus[1].startswith("Adresse bannie") else
+                   "direct" if refus[1].startswith("Connexion directe") else "refused")
+            if not (cat == "rate" and known is not None):   # vrai utilisateur trop rapide
+                self._attempt(request, ip, cat,
+                              user=known.user_name if known is not None else "")
             if refus[0] == 429:
                 # debit depasse : note aussi (une ligne par minute et par adresse,
                 # les suivantes sont comptees), sinon invisible dans la page
@@ -3589,6 +3720,18 @@ class EmbyProxy:
         self.admin_cache[uid] = (admin, time.time() + 600)
         return admin
 
+    def _attempt(self, request, ip, cat, what=None, user=""):
+        """Note une tentative suspecte (onglet Activite, Tentatives suspectes)."""
+        if not ip:
+            return
+        f = Activity._auth_fields(request)
+        agent = " / ".join(x for x in (f.get("client", ""), f.get("device", "")) if x) \
+            or request.headers.get("User-Agent", "")
+        if what is None:
+            what = "%s %s" % (_safe(request.method, 10), _safe(request.path_qs, 120))
+        self.attempts.record(self.guard.key(ip), ip, self.guard.is_local(ip), cat,
+                             what, user, agent)
+
     def _refuse(self, request, ip, status, why):
         self.guard.blocked += 1
         f = Activity._auth_fields(request)
@@ -3599,6 +3742,7 @@ class EmbyProxy:
         if c is not None:
             self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
                 why, request.method, request.path[:80]), merge=60)
+        self._attempt(request, ip, "admin", user=c.user_name if c is not None else "")
         return web.Response(status=status, text=why)
 
     # -- connexion Emby obligatoire depuis Internet ------------------------
@@ -3636,6 +3780,7 @@ class EmbyProxy:
         hits.append(now)
         while hits and now - hits[0] > 600:
             hits.popleft()
+        self._attempt(request, ip, "anon")
         self.seclog.add("refused", ip, False,
                         client=request.headers.get("User-Agent", "")[:60],
                         detail="Connexion Emby requise (%s %s)" % (
@@ -3663,6 +3808,7 @@ class EmbyProxy:
         tok = Activity._auth_fields(request).get("token", "")
         key = self.guard.key(ip)
         now = time.time()
+        self._attempt(request, ip, "bad_key")
         tried = self.badtok_hits.setdefault(key, {})
         tried[hashlib.sha256(tok.encode()).hexdigest()[:16]] = now
         for k in [k for k, t in tried.items() if now - t > 600]:
@@ -3680,6 +3826,7 @@ class EmbyProxy:
         """Robot qui cherche des failles : banni des sa premiere tentative
         (jamais une adresse du reseau local, qui peut etre le relais HTTPS)."""
         self.guard.blocked += 1
+        self._attempt(request, ip, "robot")
         if not self.guard.is_local(ip):
             key = self.guard.key(ip)
             first = self.guard.banned.get(key, 0) <= time.time()
@@ -4026,6 +4173,9 @@ class EmbyProxy:
         if isinstance(body, dict):
             user = str(body.get("Username") or body.get("Name") or "")[:80]
         local = self.guard.is_local(ip)
+        if not ok:
+            self._attempt(request, ip, "password", user=user,
+                          what="connexion Emby refusee pour « %s »" % (user or "?"))
         self.seclog.add("login_ok" if ok else "login_fail", ip, local, user,
                         f.get("client", ""), f.get("device", ""))
         if self.guard.login_result(ip, ok):
@@ -4424,6 +4574,8 @@ class EmbyProxy:
         given = str(data.get("password", ""))
         if not hmac.compare_digest(given.encode("utf-8"),
                                    self.cfg.status_password.encode("utf-8")):
+            self._attempt(request, ip, "admin_password",
+                          what="page d'administration : mot de passe de confirmation faux")
             self.seclog.add("config_fail", ip, local, detail="mot de passe de "
                             "confirmation faux")
             if self.guard.login_result(ip, False):
@@ -4547,6 +4699,8 @@ class EmbyProxy:
                                self.cfg.status_password.encode("utf-8")):
             self.guard.login_result(ip, True)
             return None
+        self._attempt(request, ip, "admin_password",
+                      what="page d'administration : mot de passe de confirmation faux")
         self.seclog.add("config_fail", ip, local, detail="mot de passe de "
                         "confirmation faux")
         if self.guard.login_result(ip, False):
@@ -4943,6 +5097,7 @@ class EmbyProxy:
                 errors.append("activité : %s" % exc)
         if "security" in kinds:
             try:
+                self.attempts.clear()
                 # les bannissements en cours restent (et survivent au redemarrage)
                 active = set(self.guard.active_bans())
                 keep = [e for e in list(self.seclog.events) if e.get("type") == "ban"
@@ -5041,6 +5196,9 @@ class EmbyProxy:
     async def security_json(self, request):
         return web.json_response(self.seclog.snapshot(self.guard))
 
+    async def attempts_json(self, request):
+        return web.json_response(self.attempts.snapshot(self.guard))
+
     async def unban(self, request):
         data = await request.post()
         ip = str(data.get("ip", ""))[:64]
@@ -5077,6 +5235,8 @@ class EmbyProxy:
                                  self.cfg.status_password.encode("utf-8"))
         local = self.guard.is_local(ip)
         if not ok:
+            self._attempt(request, ip, "admin_password",
+                          what="page d'administration du proxy : mot de passe faux")
             self.seclog.add("status_fail", ip, local,
                             client=request.headers.get("User-Agent", "")[:60])
             if self.guard.login_result(ip, False):
@@ -5176,6 +5336,11 @@ h1{font-size:19px;margin:0 0 12px}h2{font-size:15px;margin:22px 0 10px}
 .tabs{display:flex;gap:6px;margin-bottom:14px}.tabs button{background:var(--card);color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:7px 14px;cursor:pointer;font:inherit}
 .tabs button.on{color:var(--fg);border-color:var(--acc)}
 .g{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+.att .cat{display:inline-block;margin:3px 6px 0 0;padding:1px 7px;border-radius:10px;border:1px solid var(--line);font-size:12px}
+.att .cat.robot,.att .cat.bad_key,.att .cat.password,.att .cat.admin_password{border-color:var(--bad);color:var(--bad)}
+.att .tried{margin-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all}
+.att .tried div{padding:1px 0;border-top:1px dashed var(--line)}.att .tried time{color:var(--mut);margin-right:6px}
+.att .st{margin-top:6px}.att .st.ban{color:var(--bad)}.att .st.ok{color:var(--ok)}
 .users{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
 .c{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;min-width:0}
 .l{color:var(--mut);font-size:12px}.v{font-size:21px;font-weight:600}
@@ -5218,6 +5383,25 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   <h2>Utilisateurs</h2>
   <label class="sub"><input type="checkbox" id="showIdle"> afficher aussi les inactifs</label>
   <div class="users" id="users" style="margin-top:10px"></div>
+  <h2>Tentatives suspectes</h2>
+  <div class="sub">Robots, mots de passe faux, clés de session inventées, accès sans connexion, refus : une fiche par adresse, avec tout ce qui a été tenté.</div>
+  <div class="bar2">
+    <select id="aCat"><option value="">Toutes les tentatives</option>
+      <option value="robot">Robots qui cherchent des failles</option>
+      <option value="password">Mots de passe Emby faux</option>
+      <option value="admin_password">Mots de passe de la page d'administration faux</option>
+      <option value="bad_key">Clés de session inventées</option>
+      <option value="anon">Accès sans connexion</option>
+      <option value="admin">Administration d'Emby refusée</option>
+      <option value="banned">Requêtes d'adresses bannies</option>
+      <option value="rate">Trop de requêtes</option>
+      <option value="direct,refused">Autres refus</option></select>
+    <select id="aNet"><option value="">Internet et réseau local</option><option value="net">Internet seulement</option><option value="local">Réseau local seulement</option></select>
+    <select id="aBan"><option value="">Bannies ou non</option><option value="1">Bannies en ce moment</option></select>
+    <input id="aText" placeholder="Filtrer (adresse, compte, adresse demandée...)">
+  </div>
+  <div class="sub" id="aSum" style="margin-top:6px"></div>
+  <div class="users" id="attempts" style="margin-top:10px"></div>
   <h2>Journal d'activité</h2>
   <div class="bar2">
     <select id="fUser"><option value="">Tous les utilisateurs</option></select>
@@ -5322,7 +5506,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   <div class="c form">
     <div class="sub">Coche les journaux à effacer. Les bannissements en cours sont conservés.</div>
     <label class="lgk"><input type="checkbox" class="lgc" value="activity"><span>Journal d'activité (navigation, lectures, recherches…)</span><span class="sub" data-n="activity"></span></label>
-    <label class="lgk"><input type="checkbox" class="lgc" value="security"><span>Journal de sécurité (connexions, mots de passe faux, refus…)</span><span class="sub" data-n="security"></span></label>
+    <label class="lgk"><input type="checkbox" class="lgc" value="security"><span>Journal de sécurité et tentatives suspectes (connexions, mots de passe faux, refus…)</span><span class="sub" data-n="security"></span></label>
     <label class="lgk"><input type="checkbox" class="lgc" value="quotas"><span>Événements des quotas</span><span class="sub" data-n="quotas"></span></label>
     <label class="lgk"><input type="checkbox" class="lgc" value="technical"><span>Journal technique (emby_proxy.log)</span><span class="sub" data-n="technical"></span></label>
     <div class="row"><button class="red" id="lSave">Effacer la sélection…</button></div>
@@ -5391,6 +5575,44 @@ function userCard(u){
   if(u.events.length){const ev=el('div','ev');
     u.events.forEach(e=>{const r=el('div','e k-'+e.kind);r.append(el('time',null,hm(e.t)),el('span',null,e.text));ev.append(r)});c.append(ev)}
   return c}
+
+const ACAT={robot:'Robot (recherche de failles)',password:'Mot de passe Emby faux',
+  admin_password:"Mot de passe de la page d'administration faux",bad_key:'Clé de session inventée',
+  anon:'Accès sans connexion',admin:"Administration d'Emby refusée",banned:'Requête alors que bannie',
+  rate:'Trop de requêtes',direct:'Connexion directe sans le relais HTTPS',refused:'Accès refusé'};
+let lastAtt=null;const attOpen=new Set();
+function attCard(a){
+  const c=el('div','c att'),top=el('div');
+  const dot=el('span','dot');dot.style.background=a.banned_s?'var(--bad)':a.ok_user?'var(--ok)':'var(--warn)';
+  top.append(dot,el('span','name',a.ip));
+  const t=el('span','tag',a.local?'réseau local':'Internet');t.style.color=a.local?'var(--mut)':'var(--warn)';top.append(t);
+  c.append(top);
+  if(a.ips.length>1)c.append(el('div','sub',TF('Autres adresses du même bloc : {0}',a.ips.filter(x=>x!==a.ip).join(', '))));
+  c.append(el('div','sub',TF('{0} tentative(s) · première {1} · dernière {2}',a.total,day(a.first),day(a.last))));
+  const cats=el('div');Object.entries(a.cats).sort((x,y)=>y[1]-x[1]).forEach(([k,n])=>cats.append(el('span','cat '+k,T(ACAT[k]||k)+' ×'+n)));c.append(cats);
+  if(a.users.length)c.append(el('div','sub',TF('Comptes essayés : {0}',a.users.join(', '))));
+  if(a.agents.length)c.append(el('div','sub',TF('Appareil / logiciel : {0}',a.agents.join(' | '))));
+  if(a.banned_s){const st=el('div','st ban',TF('⛔ Bannie encore {0} min',Math.ceil(a.banned_s/60))+(a.ban?' — '+a.ban:''));
+    const bt=el('button','small','Débannir');bt.style.marginLeft='8px';
+    bt.onclick=()=>{if(confirm(TF('Débannir {0} ?',a.ip)))fetch('unban',{method:'POST',body:new URLSearchParams({ip:a.key.includes('/')?a.key:a.ip})}).then(tick)};
+    st.append(bt);c.append(st)}
+  else if(a.ban)c.append(el('div','st sub',TF('A été bannie : {0}',a.ban)));
+  if(a.ok_user)c.append(el('div','st ok',TF('✔ S\'est ensuite connecté avec le compte {0}',a.ok_user)));
+  if(a.tried.length){const box=el('div','tried'),open=attOpen.has(a.key),list=open?a.tried:a.tried.slice(0,8);
+    box.append(el('div','sub',T('Ce qui a été tenté (le plus récent en premier) :')));
+    list.forEach(x=>{const r=el('div');r.append(el('time',null,day(x.t)));r.append(document.createTextNode(T(x.what)+(x.n>1?'  ×'+x.n:'')));box.append(r)});
+    if(a.tried.length>8){const b=el('button','small',open?T('Réduire'):TF('Tout voir ({0})',a.tried.length));
+      b.onclick=()=>{open?attOpen.delete(a.key):attOpen.add(a.key);renderAtt()};box.append(b)}
+    c.append(box)}
+  return c}
+function renderAtt(d){
+  if(d)lastAtt=d;if(!lastAtt)return;
+  const k=$('aCat').value.split(',').filter(Boolean),nt=$('aNet').value,bn=$('aBan').value,q=$('aText').value.toLowerCase();
+  const all=lastAtt.attempts,rows=all.filter(a=>(!k.length||k.some(x=>a.cats[x]))&&(!nt||(nt==='local')===a.local)&&(!bn||a.banned_s>0)&&
+    (!q||[a.ip,a.ips.join(' '),a.users.join(' '),a.agents.join(' '),a.ban,a.ok_user,a.tried.map(x=>x.what).join(' ')].join(' ').toLowerCase().includes(q)));
+  $('aSum').textContent=TF('{0} adresse(s) · {1} bannie(s) en ce moment · {2} tentative(s) au total',all.length,all.filter(a=>a.banned_s>0).length,all.reduce((n,a)=>n+a.total,0));
+  $('attempts').replaceChildren(...(rows.length?rows.slice(0,150).map(attCard):[el('div','empty','Aucune tentative suspecte.')]))}
+['aCat','aNet','aBan'].forEach(i=>$(i).onchange=()=>renderAtt());$('aText').oninput=()=>renderAtt();
 
 let last=null;
 function renderAct(d){
@@ -5647,6 +5869,7 @@ function tick(){
   const j=u=>fetch(u).then(r=>{if(r.status===401){location.href='login';throw 0}return r.json()});
   j('activity.json').then(renderAct).catch(()=>{});
   j('security.json').then(renderSec).catch(()=>{});
+  j('attempts.json').then(renderAtt).catch(()=>{});
   j('stats.json').then(renderStats).catch(()=>{})}
 tick();setInterval(tick,3000);
 </script></body></html>

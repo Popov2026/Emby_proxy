@@ -162,6 +162,9 @@ async def main():
             body = await r.text()
             check("page d'accueil du proxy", r.status == 200 and "Emby Proxy" in body,
                   r.status)
+        async with s.get(U + "/.env", headers=dict(NET, **{"X-Forwarded-For": "198.51.100.7",
+                                                           "User-Agent": "zgrab/0.x"})) as r:
+            check("robot qui cherche .env : 404 et banni", r.status == 404, r.status)
         async with s.get(U + "/emby/System/Info/Public", headers=NET) as r:
             d = await r.json()
             check("infos publiques : nom du serveur", d.get("ServerName") == "NAS-ESSAI", d)
@@ -335,13 +338,36 @@ async def main():
             check("apercu des messages (variables remplacees)",
                   prev and "%pseudo%" not in prev, prev[:120])
             await p.click("button[data-t=act]")
-            await p.wait_for_timeout(500)
+            await p.wait_for_timeout(3500)
             check("onglet Activite : paul affiche", "paul" in await p.inner_text("body"))
+            if os.environ.get("FUNC_SHOT"):
+                await p.set_viewport_size({"width": 1200, "height": 900})
+                await p.locator("h2:has-text('Tentatives suspectes')").scroll_into_view_if_needed()
+                await p.wait_for_timeout(300)
+                await p.screenshot(path=os.environ["FUNC_SHOT"])
+            att = await p.inner_text("#attempts")
+            check("Tentatives suspectes : robot, ce qu'il a tente, banni",
+                  "198.51.100.7" in att and "GET /.env" in att and "Robot" in att
+                  and "Bannie" in att and "zgrab" in att, att[:400])
+            check("Tentatives suspectes : mot de passe faux de paul puis connexion reussie",
+                  "connexion Emby refusee pour « paul »" in att and "ensuite connecté" in att,
+                  att[:600])
+            await p.select_option("#aCat", "robot")
+            await p.wait_for_timeout(200)
+            only = await p.inner_text("#attempts")
+            check("filtre Robots : seulement le robot", "198.51.100.7" in only
+                  and "203.0.113.50" not in only, only[:200])
             lb = await p.query_selector("text=English")
             if lb:
                 await lb.click()
                 await p.wait_for_timeout(1000)
                 check("page en anglais", "Activity" in await p.inner_text("body"))
+                await p.select_option("#aCat", "")
+                await p.wait_for_timeout(3500)
+                en = await p.inner_text("#act")
+                check("Tentatives suspectes en anglais", "Suspicious attempts" in en
+                      and "Bot (looking for vulnerabilities)" in en
+                      and "Emby login refused for “paul”" in en, en[:300])
             check("aucune erreur JavaScript en fin de parcours", not errs, errs[:3])
 
             pu = await b.new_page(extra_http_headers={"X-Forwarded-For": "203.0.113.60",

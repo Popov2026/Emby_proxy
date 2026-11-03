@@ -84,6 +84,15 @@ right).
   logins and logouts, **wrong passwords**, requests refused by the proxy.
 - **Activity log** of all users, filtered by user, action and text; on disk
   in `emby_activity.log` (one JSON line per action).
+- **Suspicious attempts**: one card per address (IPv4, or IPv6 /64 block) for
+  bots looking for holes, wrong Emby passwords (with the account names
+  tried), wrong admin page passwords, invented session keys, access without
+  login, refused Emby administration, requests while banned, too many
+  requests. Each card lists **what was tried** (method and address, most
+  recent first, ×count), the device or software, whether the address is
+  banned (with an **Unban** button) or later logged in successfully (a
+  simple typo). Filters by kind, network and ban. Kept across restarts in
+  `emby_attempts.json`; cleared with the security log (Logs tab).
 
 Movie names are read from Emby's own answers. For an item never opened
 before, the proxy asks Emby with the API key from the settings (optional) or
@@ -370,6 +379,17 @@ Onglet **Activité**, rafraîchi toutes les 3 secondes :
   connexions et déconnexions, **mots de passe faux**, refus du proxy.
 - **Journal d'activité** de tous, filtrable par utilisateur, action et texte ;
   sur disque dans `emby_activity.log` (une ligne JSON par action).
+- **Tentatives suspectes** : une fiche par adresse (IPv4, ou bloc /64 en
+  IPv6) pour les robots qui cherchent des failles, les mots de passe Emby
+  faux (avec les comptes essayés), les mots de passe faux de la page
+  d'administration, les clés de session inventées, les accès sans connexion,
+  l'administration d'Emby refusée, les requêtes d'une adresse bannie, les
+  excès de requêtes. Chaque fiche liste **ce qui a été tenté** (méthode et
+  adresse, le plus récent d'abord, « ×n »), l'appareil ou le logiciel, si
+  l'adresse est bannie (bouton **Débannir**) ou s'est ensuite connectée
+  normalement (simple faute de frappe). Filtres par type, réseau et
+  bannissement. Gardées au redémarrage dans `emby_attempts.json` ; effacées
+  avec le journal de sécurité (onglet Journaux).
 
 Les noms des films sont lus dans les réponses d'Emby. Pour un élément jamais
 ouvert, le proxy demande son nom à Emby avec la clé API des réglages

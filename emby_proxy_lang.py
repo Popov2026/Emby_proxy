@@ -732,9 +732,56 @@ EN = {
     "Copier le mot de passe": "Copy password",
     "Arreter": "Stop",
     "en service": "running",
+    # tentatives suspectes (onglet Activite)
+    "Tentatives suspectes": "Suspicious attempts",
+    "Robots, mots de passe faux, clés de session inventées, accès sans connexion, refus : une fiche par adresse, avec tout ce qui a été tenté.":
+        "Bots, wrong passwords, invented session keys, access without login, refusals: one card per address, with everything that was tried.",
+    "Toutes les tentatives": "All attempts",
+    "Robots qui cherchent des failles": "Bots looking for vulnerabilities",
+    "Mots de passe Emby faux": "Wrong Emby passwords",
+    "Mots de passe de la page d'administration faux": "Wrong admin page passwords",
+    "Clés de session inventées": "Invented session keys",
+    "Accès sans connexion": "Access without login",
+    "Administration d'Emby refusée": "Emby administration refused",
+    "Requêtes d'adresses bannies": "Requests from banned addresses",
+    "Trop de requêtes": "Too many requests",
+    "Autres refus": "Other refusals",
+    "Internet et réseau local": "Internet and local network",
+    "Internet seulement": "Internet only",
+    "Réseau local seulement": "Local network only",
+    "Bannies ou non": "Banned or not",
+    "Bannies en ce moment": "Banned right now",
+    "Filtrer (adresse, compte, adresse demandée...)": "Filter (address, account, requested path...)",
+    "Robot (recherche de failles)": "Bot (looking for vulnerabilities)",
+    "Mot de passe Emby faux": "Wrong Emby password",
+    "Mot de passe de la page d'administration faux": "Wrong admin page password",
+    "Clé de session inventée": "Invented session key",
+    "Requête alors que bannie": "Request while banned",
+    "Connexion directe sans le relais HTTPS": "Direct connection without the HTTPS relay",
+    "Accès refusé": "Access refused",
+    "Autres adresses du même bloc : {0}": "Other addresses of the same block: {0}",
+    "{0} tentative(s) · première {1} · dernière {2}": "{0} attempt(s) · first {1} · last {2}",
+    "Comptes essayés : {0}": "Accounts tried: {0}",
+    "Appareil / logiciel : {0}": "Device / software: {0}",
+    "⛔ Bannie encore {0} min": "⛔ Banned for {0} more min",
+    "A été bannie : {0}": "Was banned: {0}",
+    "✔ S'est ensuite connecté avec le compte {0}": "✔ Then logged in with the account {0}",
+    "Ce qui a été tenté (le plus récent en premier) :": "What was tried (most recent first):",
+    "Réduire": "Collapse",
+    "Tout voir ({0})": "Show all ({0})",
+    "{0} adresse(s) · {1} bannie(s) en ce moment · {2} tentative(s) au total":
+        "{0} address(es) · {1} banned right now · {2} attempt(s) in total",
+    "Aucune tentative suspecte.": "No suspicious attempt.",
+    "page d'administration du proxy : mot de passe faux": "proxy admin page: wrong password",
+    "page d'administration : mot de passe de confirmation faux":
+        "admin page: wrong confirmation password",
+    "Journal de sécurité et tentatives suspectes (connexions, mots de passe faux, refus…)":
+        "Security log and suspicious attempts (logins, wrong passwords, refusals…)",
 }
 
 PATTERNS = [
+    # tentatives suspectes
+    (r"^connexion Emby refusee pour « (.*) »$", "Emby login refused for “$1”"),
     # activite
     (r"^Fiche : (.*)$", "Details: $1"),
     (r"^Saisons de (.*)$", "Seasons of $1"),

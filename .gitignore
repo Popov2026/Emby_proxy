@@ -23,3 +23,4 @@ emby_proxy_secret.key
 build/
 dist/
 *.spec
+emby_attempts.json*
