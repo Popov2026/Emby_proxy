@@ -142,3 +142,46 @@ def test_reglage_par_defaut_api(tmp_path):
     ini = tmp_path / "x.ini"
     ini.write_text("[quotas]\nmessage_delivery = direct\n", encoding="utf-8")
     assert ep.Settings(ini).quota_delivery == "DIRECT"
+
+
+async def test_coupure_ecrite_dans_la_connexion_de_l_appli(env):
+    """En DIRECT, l'arret du film (coupure de quota) part aussi par le proxy,
+    au format d'Emby."""
+    proxy, c = env
+    ws = await c.ws_connect("/embywebsocket?api_key=TOK&deviceId=shield1")
+    for _ in range(20):
+        if proxy.ws_by_device.get("shield1"):
+            break
+        await asyncio.sleep(0.05)
+    out = {}
+    t = threading.Thread(target=lambda: out.update(n=proxy._quota_stopper("shield1")))
+    t.start()
+    msg = await asyncio.wait_for(ws.receive(), 5)
+    await asyncio.get_running_loop().run_in_executor(None, t.join)
+    assert out["n"] == 1
+    d = json.loads(msg.data)
+    assert d["MessageType"] == "Playstate" and d["Data"]["Command"] == "Stop"
+    await ws.close()
+
+
+class FakeApiStop(FakeApi):
+    def __init__(self):
+        super().__init__()
+        self.stops = []
+
+    def playstate(self, session_id, command="Stop"):
+        self.stops.append((session_id, command))
+
+
+@pytest.mark.parametrize("mode,delivered,api_used", [
+    ("DIRECT", 1, False),      # coupure faite par le proxy
+    ("DIRECT", 0, True),       # appareil pas connecte par le proxy : par l'API
+    ("API", 1, True),
+])
+def test_coupure_direct_ou_api(mode, delivered, api_used):
+    api, svc = FakeApiStop(), FakeSvc(mode, delivered)
+    svc.stopper = lambda dev, command="Stop", via_api=False: 0 if via_api else delivered
+    r = ep._RoutedApi(api, svc)
+    r.sessions()
+    r.playstate("sess1", "Stop")
+    assert (api.stops == [("sess1", "Stop")]) == api_used

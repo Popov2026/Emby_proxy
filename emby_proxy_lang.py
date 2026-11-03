@@ -447,6 +447,15 @@ EN = {
     "Réglages et suivi : onglet Quotas. Nécessite la clé API Emby.":
         "Settings and tracking: Quotas tab. Requires the Emby API key.",
     "Fichier des réglages de quotas": "Quota settings file",
+    "Envoi des messages et coupures de quota": "Sending of quota messages and stops",
+    "API : Emby s'en charge. DIRECT : le proxy écrit lui-même dans la connexion en "
+    "direct (WebSocket) de l'appli les messages d'information, les avertissements "
+    "avant la coupure et l'arrêt du film, sans passer par l'API d'Emby ; un appareil "
+    "qui n'est pas connecté par le proxy les reçoit quand même par l'API.":
+        "API: Emby handles them. DIRECT: the proxy itself writes into the app's live "
+        "connection (WebSocket) the information messages, the warnings before the "
+        "stop and the stop of the movie, without Emby's API; a device not connected "
+        "through the proxy still gets them through the API.",
     "Envoi des messages de quota": "Sending of quota messages",
     "API : Emby les envoie (POST /Sessions/…/Message). DIRECT : le proxy écrit "
     "lui-même le message dans la connexion en direct (WebSocket) de l'appli, sans "
@@ -742,6 +751,7 @@ PATTERNS = [
     (r"^robot : (\d+) requetes sans connexion en 10 min$", "robot: $1 requests without login in 10 min"),
     (r"^robot : recherche de failles \((.*)\)$", "robot: looking for security holes ($1)"),
     (r"^Message de quota \((direct|API)\) : (.*)$", "Quota message ($1): $2"),
+    (r"^Coupure de quota \((direct|API)\)$", "Quota stop ($1)"),
     (r"^Erreur Emby HTTP (\d+) : (\S+) (.*)$", "Emby error HTTP $1: $2 $3"),
     (r"^Demande de lecture : (.*) → (.*)$", "Playback request: $1 → {2}"),
     (r"^Emby : (.*) → (.*)$", "Emby: $1 → {2}"),

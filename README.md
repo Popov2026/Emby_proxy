@@ -129,10 +129,11 @@ and API key.
   events, **individual quotas** (`60/300/1200`, `-/120/-`…), every setting
   with **Message preview**, and **Import an existing emby_quota.ini** (its API
   key is ignored).
-- **Sending of quota messages** (Settings tab, quotas): **API** (Emby sends
-  them) or **DIRECT** (the proxy writes the message itself into the app's
-  live connection, in Emby's own format, without Emby's API; a device not
-  connected through the proxy still gets it through the API). Each message
+- **Sending of quota messages and stops** (Settings tab, quotas): **API**
+  (Emby handles them) or **DIRECT** (the proxy itself writes the information
+  messages, the warnings before the stop and the stop of the movie into the
+  app's live connection, in Emby's own format, without Emby's API; a device
+  not connected through the proxy still gets them through the API). Each message
   appears on the device's card in the Activity tab, with the route used.
 - Files: `emby_quota.ini` (settings), `emby_quota.db` (counters).
 
@@ -402,11 +403,12 @@ API d'Emby du proxy.
   (`60/300/1200`, `-/120/-`…), tous les réglages avec **Aperçu des
   messages**, et **Reprendre un emby_quota.ini existant** (sa clé API est
   ignorée).
-- **Envoi des messages de quota** (onglet Configuration, quotas) : **API**
-  (Emby les envoie) ou **DIRECT** (le proxy écrit lui-même le message dans la
-  connexion en direct de l'appli, au format d'Emby, sans l'API d'Emby ; un
-  appareil qui n'est pas connecté par le proxy le reçoit quand même par
-  l'API). Chaque message apparaît dans la fiche de l'appareil (onglet
+- **Envoi des messages et coupures de quota** (onglet Configuration,
+  quotas) : **API** (Emby s'en charge) ou **DIRECT** (le proxy écrit lui-même
+  les messages d'information, les avertissements avant la coupure et l'arrêt
+  du film dans la connexion en direct de l'appli, au format d'Emby, sans
+  l'API d'Emby ; un appareil qui n'est pas connecté par le proxy les reçoit
+  quand même par l'API). Chaque message apparaît dans la fiche de l'appareil (onglet
   Activité), avec le moyen utilisé.
 - Fichiers : `emby_quota.ini` (réglages), `emby_quota.db` (compteurs).
 

@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -930,11 +930,12 @@ CONFIG_SCHEMA = [
          "help": "Réglages et suivi : onglet Quotas. Nécessite la clé API Emby."},
         {"sec": "quotas", "key": "message_delivery", "type": "choice",
          "choices": ["API", "DIRECT"], "live": True,
-         "label": "Envoi des messages de quota",
-         "help": "API : Emby les envoie (POST /Sessions/…/Message). DIRECT : le "
-                 "proxy écrit lui-même le message dans la connexion en direct "
-                 "(WebSocket) de l'appli, sans passer par l'API d'Emby ; un appareil "
-                 "qui n'est pas connecté par le proxy le reçoit quand même par l'API."},
+         "label": "Envoi des messages et coupures de quota",
+         "help": "API : Emby s'en charge. DIRECT : le proxy écrit lui-même dans la "
+                 "connexion en direct (WebSocket) de l'appli les messages "
+                 "d'information, les avertissements avant la coupure et l'arrêt du "
+                 "film, sans passer par l'API d'Emby ; un appareil qui n'est pas "
+                 "connecté par le proxy les reçoit quand même par l'API."},
         {"sec": "quotas", "key": "file", "type": "text", "live": False,
          "label": "Fichier des réglages de quotas", "help": ""},
         {"sec": "quotas", "key": "db_file", "type": "text", "live": False,
@@ -2425,6 +2426,7 @@ class QuotaService:
         self.error = ""
         self.notify = None               # alertes par mail (posee par le proxy)
         self.pusher = None               # envoi direct par WebSocket (proxy)
+        self.stopper = None              # coupure directe par WebSocket (proxy)
         self._lock = threading.Lock()
 
     # -- fichier de reglages -------------------------------------------
@@ -2706,6 +2708,25 @@ class _RoutedApi:
                 pass
         return None
 
+    def playstate(self, session_id, command="Stop"):
+        """Coupure (Stop) : en DIRECT, le proxy l'ecrit lui-meme dans la
+        connexion de l'appli ; sinon, ou appareil absent du proxy, par l'API."""
+        dev = self._device.get(session_id, "")
+        stopper = getattr(self._svc, "stopper", None)
+        if self._svc.pcfg.quota_delivery == "DIRECT" and stopper and dev:
+            try:
+                if stopper(dev, command):
+                    return None
+            except Exception:
+                log.exception("quotas : coupure directe")
+        self._api.playstate(session_id, command)
+        if stopper and dev:
+            try:
+                stopper(dev, command, via_api=True)
+            except Exception:
+                pass
+        return None
+
 
 class _NotifyingStore:
     """La base de quotas, dont chaque evenement (coupure, desactivation...)
@@ -2884,6 +2905,7 @@ class EmbyProxy:
         self.quota = QuotaService(cfg)
         self.quota.notify = self._quota_event
         self.quota.pusher = self._quota_pusher
+        self.quota.stopper = self._quota_stopper
         self.ws_by_device = {}          # appareil -> connexions WebSocket ouvertes
         self.auth_ips = {}              # adresse -> fin de validite (utilisateur connecte)
         self.admin_cache = {}           # utilisateur -> (administrateur ?, fin)
@@ -3941,6 +3963,45 @@ class EmbyProxy:
                 sent += 1
             except (ConnectionResetError, RuntimeError):
                 continue
+        return sent
+
+    async def push_playstate(self, device_id, command="Stop"):
+        """Commande de lecture (Stop...) ecrite dans la connexion en direct de
+        l'appli, au format qu'Emby utilise lui-meme. -> connexions atteintes."""
+        frame = json.dumps({"MessageType": "Playstate",
+                            "MessageId": secrets.token_hex(16),
+                            "Data": {"Command": command}})
+        sent = 0
+        for ws in list(self.ws_by_device.get(device_id, ())):
+            if ws.closed:
+                continue
+            try:
+                await ws.send_str(frame)
+                sent += 1
+            except (ConnectionResetError, RuntimeError):
+                continue
+        return sent
+
+    def _quota_stopper(self, device_id, command="Stop", via_api=False):
+        """Coupure de quota, appelee depuis le thread des quotas."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            return 0
+        sent = 0
+        if not via_api:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.push_playstate(device_id, command), loop)
+            sent = fut.result(timeout=10)
+        if (sent or via_api) and self.activity:
+            how = "direct" if sent else "API"
+
+            def note():
+                for c in list(self.activity.clients.values()):
+                    if c.device_id == device_id and c.user_id:
+                        self.activity.event(c, "quota", "Coupure de quota (%s)" % how,
+                                            merge=30)
+                        break
+            loop.call_soon_threadsafe(note)
         return sent
 
     def _quota_pusher(self, device_id, header, text, timeout_ms=None, via_api=False):
