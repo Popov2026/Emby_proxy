@@ -34,3 +34,37 @@ async def test_reseau_local_dit_la_verite(aiohttp_server, tmp_path):
         assert await r.json() == {"IsLocal": True, "IsInNetwork": True}   # maison
     finally:
         await c.close()
+
+
+async def test_robots_txt_interdit_a_tous(aiohttp_server, tmp_path):
+    """Donne par le proxy a tous, meme a une adresse bloquee ou bannie (cas
+    reel : ClaudeBot, sur la liste des hebergeurs, demandait robots.txt)."""
+    import time
+    seen = []
+
+    async def emby(request):
+        seen.append(request.path)
+        return web.Response(text="emby")
+    app = web.Application()
+    app.router.add_route("*", "/{t:.*}", emby)
+    srv = await aiohttp_server(app)
+    cfg = ep.Settings(tmp_path / "absent.ini", overrides={
+        ("proxy", "upstream"): str(srv.make_url("")).rstrip("/"),
+        ("cache", "dir"): str(tmp_path / "c"), ("log", "file"): "", ("status", "port"): "0",
+        ("security", "trusted_proxies"): "127.0.0.1/32"})
+    p = ep.EmbyProxy(cfg)
+    p.blocklists._install("essai", "216.73.216.0/24\n", time.time(), "")
+    p.guard.banned["45.148.10.21"] = ep.PERMANENT_BAN
+    c = TestClient(TestServer(p.build_app()))
+    await c.start_server()
+    try:
+        for ip in ("216.73.216.153", "45.148.10.21", "90.12.34.56"):
+            r = await c.get("/robots.txt", headers={"X-Forwarded-For": ip,
+                                                    "X-Forwarded-Proto": "https"})
+            assert r.status == 200 and await r.text() == "User-agent: *\nDisallow: /\n"
+        r = await c.get("/sitemap.xml", headers={"X-Forwarded-For": "216.73.216.153",
+                                                 "X-Forwarded-Proto": "https"})
+        assert r.status == 403                           # le reste : toujours bloque
+        assert "/robots.txt" not in seen                 # jamais demande a Emby
+    finally:
+        await c.close()

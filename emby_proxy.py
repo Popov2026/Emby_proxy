@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.9"
+__version__ = "2.6.10"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3285,6 +3285,8 @@ FORWARD_HDRS = {"x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarde
 # pour se reconnecter, en contournant le proxy
 RE_BRANDING = re.compile(r"^/Branding/Configuration/?$", re.I)
 RE_SYSINFO = re.compile(r"^/System/Info(?:/Public)?/?$", re.I)
+# robots.txt donne par le proxy : tous les robots interdits partout
+ROBOTS_TXT = "User-agent: *\nDisallow: /\n"
 # "suis-je sur le reseau local ?" : Emby ne voit que le proxy (ou le relais)
 RE_ENDPOINT = re.compile(r"^/System/Endpoint/?$", re.I)
 CHUNK = 256 * 1024
@@ -3919,6 +3921,12 @@ class EmbyProxy:
         np = norm_path(request.path)
         request[NPATH] = np
         self.stats.requests += 1
+        if request.path == "/robots.txt" and request.method in ("GET", "HEAD"):
+            # repondu par le proxy lui-meme, a tous (meme bloques ou bannis) :
+            # les robots honnetes (Google, Bing, ClaudeBot...) ne reviennent
+            # plus ; rien sur Emby n'y figure
+            return web.Response(text=ROBOTS_TXT, content_type="text/plain",
+                                headers={"Cache-Control": "public, max-age=86400"})
         if "relay" in self.warnings and self.cfg.trusted \
                 and self.guard._in(request.remote or "", self.cfg.trusted):
             self.warnings.pop("relay", None)      # relais declare depuis

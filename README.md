@@ -103,6 +103,9 @@ before, the proxy asks Emby with the API key from the settings (optional) or
 with the user's token. User names are resolved the same way.
 
 #### Security tab
+- **robots.txt** answered by the proxy itself, to everyone: `Disallow: /` for
+  all robots. Honest crawlers (Google, Bing, ClaudeBot…) stop crawling the
+  server; the others stay refused by the lists, bans and login rule.
 - **Blocked address lists**, downloaded from GitHub and updated every 6 h,
   kept on disk (folder `blocklists`, works at startup without Internet):
   known malicious networks (FireHOL level 1: Spamhaus DROP, DShield,
@@ -421,6 +424,10 @@ ouvert, le proxy demande son nom à Emby avec la clé API des réglages
 (facultative) ou le jeton de l'utilisateur. Idem pour les noms d'utilisateurs.
 
 #### Onglet Sécurité
+- **robots.txt** donné par le proxy lui-même, à tous : `Disallow: /` pour
+  tous les robots. Les robots honnêtes (Google, Bing, ClaudeBot…) cessent
+  d'explorer le serveur ; les autres restent refusés par les listes, les
+  bannissements et la connexion obligatoire.
 - **Listes d'adresses bloquées**, téléchargées sur GitHub et mises à jour
   toutes les 6 h, gardées sur disque (dossier `blocklists`, actives dès le
   démarrage même sans Internet) : réseaux malveillants connus (FireHOL niveau
