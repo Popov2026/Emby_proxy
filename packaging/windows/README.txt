@@ -24,20 +24,30 @@ ADDRESSES
   HTTPS reverse proxy), NEVER port 8098.
 
 UPDATE
-  Double-click uninstall_service.bat, replace the files with the new
-  version, then double-click install_service.bat. Keep emby_proxy.ini,
-  emby_quota.ini and emby_quota.db. After an update, close and reopen the
-  Emby apps (TV, phone) or log in again in the browser.
+  1. Double-click uninstall_service.bat.
+  2. Unzip the new version INTO THE SAME FOLDER and accept to replace the
+     files. The zip only contains the program: none of your files is in it.
+  3. Double-click install_service.bat.
+  Delete nothing else: settings, quotas, bans, suspicious attempts, logs
+  and cache are kept (list below, "your data"). After an update, close and
+  reopen the Emby apps (TV, phone) or log in again in the browser.
 
 UNINSTALL
   Double-click uninstall_service.bat.
 
 FILES
+  Program (replaced by an update):
   emby_proxy.exe              the proxy
   EmbyProxy-service.exe/.xml  the "Windows service" wrapper (WinSW, MIT licence)
-  wait_admin_page.ps1         used by install_service.bat (waits for the page)
+  install_service.bat, uninstall_service.bat, wait_admin_page.ps1, README.txt
+  *.example.ini, *.ini.example  examples (never your settings)
+  Your data (never delete it for an update):
   emby_proxy.ini              your settings (created at first start)
   emby_quota.ini / .db        quota settings and counters
+  emby_bans.json              banned addresses (kept across restarts)
+  emby_attempts.json          suspicious attempts (Activity tab)
+  emby_security.log           security log (logins, refusals, bans)
+  emby_activity.log           activity log
   emby_proxy.log              proxy log
   EmbyProxy-service.*.log     service logs
   image_cache\                thumbnail cache
@@ -68,21 +78,32 @@ ADRESSES
   relais HTTPS), JAMAIS le 8098.
 
 MISE A JOUR
-  Double-clic sur uninstall_service.bat, remplace les fichiers par la
-  nouvelle version, puis double-clic sur install_service.bat.
-  Garde emby_proxy.ini, emby_quota.ini et emby_quota.db. Apres une mise a
-  jour, ferme et rouvre les applis Emby (TV, telephone) ou reconnecte-toi
-  dans le navigateur.
+  1. Double-clic sur uninstall_service.bat.
+  2. Decompresse la nouvelle version DANS LE MEME DOSSIER et accepte de
+     remplacer les fichiers. Le zip ne contient que le programme : aucun
+     de tes fichiers n'y est.
+  3. Double-clic sur install_service.bat.
+  N'efface rien d'autre : reglages, quotas, bannissements, tentatives
+  suspectes, journaux et cache sont gardes (liste ci-dessous, "tes
+  donnees"). Apres une mise a jour, ferme et rouvre les applis Emby (TV,
+  telephone) ou reconnecte-toi dans le navigateur.
 
 DESINSTALLATION
   Double-clic sur uninstall_service.bat.
 
 FICHIERS
+  Programme (remplace par une mise a jour) :
   emby_proxy.exe              le proxy
   EmbyProxy-service.exe/.xml  l'enveloppe "service Windows" (WinSW, licence MIT)
-  wait_admin_page.ps1         utilise par install_service.bat (attend la page)
+  install_service.bat, uninstall_service.bat, wait_admin_page.ps1, README.txt
+  *.example.ini, *.ini.example  exemples (jamais tes reglages)
+  Tes donnees (ne jamais les effacer pour une mise a jour) :
   emby_proxy.ini              tes reglages (cree au premier demarrage)
   emby_quota.ini / .db        reglages et compteurs des quotas
+  emby_bans.json              adresses bannies (gardees au redemarrage)
+  emby_attempts.json          tentatives suspectes (onglet Activite)
+  emby_security.log           journal de securite (connexions, refus, bannissements)
+  emby_activity.log           journal d'activite
   emby_proxy.log              journal du proxy
   EmbyProxy-service.*.log     journaux du service
   image_cache\                cache des vignettes

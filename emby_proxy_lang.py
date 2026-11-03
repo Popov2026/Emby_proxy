@@ -156,6 +156,8 @@ EN = {
     "reglages des quotas modifies": "quota settings changed",
     "reglages des quotas importes": "quota settings imported",
     "redemarrage du proxy": "proxy restart",
+    "Adresse bannie temporairement.": "Address temporarily banned.",
+    # ancien libelle, encore present dans les journaux deja ecrits
     "Adresse bannie temporairement (mots de passe faux).":
         "Address temporarily banned (wrong passwords).",
     "Adresse refusee.": "Address refused.",

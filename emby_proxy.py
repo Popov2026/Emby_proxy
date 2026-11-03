@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.0"
+__version__ = "2.6.1"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1266,13 +1266,40 @@ PUBLIC_RE = re.compile(
 LOGIN_RE = re.compile(r"^/Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$", re.I)
 
 
+class BanTable(dict):
+    """Adresses bannies -> fin du bannissement. Note chaque changement pour
+    l'ecrire sur disque (emby_bans.json)."""
+    dirty = False
+
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self.dirty = True
+
+    def __delitem__(self, k):
+        super().__delitem__(k)
+        self.dirty = True
+
+    def pop(self, k, *default):
+        if k in self:
+            self.dirty = True
+        return super().pop(k, *default)
+
+    def clear(self):
+        super().clear()
+        self.dirty = True
+
+    def update(self, *a, **kw):
+        super().update(*a, **kw)
+        self.dirty = True
+
+
 class Guard:
     """Etat de securite partage : bannissements, compteurs, debits."""
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.failures = {}          # ip -> deque d'horodatages
-        self.banned = {}            # ip -> fin du bannissement
+        self.banned = BanTable()    # ip -> fin du bannissement
         self.buckets = {}           # ip -> [jetons, horodatage]
         self.blocked = 0
 
@@ -1320,7 +1347,7 @@ class Guard:
         until = self.banned.get(k)
         if until:
             if until > now:
-                return 403, "Adresse bannie temporairement (mots de passe faux)."
+                return 403, "Adresse bannie temporairement."
             self.banned.pop(k, None)
         if self.cfg.denied and self._in(ip, self.cfg.denied):
             return 403, "Adresse refusee."
@@ -3034,6 +3061,11 @@ class EmbyProxy:
         self.activity = Activity(cfg, self.guard) if cfg.activity_enabled else None
         self.seclog = SecurityLog(cfg.security_log)
         self.seclog.restore_bans(self.guard, cfg.ban_seconds)
+        # bannissements : fichier a part, a cote des reglages, jamais efface
+        # par une nouvelle version ni par la taille du journal de securite
+        self.bans_path = Path(cfg.path).parent / "emby_bans.json"
+        self._bans_lock = threading.Lock()
+        self._load_bans()
         self.attempts = Attempts(Path(cfg.security_log).with_name("emby_attempts.json")
                                  if cfg.security_log else None)
         self.sessions = {}          # jeton de la page d'etat -> expiration
@@ -3094,6 +3126,7 @@ class EmbyProxy:
             self._tasks.append(asyncio.create_task(self._resolve_loop()))
         self._tasks.append(asyncio.create_task(self._prune_loop()))
         self._tasks.append(asyncio.create_task(self._stats_loop()))
+        self._tasks.append(asyncio.create_task(self._bans_loop()))
         self._tasks.append(asyncio.create_task(self._sync_playing_loop()))
         log.info("reglages lus dans %s", self.cfg.path)
         for i, w in enumerate(self.cfg.config_warnings):
@@ -3235,6 +3268,45 @@ class EmbyProxy:
                 if pl["miss"] >= 2:
                     self.activity.end_play(c)
 
+    def _load_bans(self):
+        try:
+            data = json.loads(self.bans_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        now = time.time()
+        for k, until in (data.items() if isinstance(data, dict) else []):
+            try:
+                until = float(until)
+            except (TypeError, ValueError):
+                continue
+            if until > now and until > self.guard.banned.get(k, 0):
+                self.guard.banned[k] = until
+        self.guard.banned.dirty = False
+
+    def close_bans(self):
+        """Ecrit les bannissements en cours (au plus vite apres un changement)."""
+        banned = self.guard.banned
+        if not getattr(banned, "dirty", True):
+            return
+        banned.dirty = False
+        now = time.time()
+        text = json.dumps({k: round(v) for k, v in list(banned.items()) if v > now},
+                          indent=0)
+        with self._bans_lock:
+            try:
+                tmp = str(self.bans_path) + ".tmp"
+                Path(tmp).write_text(text, encoding="utf-8")
+                os.replace(tmp, self.bans_path)
+            except OSError as exc:
+                banned.dirty = True
+                log.warning("bannissements : ecriture impossible : %s", exc)
+
+    async def _bans_loop(self):
+        while True:
+            await asyncio.sleep(3)
+            if getattr(self.guard.banned, "dirty", False):
+                await asyncio.get_running_loop().run_in_executor(None, self.close_bans)
+
     async def _stats_loop(self):
         """Compteurs du cache sur disque : un service arrete brutalement ne
         les remet pas a zero."""
@@ -3246,6 +3318,7 @@ class EmbyProxy:
         for t in self._tasks:
             t.cancel()
         self.stats.save()
+        self.close_bans()
         self.attempts.flush()
         if self.alerts.pending:
             await self.alerts.flush()          # ne pas perdre les dernieres alertes

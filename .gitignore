@@ -24,3 +24,4 @@ build/
 dist/
 *.spec
 emby_attempts.json*
+emby_bans.json*

@@ -181,8 +181,10 @@ No Python needed.
 
 The service starts with Windows, even when nobody is logged in, and restarts
 after a crash. The firewall is set: port 8097 open, 8098 for the local network
-only. To remove it: `uninstall_service.bat`. Update: uninstall, replace the
-files, install again; then close and reopen the Emby apps.
+only. To remove it: `uninstall_service.bat`. Update: uninstall, unzip the new
+version into the same folder (the zip only holds the program: settings,
+quotas, bans `emby_bans.json`, attempts, logs and cache are kept), install
+again; then close and reopen the Emby apps.
 
 The compiled version is built and tested on a real Windows by GitHub
 (`.github/workflows/release.yml`): DPAPI encryption, installation, start,
@@ -489,8 +491,10 @@ Pas besoin de Python.
 Le service démarre avec Windows, même sans session ouverte, et redémarre seul
 en cas de plantage. Pare-feu réglé : 8097 ouvert, 8098 au réseau local
 seulement. Pour le retirer : `uninstall_service.bat`. Mise à jour :
-désinstaller, remplacer les fichiers, réinstaller ; puis fermer et rouvrir les
-applis Emby.
+désinstaller, décompresser la nouvelle version dans le même dossier (le zip ne
+contient que le programme : réglages, quotas, bannissements `emby_bans.json`,
+tentatives, journaux et cache sont gardés), réinstaller ; puis fermer et
+rouvrir les applis Emby.
 
 La version compilée est construite et testée sur un vrai Windows par GitHub
 (`.github/workflows/release.yml`) : chiffrement DPAPI, installation,

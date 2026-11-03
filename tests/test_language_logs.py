@@ -84,6 +84,8 @@ def test_textes_du_script_traduits():
      "Refused: Address refused. (GET /emby/Items)"),
     ("Adresse bannie temporairement (mots de passe faux). (POST /x)",
      "Address temporarily banned (wrong passwords). (POST /x)"),
+    ("Adresse bannie temporairement. (POST /x)",
+     "Address temporarily banned. (POST /x)"),
     ("port 8098 deja utilise par un autre programme",
      "port 8098 already used by another program"),
     ("entre 1 et 65535", "between 1 and 65535"),
