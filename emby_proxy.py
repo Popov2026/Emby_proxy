@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.2.3"
+__version__ = "2.3.0"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -87,6 +87,7 @@ DEFAULTS = {
         "tls_cert": "",
         "tls_key": "",
         "forward_client_ip": "true",
+        "landing_page": "true",
     },
     "cache": {
         "dir": "image_cache",
@@ -466,6 +467,7 @@ class Settings:
 
         self.listen_host = p.get("listen_host")
         self.forward_ip = p.getboolean("forward_client_ip")
+        self.landing_page = p.getboolean("landing_page")
         self.listen_port = p.getint("listen_port")
         self.upstream = normalize_upstream(p.get("upstream")) or "http://127.0.0.1:8096"
         self.tls_cert = self._path(base, p.get("tls_cert"))
@@ -580,6 +582,8 @@ listen_port = 8097
 # Transmettre a Emby l'adresse reelle des visiteurs. false : Emby voit tout le
 # monde comme sur le reseau local (plus de limite de debit "a distance").
 forward_client_ip = true
+# Page d'accueil du proxy (test de connexion) avant Emby, dans un navigateur.
+landing_page = true
 # Adresse du vrai serveur Emby (jamais montree aux utilisateurs).
 upstream = http://127.0.0.1:8096
 # HTTPS direct : chemins du certificat et de la clef (PEM). Vide = HTTP.
@@ -754,6 +758,11 @@ CONFIG_SCHEMA = [
          "help": "Vide si le HTTPS est fait par un relais (proxy inverse) devant."},
         {"sec": "proxy", "key": "tls_key", "type": "text", "live": False,
          "label": "Clé du certificat (fichier PEM)", "help": ""},
+        {"sec": "proxy", "key": "landing_page", "type": "bool", "live": True,
+         "label": "Page d'accueil du proxy avant Emby (navigateurs)",
+         "help": "Dans un navigateur, l'adresse du serveur affiche d'abord une page "
+                 "du proxy : connexion via Emby Proxy, test de connexion à Emby, puis "
+                 "bouton « Continuer vers Emby ». Les applis Emby ne la voient pas."},
         {"sec": "proxy", "key": "forward_client_ip", "type": "bool", "live": True,
          "label": "Transmettre à Emby l'adresse réelle des visiteurs",
          "help": "Décoché : Emby voit tout le monde comme sur le réseau local (adresse "
@@ -895,7 +904,7 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "burst", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
-              "language", "forward_ip")
+              "language", "forward_ip", "landing_page")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -3090,6 +3099,10 @@ class EmbyProxy:
                 self.seclog.add("refused", ip, self.guard.is_local(ip),
                                 client=f.get("client", ""), device=f.get("device", ""),
                                 detail=refus[1])
+                if self.activity:
+                    c = self._device_card(request)
+                    self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
+                        refus[1], request.method, request.path[:80]), merge=60)
             else:
                 log.info("refuse %s %s %s : %s", ip, _safe(request.method, 10),
                          _safe(request.path), refus[1])
@@ -3099,7 +3112,7 @@ class EmbyProxy:
                                 detail="%s (%s %s)" % (refus[1], request.method,
                                                        request.path[:80]))
                 if self.activity:
-                    c = self.activity.identify(request, trusted=False)
+                    c = self._device_card(request)
                     self.activity.event(c, "refused", "Refuse : %s (%s %s)" % (
                         refus[1], request.method, request.path[:80]))
             return web.Response(status=refus[0], text=refus[1])
@@ -3197,7 +3210,54 @@ class EmbyProxy:
             h.setdefault("Strict-Transport-Security", "max-age=31536000")
 
     # -- aiguillage ----------------------------------------------------
+    def landing(self, request):
+        """Page d'accueil (navigateur) : on est bien sur le proxy, test de
+        connexion a Emby, puis bouton vers Emby."""
+        lang = self.cfg.language
+        t = lambda x: _html_escape(tr(x, lang))      # noqa: E731
+        proto, host = self._public_origin(request)
+        ip = request[CLIENT_IP]
+        secure = proto == "https"
+        rows = [
+            (t("Adresse utilisée"), _html_escape("%s://%s" % (proto, host))),
+            (t("Type de connexion"), t("chiffrée (HTTPS)") if secure else
+             t("non chiffrée (HTTP)")),
+            (t("Ton adresse IP"), _html_escape(ip) + " · " + (
+                t("réseau local") if self.guard.is_local(ip) else t("Internet"))),
+            (t("Version du proxy"), __version__),
+        ]
+        html = (LANDING_HTML.replace("@@LANG@@", lang)
+                .replace("@@TITLE@@", t("Connecté via Emby Proxy"))
+                .replace("@@SUB@@", t("Tu passes par le proxy sécurisé, et non "
+                                      "directement par le serveur Emby."))
+                .replace("@@ROWS@@", "".join(
+                    "<tr><th>%s</th><td>%s</td></tr>" % r for r in rows))
+                .replace("@@TEST@@", t("Test de connexion"))
+                .replace("@@T_PROXY@@", t("Proxy"))
+                .replace("@@T_EMBY@@", t("Serveur Emby"))
+                .replace("@@OK_PROXY@@", t("répond"))
+                .replace("@@WAIT@@", t("test en cours…"))
+                .replace("@@OK_EMBY@@", t("répond"))
+                .replace("@@KO_EMBY@@", t("ne répond pas"))
+                .replace("@@VERSION@@", t("version"))
+                .replace("@@GO@@", t("Continuer vers Emby"))
+                .replace("@@RETRY@@", t("Refaire le test")))
+        return web.Response(text=html, content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+
+    def _device_card(self, request):
+        """Fiche de l'appareil pour une requete refusee par le proxy : la vraie
+        fiche si son jeton a deja ete accepte par Emby, sinon une fiche a part."""
+        tok = Activity._auth_fields(request).get("token", "")
+        return self.activity.identify(
+            request, trusted=bool(tok) and tok in self.activity.token_user)
+
     async def handle(self, request):
+        if request.method == "GET" and request.path in ("/", "/emby", "/emby/") \
+                and getattr(self.cfg, "landing_page", True) \
+                and "text/html" in request.headers.get("Accept", "") \
+                and "Mozilla" in request.headers.get("User-Agent", ""):
+            return self.landing(request)
         if (request.headers.get("Upgrade", "").lower() == "websocket"
                 and request.method == "GET"):
             return await self.proxy_ws(request)
@@ -3375,6 +3435,13 @@ class EmbyProxy:
         finally:
             if act and todo:
                 act.after(c, todo, up.status)
+            if act and c is not None and up.status >= 400 and not is_login \
+                    and not any(k in ("pbinfo", "stream", "login", "delete")
+                                for k, _ in todo):
+                # toute autre erreur d'Emby : visible dans la fiche de l'appareil
+                act.event(c, "refused", "Erreur Emby HTTP %d : %s %s" % (
+                    up.status, _safe(request.method, 10), _safe(request.path, 100)),
+                    merge=60)
             up.release()
 
     async def _sysinfo(self, request, up):
@@ -4388,6 +4455,38 @@ class EmbyProxy:
         html = STATUS_HTML.replace("@@LANG@@", self.cfg.language) \
             .replace("@@I18N@@", js_table())
         return web.Response(text=html, content_type="text/html")
+
+
+LANDING_HTML = """<!doctype html><html lang="@@LANG@@"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy</title>
+<style>body{font:15px system-ui,Segoe UI,sans-serif;background:#16181f;color:#e4e6ec;margin:0;
+min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}
+.c{background:#1f222b;border:1px solid #2e323d;border-radius:12px;padding:24px;width:100%;max-width:520px}
+h1{font-size:21px;margin:0 0 4px}.sub{color:#9aa0aa;font-size:13px;margin-bottom:16px}
+.ok{color:#2ecc71}.ko{color:#e05555}.mut{color:#9aa0aa}
+table{width:100%;border-collapse:collapse;margin:6px 0 16px}th,td{text-align:left;padding:6px 4px;
+border-bottom:1px solid #2e323d;font-size:14px;vertical-align:top}th{color:#9aa0aa;font-weight:500;width:42%}
+h2{font-size:15px;margin:14px 0 6px}.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+a.btn,button{display:inline-block;padding:10px 16px;border-radius:7px;border:0;font:inherit;cursor:pointer;
+text-decoration:none}a.btn{background:#e94560;color:#fff}button{background:#2e323d;color:#e4e6ec}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#2ecc71;margin-right:8px}</style>
+</head><body><div class="c">
+<h1><span class="dot"></span>@@TITLE@@</h1><div class="sub">@@SUB@@</div>
+<table>@@ROWS@@</table>
+<h2>@@TEST@@</h2>
+<table><tr><th>@@T_PROXY@@</th><td class="ok">&#10004; @@OK_PROXY@@</td></tr>
+<tr><th>@@T_EMBY@@</th><td id="emby" class="mut">@@WAIT@@</td></tr></table>
+<div class="row"><a class="btn" href="/web/index.html">@@GO@@</a><button id="retry">@@RETRY@@</button></div>
+</div>
+<script>
+function test(){const e=document.getElementById('emby');e.className='mut';e.textContent='@@WAIT@@';
+  const t0=performance.now();
+  fetch('/emby/System/Info/Public',{cache:'no-store'}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})
+  .then(d=>{const ms=Math.round(performance.now()-t0);e.className='ok';
+    e.textContent='\u2714 @@OK_EMBY@@ \u00b7 '+(d.ServerName||'Emby')+' \u00b7 @@VERSION@@ '+(d.Version||'?')+' \u00b7 '+ms+' ms'})
+  .catch(x=>{e.className='ko';e.textContent='\u2716 @@KO_EMBY@@ ('+x.message+')'})}
+document.getElementById('retry').onclick=test;test();
+</script></body></html>"""
 
 
 def _html_escape(txt):

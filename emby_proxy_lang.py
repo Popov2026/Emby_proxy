@@ -272,6 +272,31 @@ EN = {
     "Vide si le HTTPS est fait par un relais (proxy inverse) devant.":
         "Empty if HTTPS is handled by a relay (reverse proxy) in front.",
     "Clé du certificat (fichier PEM)": "Certificate key (PEM file)",
+    "Page d'accueil du proxy avant Emby (navigateurs)":
+        "Proxy home page before Emby (browsers)",
+    "Dans un navigateur, l'adresse du serveur affiche d'abord une page du proxy : "
+    "connexion via Emby Proxy, test de connexion à Emby, puis bouton « Continuer "
+    "vers Emby ». Les applis Emby ne la voient pas.":
+        "In a browser, the server address first shows a proxy page: connected via "
+        "Emby Proxy, connection test to Emby, then a “Continue to Emby” button. The "
+        "Emby apps do not see it.",
+    "Connecté via Emby Proxy": "Connected via Emby Proxy",
+    "Tu passes par le proxy sécurisé, et non directement par le serveur Emby.":
+        "You are going through the secure proxy, not directly to the Emby server.",
+    "Adresse utilisée": "Address used",
+    "Type de connexion": "Connection",
+    "chiffrée (HTTPS)": "encrypted (HTTPS)",
+    "non chiffrée (HTTP)": "not encrypted (HTTP)",
+    "Ton adresse IP": "Your IP address",
+    "Version du proxy": "Proxy version",
+    "Test de connexion": "Connection test",
+    "Serveur Emby": "Emby server",
+    "répond": "answers",
+    "ne répond pas": "does not answer",
+    "test en cours…": "testing…",
+    "version": "version",
+    "Continuer vers Emby": "Continue to Emby",
+    "Refaire le test": "Test again",
     "Transmettre à Emby l'adresse réelle des visiteurs":
         "Pass the visitors' real address to Emby",
     "Décoché : Emby voit tout le monde comme sur le réseau local (adresse du proxy). "
@@ -655,6 +680,7 @@ PATTERNS = [
     (r"^Pause : (.*)$", "Paused: $1"),
     (r"^Reprise : (.*)$", "Resumed: $1"),
     (r"^Refuse : (.*)$", "Refused: {1}"),
+    (r"^Erreur Emby HTTP (\d+) : (\S+) (.*)$", "Emby error HTTP $1: $2 $3"),
     (r"^Demande de lecture : (.*) → (.*)$", "Playback request: $1 → {2}"),
     (r"^Emby : (.*) → (.*)$", "Emby: $1 → {2}"),
     (r"^(.*) — raisons : (.*)$", "{1} — reasons: $2"),
