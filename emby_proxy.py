@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.2"
+__version__ = "2.6.3"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -859,7 +859,8 @@ CONFIG_SCHEMA = [
          "max": 1440, "live": True, "label": "… sur une durée de (minutes)", "help": ""},
         {"sec": "security", "key": "ban_minutes", "type": "float", "min": 1,
          "max": 525600, "live": True, "label": "Durée du bannissement (minutes)",
-         "help": ""},
+         "help": "Pour les mots de passe faux. Les robots sont bannis "
+                 "définitivement (seul le bouton Débannir les libère)."},
         {"sec": "security", "key": "rate_per_second", "type": "float", "min": 0,
          "max": 100000, "live": True, "label": "Requêtes par seconde par adresse (0 = sans limite)",
          "help": "Une page d'accueil Emby charge facilement 100 vignettes d'un coup."},
@@ -1266,6 +1267,15 @@ PUBLIC_RE = re.compile(
 LOGIN_RE = re.compile(r"^/Users/(?:AuthenticateByName|[^/]+/Authenticate)/?$", re.I)
 
 
+# Bannissement definitif (robots) : jamais leve tout seul, seulement par le
+# bouton Debannir de la page d'administration.
+PERMANENT_BAN = 253402300799.0          # 31/12/9999
+
+
+def is_permanent(until):
+    return until >= PERMANENT_BAN - 1
+
+
 class BanTable(dict):
     """Adresses bannies -> fin du bannissement. Note chaque changement pour
     l'ecrire sur disque (emby_bans.json)."""
@@ -1347,7 +1357,8 @@ class Guard:
         until = self.banned.get(k)
         if until:
             if until > now:
-                return 403, "Adresse bannie temporairement."
+                return 403, ("Adresse bannie." if is_permanent(until)
+                             else "Adresse bannie temporairement.")
             self.banned.pop(k, None)
         if self.cfg.denied and self._in(ip, self.cfg.denied):
             return 403, "Adresse refusee."
@@ -1508,7 +1519,10 @@ class SecurityLog:
         """Un redemarrage du proxy ne doit pas lever les bannissements."""
         now = time.time()
         for e in list(self.events):
-            if e.get("type") == "ban" and e["t"] + ban_seconds > now:
+            if e.get("type") == "ban" and str(e.get("detail", "")).startswith("robot"):
+                # robot : banni pour toujours (meme bannissement ancien)
+                guard.banned[e.get("ban_key") or guard.key(e["ip"])] = PERMANENT_BAN
+            elif e.get("type") == "ban" and e["t"] + ban_seconds > now:
                 guard.banned[e.get("ban_key") or guard.key(e["ip"])] = e["t"] + ban_seconds
             elif e.get("type") == "unban":
                 guard.banned.pop(e.get("ban_key") or guard.key(e["ip"]), None)
@@ -1626,6 +1640,14 @@ class Attempts:
         a = self.items.get(key)
         if a is not None:
             a["ban"] = str(reason or "")[:200]
+            a.pop("unbanned", None)
+            self._changed()
+
+    def unbanned(self, key):
+        """Debannie a la main : ne pas la rebannir au prochain demarrage."""
+        a = self.items.get(key)
+        if a is not None:
+            a["unbanned"] = True
             self._changed()
 
     def login_ok(self, key, user):
@@ -3080,6 +3102,12 @@ class EmbyProxy:
         self._load_bans()
         self.attempts = Attempts(Path(cfg.security_log).with_name("emby_attempts.json")
                                  if cfg.security_log else None)
+        # robots bannis par une version precedente (bannissement d'une heure,
+        # parfois deja leve) : bannis pour toujours
+        for key, a in list(self.attempts.items.items()):
+            if str(a.get("ban", "")).startswith("robot") and not a.get("unbanned") \
+                    and not self.guard.is_local((a.get("ips") or [key])[-1]):
+                self.guard.banned[key] = PERMANENT_BAN
         self.sessions = {}          # jeton de la page d'etat -> expiration
         self.warnings = {}
         if not cfg.tls_cert and not cfg.trusted and \
@@ -3872,7 +3900,7 @@ class EmbyProxy:
                             _safe(request.method, 10), _safe(request.path, 80)),
                         merge_key="login_required")
         if len(hits) >= 30 and self.guard.banned.get(key, 0) <= now:
-            self.guard.banned[key] = now + self.cfg.ban_seconds
+            self.guard.banned[key] = PERMANENT_BAN
             self.seclog.add("ban", ip, False, detail="robot : %d requetes sans "
                             "connexion en 10 min" % len(hits), ban_key=key)
             log.warning("robot banni : %s (%d requetes sans connexion)", ip, len(hits))
@@ -3899,7 +3927,7 @@ class EmbyProxy:
         for k in [k for k, t in tried.items() if now - t > 600]:
             del tried[k]
         if len(tried) >= self.BAD_KEYS_MAX and self.guard.banned.get(key, 0) <= now:
-            self.guard.banned[key] = now + self.cfg.ban_seconds
+            self.guard.banned[key] = PERMANENT_BAN
             self.seclog.add("ban", ip, False, detail="robot : %d cles de session "
                             "refusees en 10 min" % len(tried), ban_key=key)
             log.warning("robot banni : %s (%d cles de session differentes refusees)",
@@ -3915,7 +3943,7 @@ class EmbyProxy:
         if not self.guard.is_local(ip):
             key = self.guard.key(ip)
             first = self.guard.banned.get(key, 0) <= time.time()
-            self.guard.banned[key] = time.time() + self.cfg.ban_seconds
+            self.guard.banned[key] = PERMANENT_BAN
             if first:
                 self.seclog.add("ban", ip, False,
                                 client=request.headers.get("User-Agent", "")[:60],
@@ -5292,6 +5320,7 @@ class EmbyProxy:
         data = await request.post()
         ip = str(data.get("ip", ""))[:64]
         ok = self.guard.unban(ip)
+        self.attempts.unbanned(self.guard.key(ip) if "/" not in ip else ip)
         if ok:
             self.seclog.add("unban", ip, False, detail="par %s" % request[CLIENT_IP],
                             ban_key=self.guard.key(ip) if "/" not in ip else ip)
@@ -5665,6 +5694,8 @@ function userCard(u){
     u.events.forEach(e=>{const r=el('div','e k-'+e.kind);r.append(el('time',null,hm(e.t)),el('span',null,e.text));ev.append(r)});c.append(ev)}
   return c}
 
+const PERM=10*365*86400;
+const banLeft=s=>s>PERM?T('définitif'):s>=86400?TF('{0} j',Math.ceil(s/86400)):s>=3600?TF('{0} h',Math.ceil(s/3600)):Math.ceil(s/60)+' min';
 const ACAT={robot:'Robot (recherche de failles)',password:'Mot de passe Emby faux',
   admin_password:"Mot de passe de la page d'administration faux",bad_key:'Clé de session inventée',
   anon:'Accès sans connexion',admin:"Administration d'Emby refusée",banned:'Requête alors que bannie',
@@ -5681,7 +5712,7 @@ function attCard(a){
   const cats=el('div');Object.entries(a.cats).sort((x,y)=>y[1]-x[1]).forEach(([k,n])=>cats.append(el('span','cat '+k,T(ACAT[k]||k)+' ×'+n)));c.append(cats);
   if(a.users.length)c.append(el('div','sub',TF('Comptes essayés : {0}',a.users.join(', '))));
   if(a.agents.length)c.append(el('div','sub',TF('Appareil / logiciel : {0}',a.agents.join(' | '))));
-  if(a.banned_s){const st=el('div','st ban',TF('⛔ Bannie encore {0} min',Math.ceil(a.banned_s/60))+(a.ban?' — '+a.ban:''));
+  if(a.banned_s){const st=el('div','st ban',(a.banned_s>PERM?T('⛔ Bannie définitivement'):TF('⛔ Bannie encore {0}',banLeft(a.banned_s)))+(a.ban?' — '+a.ban:''));
     const bt=el('button','small','Débannir');bt.style.marginLeft='8px';
     bt.onclick=()=>{if(confirm(TF('Débannir {0} ?',a.ip)))fetch('unban',{method:'POST',body:new URLSearchParams({ip:a.key.includes('/')?a.key:a.ip})}).then(tick)};
     st.append(bt);c.append(st)}
@@ -5756,7 +5787,7 @@ function renderSec(d){
     card('Accès refusés (24 h)',n.refused),card('Adresses bannies en ce moment',d.bans.length,d.bans.length?'var(--bad)':''));
   $('bans').replaceChildren(...(d.bans.length?d.bans.map(b=>{const tr=el('tr'),bt=el('button','small','Débannir');
     bt.onclick=()=>{if(confirm(TF('Débannir {0} ?',b.ip)))fetch('unban',{method:'POST',body:new URLSearchParams({ip:b.ip})}).then(tick)};
-    const td=el('td');td.append(bt);tr.append(el('td',null,b.ip),el('td',null,Math.ceil(b.remaining_s/60)+' min'),td);return tr})
+    const td=el('td');td.append(bt);tr.append(el('td',null,b.ip),el('td',null,banLeft(b.remaining_s)),td);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune adresse bannie.');td.colSpan=3;tr.append(td);return tr})()]));
   $('topfail').textContent=d.top_fail_ips.length?d.top_fail_ips.map(([ip,c])=>ip+' : '+c).join('   ·   '):T('aucune');
   renderSecFeed()}
