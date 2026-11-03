@@ -1,0 +1,39 @@
+name: Nettoyage de l'historique
+# A lancer une fois apres la reecriture de l'historique : supprime les
+# anciennes versions publiees, leurs etiquettes et les journaux des anciennes
+# executions (ils citaient l'ancien historique).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Versions publiees et leurs etiquettes
+        run: |
+          for t in $(gh release list -R "$REPO" --limit 200 --json tagName -q '.[].tagName'); do
+            echo "version $t"
+            gh release delete "$t" -R "$REPO" --cleanup-tag -y
+          done
+          for t in $(gh api "repos/$REPO/tags?per_page=100" -q '.[].name'); do
+            echo "etiquette $t"
+            gh api -X DELETE "repos/$REPO/git/refs/tags/$t"
+          done
+      - name: Journaux des anciennes executions
+        run: |
+          for id in $(gh api "repos/$REPO/actions/runs?per_page=100" --paginate -q '.workflow_runs[].id'); do
+            if [ "$id" != "${{ github.run_id }}" ]; then
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null && echo "execution $id"
+            fi
+          done
+      - name: Controle
+        run: |
+          echo "versions restantes : $(gh release list -R "$REPO" --json tagName -q 'length')"
+          echo "etiquettes restantes : $(gh api "repos/$REPO/tags" -q 'length')"

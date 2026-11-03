@@ -936,12 +936,14 @@ async def test_connexion_directe_sans_relais_refusee(env):
 
 
 
-def test_preconfiguration_serveur_192_168_1_123(tmp_path):
+def test_preconfiguration_relais_sur_la_meme_machine(tmp_path):
+    """Seul un relais sur la machine du proxy est de confiance d'office :
+    aucune adresse du reseau n'est preconfiguree."""
     ini = tmp_path / "emby_proxy.ini"
     ep.write_example_config(ini)
     cfg = ep.Settings(ini)
     assert ep.Guard._in("127.0.0.1", cfg.trusted)
-    assert ep.Guard._in("192.168.1.123", cfg.trusted)
+    assert not ep.Guard._in("192.168.1.123", cfg.trusted)
     assert not ep.Guard._in("192.168.1.20", cfg.trusted)   # un PC de la maison
     assert cfg.require_relay
     p = ep.EmbyProxy(cfg)
