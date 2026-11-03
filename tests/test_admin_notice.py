@@ -86,8 +86,8 @@ async def test_message_apres_la_connexion_d_un_administrateur(env):
     msg = await asyncio.wait_for(ws.receive(), 10)
     assert msg.type == WSMsgType.TEXT
     d = json.loads(msg.data)
-    assert d["Data"]["Name"] == "DisplayMessage"
-    assert "LECTURE SEULE" in d["Data"]["Arguments"]["Text"]
+    assert d["MessageType"] == "DisplayMessage"
+    assert "LECTURE SEULE" in d["Data"]["Text"]
     await ws.close()
 
 

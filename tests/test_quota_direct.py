@@ -45,11 +45,16 @@ async def test_message_ecrit_dans_la_connexion_de_l_appli(env):
         if proxy.ws_by_device.get("shield1"):
             break
         await asyncio.sleep(0.05)
+    # methode "Message" (par defaut) : forme de POST /Sessions/{id}/Message
     n = await proxy.push_message("shield1", "Quota", "Il te reste 5 min", 8000)
     assert n == 1
-    msg = await asyncio.wait_for(ws.receive(), 3)
-    d = json.loads(msg.data)
-    # exactement le format qu'Emby envoie aux applis
+    d = json.loads((await asyncio.wait_for(ws.receive(), 3)).data)
+    assert d["MessageType"] == "DisplayMessage"
+    assert d["Data"] == {"Header": "Quota", "Text": "Il te reste 5 min", "TimeoutMs": 8000}
+    # methode "Commande generale" : forme de .../Command/DisplayMessage
+    n = await proxy.push_message("shield1", "Quota", "Il te reste 5 min", 8000,
+                                 route="command")
+    d = json.loads((await asyncio.wait_for(ws.receive(), 3)).data)
     assert d["MessageType"] == "GeneralCommand"
     assert d["Data"]["Name"] == "DisplayMessage"
     assert d["Data"]["Arguments"] == {"Header": "Quota", "Text": "Il te reste 5 min",
@@ -84,7 +89,7 @@ async def test_envoi_depuis_le_thread_des_quotas(env):
     msg = await asyncio.wait_for(ws.receive(), 5)
     await asyncio.get_running_loop().run_in_executor(None, t.join)
     assert out["n"] == 1
-    assert json.loads(msg.data)["Data"]["Arguments"]["Header"] == "Fin du quota"
+    assert json.loads(msg.data)["Data"]["Header"] == "Fin du quota"
     await ws.close()
 
 
@@ -108,8 +113,8 @@ class FakeSvc:
         self.calls = []
         self.delivered = delivered
 
-        def pusher(dev, header, text, timeout_ms=None, via_api=False):
-            self.calls.append((dev, via_api))
+        def pusher(dev, header, text, timeout_ms=None, via_api=False, route="message"):
+            self.calls.append((dev, via_api, route))
             return 0 if via_api else self.delivered
         self.pusher = pusher
 
@@ -185,3 +190,16 @@ def test_coupure_direct_ou_api(mode, delivered, api_used):
     r.sessions()
     r.playstate("sess1", "Stop")
     assert (api.stops == [("sess1", "Stop")]) == api_used
+
+
+
+def test_methode_d_envoi_transmise_en_direct():
+    """Bug trouve : en DIRECT, la methode d'envoi choisie (Message / Commande
+    generale) etait ignoree ; une appli qui ne comprend que l'une n'affichait
+    rien, sans repli sur l'API."""
+    api, svc = FakeApi(), FakeSvc("DIRECT", 1)
+    r = ep._RoutedApi(api, svc)
+    r.sessions()
+    r.send_message("sess1", "Q", "t", 5000)
+    r.send_message("sess1", "Q", "t", 5000, route="command")
+    assert [c[2] for c in svc.calls] == ["message", "command"]

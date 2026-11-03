@@ -65,7 +65,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.4"
+__version__ = "2.5.5"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2714,7 +2714,7 @@ class _RoutedApi:
         dev = self._device.get(session_id, "")
         if self._svc.pcfg.quota_delivery == "DIRECT" and self._svc.pusher and dev:
             try:
-                if self._svc.pusher(dev, header, text, timeout_ms):
+                if self._svc.pusher(dev, header, text, timeout_ms, route=route):
                     return None
             except Exception:
                 log.exception("quotas : envoi direct")
@@ -4092,15 +4092,27 @@ class EmbyProxy:
         return ws
 
     # -- messages de quota envoyes en direct (sans l'API d'Emby) ----------
-    async def push_message(self, device_id, header, text, timeout_ms=None):
-        """Ecrit un message dans la connexion en direct de l'appli, au format
-        qu'Emby utilise lui-meme. -> nombre de connexions atteintes."""
-        args = {"Header": header, "Text": text}
-        if timeout_ms:
-            args["TimeoutMs"] = str(int(timeout_ms))
-        frame = json.dumps({"MessageType": "GeneralCommand",
-                            "MessageId": secrets.token_hex(16),
-                            "Data": {"Name": "DisplayMessage", "Arguments": args}})
+    async def push_message(self, device_id, header, text, timeout_ms=None,
+                           route="message"):
+        """Ecrit un message dans la connexion en direct de l'appli, sous la
+        meme forme qu'Emby pour la methode d'envoi choisie (onglet Quotas,
+        \"Methode d'envoi\") : les applis ne comprennent pas toutes les deux.
+          message -> MessageType DisplayMessage (POST /Sessions/{id}/Message)
+          command -> GeneralCommand DisplayMessage (.../Command/DisplayMessage)
+        -> nombre de connexions atteintes."""
+        if route == "command":
+            args = {"Header": header, "Text": text}
+            if timeout_ms:
+                args["TimeoutMs"] = str(int(timeout_ms))
+            msg = {"MessageType": "GeneralCommand",
+                   "Data": {"Name": "DisplayMessage", "Arguments": args}}
+        else:
+            data = {"Header": header, "Text": text}
+            if timeout_ms:
+                data["TimeoutMs"] = int(timeout_ms)
+            msg = {"MessageType": "DisplayMessage", "Data": data}
+        msg["MessageId"] = secrets.token_hex(16)
+        frame = json.dumps(msg)
         sent = 0
         for ws in list(self.ws_by_device.get(device_id, ())):
             if ws.closed:
@@ -4151,7 +4163,8 @@ class EmbyProxy:
             loop.call_soon_threadsafe(note)
         return sent
 
-    def _quota_pusher(self, device_id, header, text, timeout_ms=None, via_api=False):
+    def _quota_pusher(self, device_id, header, text, timeout_ms=None, via_api=False,
+                      route="message"):
         """Appele depuis le thread des quotas."""
         loop = getattr(self, "_loop", None)
         if loop is None or loop.is_closed():
@@ -4159,7 +4172,7 @@ class EmbyProxy:
         sent = 0
         if not via_api:
             fut = asyncio.run_coroutine_threadsafe(
-                self.push_message(device_id, header, text, timeout_ms), loop)
+                self.push_message(device_id, header, text, timeout_ms, route), loop)
             sent = fut.result(timeout=10)
         if (sent or via_api) and self.activity:
             how = "direct" if sent else "API"
