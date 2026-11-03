@@ -65,7 +65,7 @@ from aiohttp import ClientError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -1204,6 +1204,13 @@ class DiskCache:
 # =====================================================================
 # Administration d'Emby : refusee hors du reseau local.
 ADMIN_MODES = ("NONE", "VIEW", "FULL")
+ADMIN_NOTICE = {
+    "NONE": "Depuis Internet, l'administration d'Emby est INTERDITE : on peut "
+            "regarder normalement, le tableau de bord n'est accessible que depuis "
+            "le réseau local.",
+    "VIEW": "Depuis Internet, l'administration d'Emby est en LECTURE SEULE : le "
+            "tableau de bord s'affiche, mais aucune modification n'est possible.",
+}
 # Tableau de bord d'Emby : donnees qu'il lit (refusees aux comptes
 # administrateurs en mode "interdite" ; les applis ordinaires ne les lisent
 # pas sans filtre).
@@ -1639,6 +1646,7 @@ class Activity:
         self.on_delete = None
         self.on_play = None         # verification aupres d'Emby (posee par le proxy)
         self.on_admin = None        # compte administrateur ou non (pose par le proxy)
+        self.on_login = None        # connexion reussie (pose par le proxy)
 
     # -- identification ------------------------------------------------
     @staticmethod
@@ -2064,6 +2072,8 @@ class Activity:
                 self.info.users[uid] = u.get("Name") or ""
                 if isinstance(u.get("Policy"), dict) and self.on_admin:
                     self.on_admin(uid, bool(u["Policy"].get("IsAdministrator")))
+                if isinstance(u.get("Policy"), dict) and self.on_login:
+                    self.on_login(c, uid, bool(u["Policy"].get("IsAdministrator")))
                 c.user_id, c.user_name = uid, u.get("Name") or c.user_name
                 if data.get("AccessToken"):
                     self.token_user[data["AccessToken"]] = uid
@@ -2758,6 +2768,7 @@ HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 FORWARD_HDRS = {"x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarded-host"}
 # Emby y annonce sa propre adresse : les applis (Android TV...) s'en servent
 # pour se reconnecter, en contournant le proxy
+RE_BRANDING = re.compile(r"^/Branding/Configuration/?$", re.I)
 RE_SYSINFO = re.compile(r"^/System/Info(?:/Public)?/?$", re.I)
 CHUNK = 256 * 1024
 try:                                     # aiohttp >= 3.11
@@ -2930,6 +2941,7 @@ class EmbyProxy:
             self.activity.on_play = self._schedule_play_check
             self.activity.on_admin = lambda uid, adm: self.admin_cache.__setitem__(
                 uid, (adm, time.time() + 600))
+            self.activity.on_login = self._admin_login_notice
 
     # -- cycle de vie --------------------------------------------------
     async def startup(self, app):
@@ -3470,6 +3482,9 @@ class EmbyProxy:
                 t("réseau local") if self.guard.is_local(ip) else t("Internet"))),
             (t("Version du proxy"), __version__),
         ]
+        notice = self._admin_notice(request)
+        if notice:
+            rows.append((t("Administration d'Emby"), "\u26a0 " + _html_escape(notice)))
         html = (LANDING_HTML.replace("@@LANG@@", lang)
                 .replace("@@TITLE@@", t("Connecté via Emby Proxy"))
                 .replace("@@SUB@@", t("Tu passes par le proxy sécurisé, et non "
@@ -3789,6 +3804,10 @@ class EmbyProxy:
             if request.method == "GET" and up.status == 200 and RE_SYSINFO.match(np) \
                     and "json" in up.headers.get("Content-Type", ""):
                 return await self._sysinfo(request, up)
+            if request.method == "GET" and up.status == 200 and RE_BRANDING.match(np) \
+                    and "json" in up.headers.get("Content-Type", "") \
+                    and self._admin_notice(request):
+                return await self._branding(request, up)
             resp = web.StreamResponse(status=up.status, reason=up.reason)
             for k, v in up.headers.items():
                 lk = k.lower()
@@ -3829,6 +3848,90 @@ class EmbyProxy:
                     up.status, _safe(request.method, 10), _safe(request.path, 100)),
                     merge=60)
             up.release()
+
+    def _admin_notice(self, request):
+        """Texte a afficher depuis Internet quand l'administration d'Emby n'y
+        est pas autorisee ; "" sinon (reseau local, ou autorisee)."""
+        mode = getattr(self.cfg, "admin_mode", "NONE")
+        ip = request.get(CLIENT_IP, "")
+        if mode == "FULL" or not ip or self.guard.is_local(ip):
+            return ""
+        return tr(ADMIN_NOTICE[mode], self.cfg.language)
+
+    async def _branding(self, request, up):
+        """Ecran de connexion d'Emby : la mention de l'administration limitee
+        est ajoutee a son texte d'avertissement (LoginDisclaimer)."""
+        raw = await up.read()
+        try:
+            data = json.loads(_decode(raw, up.headers.get("Content-Encoding")))
+        except (ValueError, OSError, zlib.error):
+            data = None
+        if not isinstance(data, dict):
+            return web.Response(status=200, body=raw, headers={
+                k: v for k, v in up.headers.items()
+                if k.lower() not in HOP and k.lower() != "content-length"})
+        note = "\u26a0 " + self._admin_notice(request)
+        old = (data.get("LoginDisclaimer") or "").strip()
+        data["LoginDisclaimer"] = (old + "\n\n" + note) if old else note
+        resp = web.json_response(data)
+        for k, v in up.headers.items():
+            if k.lower() not in HOP and k.lower() not in (
+                    "content-length", "content-encoding", "content-type"):
+                resp.headers.add(k, v)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    # 2) juste apres la connexion d'un compte administrateur
+    def _admin_login_notice(self, c, uid, is_admin):
+        if not is_admin or getattr(self.cfg, "admin_mode", "NONE") == "FULL" \
+                or not c.ip or self.guard.is_local(c.ip) or not c.device_id:
+            return
+        text = tr(ADMIN_NOTICE[self.cfg.admin_mode], self.cfg.language)
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._send_login_notice(c, text))
+        except RuntimeError:
+            return
+        self._tasks.append(task)
+
+    async def _send_login_notice(self, c, text, wait=30):
+        """L'appli ouvre sa connexion en direct juste apres le login : on
+        l'attend (30 s au plus), sinon le message passe par l'API d'Emby."""
+        dev, sent = c.device_id, 0
+        for _ in range(int(wait * 2)):
+            if self.ws_by_device.get(dev):
+                await asyncio.sleep(1.5)             # l'appli finit de demarrer
+                sent = await self.push_message(dev, "Emby Proxy", text, 15000)
+                break
+            await asyncio.sleep(0.5)
+        how = "direct"
+        if not sent:
+            how = "API"
+            if not self.cfg.api_key or not await self._api_message(dev, text):
+                return
+        self.activity.event(c, "quota", "Message de connexion (%s) : %s"
+                            % (how, text[:60]), merge=30)
+
+    async def _api_message(self, device_id, text):
+        try:
+            async with self.session.get("%s/emby/Sessions" % self.cfg.upstream,
+                                        params={"api_key": self.cfg.api_key,
+                                                "DeviceId": device_id},
+                                        timeout=ClientTimeout(total=10)) as r:
+                sessions = json.loads(_decode(await r.read(),
+                                              r.headers.get("Content-Encoding")))
+            sid = next((s.get("Id") for s in sessions or []
+                        if s.get("DeviceId") == device_id), None)
+            if not sid:
+                return False
+            async with self.session.post(
+                    "%s/emby/Sessions/%s/Message" % (self.cfg.upstream, sid),
+                    params={"api_key": self.cfg.api_key},
+                    json={"Header": "Emby Proxy", "Text": text, "TimeoutMs": 15000},
+                    timeout=ClientTimeout(total=10)) as r:
+                return r.status < 400
+        except (ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError):
+            return False
 
     async def _sysinfo(self, request, up):
         """Infos du serveur : les adresses d'Emby remplacees par celle du proxy,

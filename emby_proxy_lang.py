@@ -296,6 +296,15 @@ EN = {
     "test en cours…": "testing…",
     "version": "version",
     "Continuer vers Emby": "Continue to Emby",
+    "Administration d'Emby": "Emby administration",
+    "Depuis Internet, l'administration d'Emby est INTERDITE : on peut regarder "
+    "normalement, le tableau de bord n'est accessible que depuis le réseau local.":
+        "From the Internet, Emby administration is BLOCKED: you can watch normally, "
+        "the dashboard is only reachable from the local network.",
+    "Depuis Internet, l'administration d'Emby est en LECTURE SEULE : le tableau de "
+    "bord s'affiche, mais aucune modification n'est possible.":
+        "From the Internet, Emby administration is READ ONLY: the dashboard is shown, "
+        "but no change is possible.",
     "Refaire le test": "Test again",
     "Transmettre à Emby l'adresse réelle des visiteurs":
         "Pass the visitors' real address to Emby",
@@ -752,6 +761,7 @@ PATTERNS = [
     (r"^robot : recherche de failles \((.*)\)$", "robot: looking for security holes ($1)"),
     (r"^Message de quota \((direct|API)\) : (.*)$", "Quota message ($1): $2"),
     (r"^Coupure de quota \((direct|API)\)$", "Quota stop ($1)"),
+    (r"^Message de connexion \((direct|API)\) : (.*)$", "Login message ($1): $2"),
     (r"^Erreur Emby HTTP (\d+) : (\S+) (.*)$", "Emby error HTTP $1: $2 $3"),
     (r"^Demande de lecture : (.*) → (.*)$", "Playback request: $1 → {2}"),
     (r"^Emby : (.*) → (.*)$", "Emby: $1 → {2}"),
