@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.11"
+__version__ = "2.6.12"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2165,6 +2165,27 @@ class Activity:
                 f[dst] = request.headers[h]
         return {k: str(v)[:200] for k, v in f.items()}
 
+    @staticmethod
+    def _key(request, f, trusted):
+        ip = request[CLIENT_IP]
+        token = f.get("token", "") if trusted else ""
+        th = hashlib.sha256(token.encode()).hexdigest()[:12] if token else ""
+        ua = request.headers.get("User-Agent", "")
+        if not trusted:
+            return "anon:%s:%s" % (ip, hashlib.sha1(ua.encode()).hexdigest()[:8])
+        if f.get("deviceid"):
+            # appareil + jeton : un autre compte qui reprend le meme
+            # identifiant d'appareil n'arrive pas dans cette fiche
+            return "dev:%s:%s" % (f["deviceid"], th)
+        if token:
+            return "tok:" + th
+        return "ip:%s:%s" % (ip, hashlib.sha1(ua.encode()).hexdigest()[:8])
+
+    def peek(self, request):
+        """Fiche DEJA existante ou ira cette requete si Emby l'accepte ; rien
+        n'est cree ni compte (note a l'arrivee de la requete)."""
+        return self.clients.get(self._key(request, self._auth_fields(request), True))
+
     def identify(self, request, trusted=True):
         """trusted = Emby a accepte la requete (jeton valable). Sinon les
         identifiants annonces (appareil, utilisateur) ne sont que des
@@ -2173,18 +2194,7 @@ class Activity:
         ip = request[CLIENT_IP]
         f = self._auth_fields(request)
         token = f.get("token", "") if trusted else ""
-        th = hashlib.sha256(token.encode()).hexdigest()[:12] if token else ""
-        ua = request.headers.get("User-Agent", "")
-        if not trusted:
-            key = "anon:%s:%s" % (ip, hashlib.sha1(ua.encode()).hexdigest()[:8])
-        elif f.get("deviceid"):
-            # appareil + jeton : un autre compte qui reprend le meme
-            # identifiant d'appareil n'arrive pas dans cette fiche
-            key = "dev:%s:%s" % (f["deviceid"], th)
-        elif token:
-            key = "tok:" + th
-        else:
-            key = "ip:%s:%s" % (ip, hashlib.sha1(ua.encode()).hexdigest()[:8])
+        key = self._key(request, f, trusted)
         c = self.clients.get(key)
         if c is None:
             if len(self.clients) > 2000:
@@ -3916,6 +3926,63 @@ class EmbyProxy:
     # -- securite ------------------------------------------------------
     @web.middleware
     async def security_mw(self, request, handler):
+        """Chaque requete d'un appareil connu est notee DES SON ARRIVEE dans
+        sa fiche (Dernieres requetes), puis completee a la fin : une requete
+        qui reste bloquee apparait "en cours", une abandonnee "abandonnee"."""
+        request[CLIENT_IP] = self.guard.client_ip(request)
+        self._rq_start(request)
+        try:
+            resp = await self._security_mw(request, handler)
+        except (asyncio.CancelledError, ConnectionResetError):
+            self._rq_end(request, None)             # l'appli a raccroche
+            raise
+        except web.HTTPException as exc:
+            self._rq_end(request, exc.status)
+            raise
+        except Exception:
+            self._rq_end(request, 500)
+            raise
+        self._rq_end(request, getattr(resp, "status", None))
+        return resp
+
+    def _rq_start(self, request):
+        if self.activity is None or request.path.startswith("/__proxy/") \
+                or request.path == "/robots.txt":
+            return
+        # seulement la fiche existante d'un appareil deja accepte par Emby :
+        # cle de session connue, ou, sans cle (lecteur video de certaines
+        # applis), une adresse ou un compte s'est connecte. Rien n'est cree.
+        tok = Activity._auth_fields(request).get("token", "")
+        ip = request[CLIENT_IP]
+        if tok:
+            ok = tok in self.activity.token_user
+        else:
+            ok = self.auth_ips.get(self.guard.key(ip), 0) > time.time() \
+                or self.guard.is_local(ip)
+        card = self.activity.peek(request) if ok else None
+        if card is None:
+            return
+        entry = [time.time(), _safe(request.method, 10),
+                 redact(request.path_qs)[:160], None, None]
+        card.recent.append(entry)
+        request["rq_entry"] = entry
+
+    def _rq_end(self, request, status, why=""):
+        entry = request.get("rq_entry")
+        if entry is None or entry[3] is not None:
+            return
+        note = ""
+        if request.get("announced"):
+            note = ("  [%s]" % request["announced"] if request["announced"].startswith(
+                "reseau local") else "  [adresse annoncee a l'appli : %s]"
+                % request["announced"])
+        if why:
+            note += "  [%s]" % why
+        entry[2] += note + request.get("rq_note", "")
+        entry[3] = status if status is not None else -1
+        entry[4] = int((time.time() - entry[0]) * 1000)
+
+    async def _security_mw(self, request, handler):
         ip = self.guard.client_ip(request)
         request[CLIENT_IP] = ip
         np = norm_path(request.path)
@@ -4435,6 +4502,9 @@ class EmbyProxy:
         qu'une appli demande vraiment ; cles masquees)."""
         if c is None:
             return
+        if request.get("rq_entry") is not None and "WebSocket" not in note:
+            request["rq_note"] = request.get("rq_note", "") + note
+            return                       # ligne deja notee a l'arrivee
         if request.get("announced"):
             note += ("  [%s]" % request["announced"] if request["announced"].startswith(
                 "reseau local") else "  [adresse annoncee a l'appli : %s]" % request["announced"])
@@ -6275,7 +6345,7 @@ function userCard(u){
   if(u.location){const l=el('div','loc');l.append(el('span','l',T('Où :')+' '),el('span',null,u.location),el('span','sub','  '+ago(u.location_s)));c.append(l)}
   if((u.recent||[]).length){const det=el('details','rq'),sm=el('summary',null,TF('Dernières requêtes ({0})',u.recent.length));det.append(sm);
     const box=el('div','tried');u.recent.forEach(r=>{const d=el('div');if(r.s>=400)d.style.color='var(--bad)';
-      d.append(el('time',null,hm(r.t)));d.append(document.createTextNode(r.m+' '+r.p+' → '+r.s+' ('+r.ms+' ms)'));box.append(d)});
+      d.append(el('time',null,hm(r.t)));d.append(document.createTextNode(r.m+' '+r.p+' → '+(r.s==null?T('en cours depuis')+' '+Math.max(0,Math.round(Date.now()/1000-r.t))+' s':r.s==-1?T('abandonnée')+' ('+r.ms+' ms)':r.s+' ('+r.ms+' ms)')));box.append(d)});
     det.append(box);det.open=openRq.has(u.key);det.ontoggle=()=>det.open?openRq.add(u.key):openRq.delete(u.key);c.append(det)}
   if(u.events.length){const ev=el('div','ev');
     u.events.forEach(e=>{const r=el('div','e k-'+e.kind);r.append(el('time',null,hm(e.t)),el('span',null,e.text));ev.append(r)});c.append(ev)}

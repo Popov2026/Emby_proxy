@@ -783,6 +783,8 @@ EN = {
     "Aucune tentative suspecte.": "No suspicious attempt.",
     "Appareils enregistrés dans Emby": "Devices registered in Emby",
     "Dernières requêtes ({0})": "Latest requests ({0})",
+    "en cours depuis": "in progress for",
+    "abandonnée": "abandoned",
     "Clé de session refusée par Emby (périmée ou inventée)": "Session key refused by Emby (expired or invented)",
     "Clés de session refusées par Emby (périmées ou inventées)": "Session keys refused by Emby (expired or invented)",
     "1 seule clé refusée, renvoyée plusieurs fois : une appli avec une ancienne session, à reconnecter avec le mot de passe.":
