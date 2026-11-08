@@ -387,6 +387,21 @@ async def main():
             rq = await p.inner_text("details.rq >> nth=0")
             check("fiche de l'appareil : dernieres requetes (lecture comprise, cles masquees)",
                   "PlaybackInfo" in rq and "api_key=***" in rq and TOK not in rq, rq[:400])
+            # copier : la selection a la souris debordait sur les colonnes voisines
+            # (page en http sur le reseau local : pas d'API presse-papiers)
+            await p.evaluate("()=>{window.__cp=[];document.execCommand=c=>{"
+                             "window.__cp.push(document.body.lastElementChild.value);return true};"
+                             "Object.defineProperty(navigator,'clipboard',{value:{writeText:"
+                             "()=>Promise.reject(new Error('refuse'))}})}")
+            await p.click("details.rq button.copy >> nth=0")
+            await p.click("#users > .c >> nth=0 >> button.copy >> nth=0")
+            await p.click("#attempts > .c >> nth=0 >> button.copy >> nth=0")
+            cp = await p.evaluate("window.__cp")
+            check("boutons Copier : requetes, fiche, tentative (texte de la fiche seule)",
+                  len(cp) == 3 and "PlaybackInfo" in cp[0] and "paul" in cp[1]
+                  and "PlaybackInfo" in cp[1] and "Copier" not in cp[1]
+                  and "tenté" in cp[2],
+                  [x[:200] for x in cp])
             if os.environ.get("FUNC_SHOT"):
                 await p.set_viewport_size({"width": 1200, "height": 900})
                 await p.locator("h2:has-text('Tentatives suspectes')").scroll_into_view_if_needed()
@@ -406,6 +421,13 @@ async def main():
                   and "GET /emby/Users/Public -> 200" in phone, phone[:900])
             await p.click("button[data-t=sec]")
             await p.wait_for_timeout(3500)
+            await p.click("#sec button.copy >> nth=0")
+            cp = await p.evaluate("window.__cp")
+            check("bouton Copier le journal de securite (une ligne par evenement)",
+                  len(cp) == 4 and cp[3].startswith("Date\t") and cp[3].count("\n") > 1,
+                  cp[3:][:1])
+            if os.environ.get("FUNC_CP"):
+                print("\n=====\n".join(cp))
             bls = await p.inner_text("#bls")
             check("onglet Securite : listes de blocage affichees",
                   "Hébergeurs et serveurs loués" in bls and "✔ chargée" in bls, bls[:300])

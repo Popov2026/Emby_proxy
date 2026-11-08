@@ -56,6 +56,8 @@ async def test_pas_de_compression_comme_emby(tmp_path):
         c = [x for x in p.activity.snapshot()["clients"] if x["device"] == "SHIELD"][0]
         lines = " | ".join(r["p"] for r in c["recent"])
         assert "WebSocket ouvert" in lines and "fermee apres" in lines, lines
+        ws_lines = [r for r in c["recent"] if "websocket?" in r["p"].lower()]
+        assert len(ws_lines) == 1 and ws_lines[0]["s"] == 101, lines   # une ligne
     finally:
         await ps.close()
         await us.close()
@@ -78,7 +80,7 @@ async def test_emby_muet_jamais_d_attente_sans_fin(tmp_path):
             assert time.time() - t < 5
         c = [x for x in p.activity.snapshot()["clients"] if x["device"] == "SHIELD"][0]
         lines = " | ".join(r["p"] for r in c["recent"])
-        assert "n'a pas repondu" in lines and "ouverture aupres d'Emby" in lines, lines
+        assert "n'a pas repondu" in lines and lines.count("embywebsocket") == 1, lines
     finally:
         await ps.close()
         await us.close()

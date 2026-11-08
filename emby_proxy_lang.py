@@ -785,6 +785,11 @@ EN = {
     "Dernières requêtes ({0})": "Latest requests ({0})",
     "en cours depuis": "in progress for",
     "abandonnée": "abandoned",
+    "Copier": "Copy",
+    "Copié ✔": "Copied ✔",
+    "Copie impossible": "Copy failed",
+    "Copier ces requêtes": "Copy these requests",
+    "Copier le journal": "Copy the log",
     "Clé de session refusée par Emby (périmée ou inventée)": "Session key refused by Emby (expired or invented)",
     "Clés de session refusées par Emby (périmées ou inventées)": "Session keys refused by Emby (expired or invented)",
     "1 seule clé refusée, renvoyée plusieurs fois : une appli avec une ancienne session, à reconnecter avec le mot de passe.":

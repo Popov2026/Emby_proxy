@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.12"
+__version__ = "2.6.13"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3965,7 +3965,7 @@ class EmbyProxy:
         entry = [time.time(), _safe(request.method, 10),
                  redact(request.path_qs)[:160], None, None]
         card.recent.append(entry)
-        request["rq_entry"] = entry
+        request["rq_entry"], request["rq_base"] = entry, entry[2]
 
     def _rq_end(self, request, status, why=""):
         entry = request.get("rq_entry")
@@ -4502,15 +4502,26 @@ class EmbyProxy:
         qu'une appli demande vraiment ; cles masquees)."""
         if c is None:
             return
-        if request.get("rq_entry") is not None and "WebSocket" not in note:
-            request["rq_note"] = request.get("rq_note", "") + note
-            return                       # ligne deja notee a l'arrivee
+        entry = request.get("rq_entry")
+        if entry is not None:            # ligne deja notee a l'arrivee
+            if "WebSocket" in note:      # etat du WebSocket : sur la meme ligne
+                entry[2] = request["rq_base"] + note
+            else:
+                request["rq_note"] = request.get("rq_note", "") + note
+            return
         if request.get("announced"):
             note += ("  [%s]" % request["announced"] if request["announced"].startswith(
                 "reseau local") else "  [adresse annoncee a l'appli : %s]" % request["announced"])
-        c.recent.append((time.time(), _safe(request.method, 10),
-                         redact(request.path_qs)[:160] + note, status,
-                         int((time.time() - t0) * 1000)))
+        line = [time.time(), _safe(request.method, 10),
+                redact(request.path_qs)[:160] + note, status,
+                int((time.time() - t0) * 1000)]
+        ws = request.get("ws_line")
+        if ws is not None and "WebSocket" in note:   # etats successifs : une ligne
+            ws[2:] = line[2:]
+            return
+        if "WebSocket" in note:
+            request["ws_line"] = line
+        c.recent.append(line)
 
     async def proxy_http(self, request):
         t_start = time.time()
@@ -6111,6 +6122,7 @@ td,th{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;font-s
 button.red{margin-top:16px;background:var(--acc);color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer}
 pre{background:var(--card);padding:10px;border-radius:8px;white-space:pre-wrap}.empty{color:var(--mut);padding:10px}
 button.ghost{background:none;border:1px solid var(--line);color:var(--mut);border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
+button.copy{float:right;margin-left:6px;font-size:12px}.copybar{overflow:hidden;margin:4px 0}
 button.small{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer;font:inherit}
 .w{background:#3a2a12;border:1px solid var(--warn);color:#ffd9a0;border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:13px}
 .t-login_fail,.t-status_fail,.t-ban,.t-config_fail{color:var(--bad)}.t-login_ok,.t-status_ok,.t-unban{color:var(--ok)}.t-refused,.t-config{color:var(--warn)}
@@ -6328,8 +6340,24 @@ document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   if(b.dataset.t==='conf')loadConf();});
 
 const openRq=new Set();
+// ---- copier une fiche : selectionner a la souris deborde sur les colonnes voisines
+function nodeText(n){if(n.nodeType===3)return n.nodeValue;if(n.nodeType!==1||n.tagName==='BUTTON')return '';
+  let t='';n.childNodes.forEach(x=>t+=nodeText(x));
+  if(n.tagName==='TIME')return t+' ';
+  if(n.tagName==='BR')return '\n';
+  return /^(DIV|DETAILS|SUMMARY|P|H\d|TR|LI)$/.test(n.tagName)?'\n'+t+'\n':/^(A|CODE|B|STRONG|I|EM)$/.test(n.tagName)?t:' '+t+' '}
+function cleanText(t){return t.split('\n').map(x=>x.replace(/[ \t]+/g,' ').trim()).filter(Boolean).join('\n')+'\n'}
+function copyText(t,b){const done=ok=>{if(!b)return;const o=b.textContent;b.textContent=T(ok?'Copié ✔':'Copie impossible');setTimeout(()=>b.textContent=o,1500)};
+  const old=()=>{const a=document.createElement('textarea');a.value=t;a.setAttribute('readonly','');a.style.position='fixed';a.style.opacity='0';
+    document.body.append(a);a.select();let ok=false;try{ok=document.execCommand('copy')}catch(e){}a.remove();done(ok)};
+  if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(t).then(()=>done(true),old);else old()}
+function copyBtn(label,get){const b=el('button','small copy',label);b.onclick=e=>{e.preventDefault();e.stopPropagation();copyText(get(),b)};return b}
+function tableText(tb){const tab=tb.closest('table'),rows=[...tab.querySelectorAll('tr')].filter(r=>!r.hidden&&r.style.display!=='none');
+  return rows.map(r=>[...r.children].map(c=>cleanText(nodeText(c)).trim().replace(/\n/g,' ')).join('\t')).join('\n')+'\n'}
+['feed','sfeed','qEvents'].forEach(id=>{const tb=$(id);if(!tb)return;const w=tb.closest('.tw'),bar=el('div','copybar');
+  bar.append(copyBtn('Copier le journal',()=>tableText(tb)));w.before(bar)});
 function userCard(u){
-  const c=el('div','c');
+  const c=el('div','c');c.append(copyBtn('Copier',()=>cleanText(nodeText(c))));
   const top=el('div');const dot=el('span','dot');dot.style.background=u.playing?'var(--ok)':u.active?'var(--info)':'#555';
   top.append(dot,el('span','name',u.user));
   const t=el('span','tag',u.local?'réseau local':'Internet');t.style.color=u.local?'var(--mut)':'var(--warn)';top.append(t);
@@ -6346,6 +6374,7 @@ function userCard(u){
   if((u.recent||[]).length){const det=el('details','rq'),sm=el('summary',null,TF('Dernières requêtes ({0})',u.recent.length));det.append(sm);
     const box=el('div','tried');u.recent.forEach(r=>{const d=el('div');if(r.s>=400)d.style.color='var(--bad)';
       d.append(el('time',null,hm(r.t)));d.append(document.createTextNode(r.m+' '+r.p+' → '+(r.s==null?T('en cours depuis')+' '+Math.max(0,Math.round(Date.now()/1000-r.t))+' s':r.s==-1?T('abandonnée')+' ('+r.ms+' ms)':r.s+' ('+r.ms+' ms)')));box.append(d)});
+    box.prepend(copyBtn('Copier ces requêtes',()=>cleanText((u.user||'')+' · '+(u.device||'')+'\n'+nodeText(box))));
     det.append(box);det.open=openRq.has(u.key);det.ontoggle=()=>det.open?openRq.add(u.key):openRq.delete(u.key);c.append(det)}
   if(u.events.length){const ev=el('div','ev');
     u.events.forEach(e=>{const r=el('div','e k-'+e.kind);r.append(el('time',null,hm(e.t)),el('span',null,e.text));ev.append(r)});c.append(ev)}
@@ -6380,8 +6409,9 @@ $('dDo').onclick=()=>{if(!devDel)return;post('devices/delete',{id:devDel.id,labe
 function showDevicesOf(name){document.querySelector('button[data-t=sec]').click();loadDevices(true).then(()=>{$('dUser').value=name;renderDevices();$('devH').scrollIntoView()})}
 
 let lastAtt=null;const attOpen=new Set();
-function attCard(a){
+function attCard(a,full){
   const c=el('div','c att'),top=el('div');
+  if(!full)c.append(copyBtn('Copier',()=>cleanText(nodeText(attCard(a,true)))));
   const dot=el('span','dot');dot.style.background=a.banned_s?'var(--bad)':a.ok_user?'var(--ok)':'var(--warn)';
   top.append(dot,el('span','name',a.ip));
   const t=el('span','tag',a.local?'réseau local':'Internet');t.style.color=a.local?'var(--mut)':'var(--warn)';top.append(t);
@@ -6407,9 +6437,9 @@ function attCard(a){
   if(a.ok_user)c.append(el('div','st ok',TF('✔ S\'est ensuite connecté avec le compte {0}',a.ok_user)));
   if((a.seen||[]).length){const box=el('div','tried');
     box.append(el('div','sub',T('Ce qu\'elle a obtenu sans connexion (laissé passer par le proxy) :')));
-    a.seen.slice(0,10).forEach(x=>{const r=el('div');r.append(el('time',null,day(x.t)));r.append(document.createTextNode(x.what+(x.n>1?'  ×'+x.n:'')));box.append(r)});
+    a.seen.slice(0,full?a.seen.length:10).forEach(x=>{const r=el('div');r.append(el('time',null,day(x.t)));r.append(document.createTextNode(x.what+(x.n>1?'  ×'+x.n:'')));box.append(r)});
     c.append(box)}
-  if(a.tried.length){const box=el('div','tried'),open=attOpen.has(a.key),list=open?a.tried:a.tried.slice(0,8);
+  if(a.tried.length){const box=el('div','tried'),open=full||attOpen.has(a.key),list=open?a.tried:a.tried.slice(0,8);
     box.append(el('div','sub',T('Ce qui a été tenté (le plus récent en premier) :')));
     list.forEach(x=>{const r=el('div');r.append(el('time',null,day(x.t)));r.append(document.createTextNode(T(x.what)+(x.n>1?'  ×'+x.n:'')));box.append(r)});
     if(a.tried.length>8){const b=el('button','small',open?T('Réduire'):TF('Tout voir ({0})',a.tried.length));
@@ -6422,7 +6452,7 @@ function renderAtt(d){
   const all=lastAtt.attempts,rows=all.filter(a=>(!k.length||k.some(x=>a.cats[x]))&&(!nt||(nt==='local')===a.local)&&(!bn||a.banned_s>0)&&
     (!q||[a.ip,a.ips.join(' '),a.users.join(' '),a.agents.join(' '),a.ban,a.ok_user,a.tried.map(x=>x.what).join(' ')].join(' ').toLowerCase().includes(q)));
   $('aSum').textContent=TF('{0} adresse(s) · {1} bannie(s) en ce moment · {2} tentative(s) au total',all.length,all.filter(a=>a.banned_s>0).length,all.reduce((n,a)=>n+a.total,0));
-  $('attempts').replaceChildren(...(rows.length?rows.slice(0,150).map(attCard):[el('div','empty','Aucune tentative suspecte.')]))}
+  $('attempts').replaceChildren(...(rows.length?rows.slice(0,150).map(a=>attCard(a)):[el('div','empty','Aucune tentative suspecte.')]))}
 ['aCat','aNet','aBan'].forEach(i=>$(i).onchange=()=>renderAtt());$('aText').oninput=()=>renderAtt();
 
 let last=null;
