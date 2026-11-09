@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.13"
+__version__ = "2.6.14"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -4764,6 +4764,20 @@ class EmbyProxy:
         resp.headers["Cache-Control"] = "no-cache"
         return resp
 
+    def _lan_address(self, request):
+        """Adresse du proxy sur le reseau de la maison (celle ou le relais le
+        joint), "" si inconnue ou de la machine elle-meme (127.0.0.1)."""
+        try:
+            ip, port = (request.transport.get_extra_info("sockname") or ())[:2]
+            a = ipaddress.ip_address(ip.split("%")[0])
+        except (TypeError, ValueError, AttributeError):
+            return ""
+        if getattr(a, "ipv4_mapped", None):
+            a = a.ipv4_mapped
+        if a.is_loopback or a.is_unspecified or not a.is_private:
+            return ""
+        return "%s://%s:%d" % (request.scheme, a if a.version == 4 else "[%s]" % a, port)
+
     async def _sysinfo(self, request, up):
         """Infos du serveur : les adresses d'Emby remplacees par celle du proxy,
         vue par l'utilisateur (sinon les applis se reconnectent en direct)."""
@@ -4783,16 +4797,29 @@ class EmbyProxy:
         # avec Android TV (version 2.1.3, essayee sur une box Android TV).
         proto, host, sure = self._public_origin(request, certain=True)
         origin = "%s://%s" % (proto, host)
-        request["announced"] = origin if sure else "aucune (relais sans X-Forwarded-Proto)"
+        # Adresse LOCALE : comme Emby, jamais l'adresse publique. Venue par le
+        # relais HTTPS, l'appli comparerait l'adresse qu'elle utilise a
+        # l'adresse locale annoncee, se croirait a la maison et lirait le
+        # fichier sans rien demander au serveur (Shield, TV Sony : ecran noir,
+        # aucune demande de lecture). Adresse locale = le proxy sur le reseau
+        # de la maison (la ou le relais le joint), ou aucune.
+        local = origin
+        if "X-Forwarded-For" in request.headers or \
+                origin != "%s://%s" % (request.scheme, request.host):
+            local = self._lan_address(request)             # venue par le relais
+        request["announced"] = (origin if sure else
+                                "aucune (relais sans X-Forwarded-Proto)") + (
+            "" if local == origin else ", locale : %s" % (local or "aucune"))
         for k in ("LocalAddress", "WanAddress", "LocalAddresses", "RemoteAddresses"):
             if k not in data:
                 continue
-            if not sure:
+            v = local if k.startswith("Local") else origin
+            if not sure or not v:
                 # relais qui ne dit pas s'il est en HTTPS : aucune adresse plutot
                 # qu'une fausse (l'appli garde celle qu'on lui a donnee)
                 del data[k]
             else:
-                data[k] = [origin] if k.endswith("es") else origin
+                data[k] = [v] if k.endswith("es") else v
         # en-tetes d'Emby gardes (autorisations CORS surtout : sans elles,
         # l'appli iPhone, construite sur un navigateur integre, rejette la
         # reponse et ne peut pas se connecter)

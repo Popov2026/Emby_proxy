@@ -124,16 +124,40 @@ async def test_adresses_d_emby_remplacees_par_le_proxy(env, path):
 
 
 async def test_tv_sur_internet_via_le_relais_https(env):
-    """Comportement de la 2.1.3, essaye sur une box Android TV : l'appli recoit
-    l'adresse https du relais."""
+    """Adresse distante = le relais https ; adresse LOCALE = le proxy sur le
+    reseau de la maison, comme Emby (jamais l'adresse publique : l'appli se
+    croirait a la maison et lirait le fichier sans demande de lecture)."""
     proxy, c, _ = env
     proxy.cfg.trusted = ep._nets("127.0.0.1/32")
-    r = await c.get("/emby/System/Info/Public", headers={
-        "X-Forwarded-For": "198.51.100.77", "X-Forwarded-Proto": "https",
-        "Host": "emby.example.com"})
-    d = json.loads(await r.read())
-    for k in ("LocalAddress", "WanAddress"):
-        assert d[k] == "https://emby.example.com"
+    h = {"X-Forwarded-For": "198.51.100.77", "X-Forwarded-Proto": "https",
+         "Host": "emby.example.com"}
+    proxy._lan_address = lambda request: "http://192.168.50.7:8097"
+    d = json.loads(await (await c.get("/emby/System/Info/Public", headers=h)).read())
+    assert d["WanAddress"] == "https://emby.example.com"
+    assert d["RemoteAddresses"] == ["https://emby.example.com"]
+    assert d["LocalAddress"] == "http://192.168.50.7:8097"
+    assert d["LocalAddresses"] == ["http://192.168.50.7:8097"]
+    # relais sur la meme machine : adresse locale inconnue, aucune
+    proxy._lan_address = lambda request: ""
+    d = json.loads(await (await c.get("/emby/System/Info/Public", headers=h)).read())
+    assert "LocalAddress" not in d and "LocalAddresses" not in d
+    assert d["WanAddress"] == "https://emby.example.com"
+
+
+def test_adresse_du_proxy_sur_le_reseau_local():
+    class T:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def get_extra_info(self, k):
+            return self.sock
+    p = ep.EmbyProxy.__new__(ep.EmbyProxy)
+    for sock, want in ((("192.168.50.7", 8097), "http://192.168.50.7:8097"),
+                       (("127.0.0.1", 8097), ""), (("::ffff:10.0.0.2", 8097, 0, 0),
+                                                    "http://10.0.0.2:8097"),
+                       (("8.8.8.8", 8097), ""), (None, "")):
+        req = type("R", (), {"transport": T(sock), "scheme": "http"})()
+        assert p._lan_address(req) == want, sock
 
 
 async def test_adresse_publique_du_relais_https(env):
@@ -169,7 +193,7 @@ async def test_relais_local_non_declare_annonce_https(env):
         "Host": "emby.example.com"})
     d = json.loads(await r.read())
     assert d["WanAddress"] == "https://emby.example.com"
-    assert d["LocalAddress"] == "https://emby.example.com"
+    assert d.get("LocalAddress") != "https://emby.example.com"   # jamais locale
     assert seen["info_headers"]["X-Forwarded-Proto"] == "https"
     # l'adresse du visiteur, elle, n'est reprise que d'un relais declare
     assert seen["info_headers"]["X-Forwarded-For"] == "127.0.0.1"
