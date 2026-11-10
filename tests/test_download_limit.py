@@ -34,6 +34,14 @@ async def env(aiohttp_server, tmp_path):
     app = web.Application()
     app.router.add_post("/emby/Users/AuthenticateByName", auth)
     app.router.add_get("/emby/Items/{id}/Download", slow)
+
+    async def ws(request):
+        w = web.WebSocketResponse()
+        await w.prepare(request)
+        async for _ in w:
+            pass
+        return w
+    app.router.add_get("/embywebsocket", ws)
     app.router.add_get("/emby/Videos/{id}/stream.mkv", slow)
     app.router.add_route("*", "/{tail:.*}", ok)
     srv = await aiohttp_server(app)
@@ -118,4 +126,35 @@ async def test_reglage_depuis_la_page_a_chaud(env):
     assert (await set_("-3")).status == 400
     html = await (await c.get("/__proxy/")).text()
     assert "Téléchargements simultanés par compte" in html
+    release.set()
+
+
+async def test_navigateur_message_dans_emby_sans_page_d_erreur(env):
+    """Cas reel : Firefox affichait sa page "probleme sur ce site, 429" a la
+    place d'Emby. Le navigateur reste sur Emby (204) et le message s'affiche
+    dans Emby par sa connexion en direct ; sans elle, 429 avec le texte."""
+    import json
+    p, c, release = env
+    p.cfg.max_downloads = 1
+    web_h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:140.0) Gecko/20100101 Firefox/140.0",
+             "X-Emby-Authorization": 'MediaBrowser Client="Emby Web", Device="Firefox", '
+                                     'DeviceId="ff1", Token="T-alice"'}
+    await c.get("/emby/Users/%s/Items" % ("a" * 32), headers=web_h)   # fiche du navigateur
+    a = await start(c, "/emby/Items/101/Download")
+    assert a.status == 200
+    ua = {"User-Agent": web_h["User-Agent"]}
+    r = await c.get("/emby/Items/102/Download?api_key=T-alice", headers=ua)
+    assert r.status == 429                                    # pas de connexion en direct
+    sock = await c.ws_connect("/embywebsocket?api_key=T-alice&deviceId=ff1")
+    await asyncio.sleep(0.1)
+    r = await c.get("/emby/Items/102/Download?api_key=T-alice", headers=ua)
+    assert r.status == 204 and await r.read() == b""
+    msg = json.loads((await sock.receive(timeout=3)).data)
+    assert msg["MessageType"] == "GeneralCommand" and msg["Data"]["Name"] == "DisplayMessage"
+    assert "1 au maximum" in msg["Data"]["Arguments"]["Text"]
+    # une appli (pas un navigateur) : toujours 429 avec le texte
+    r = await c.get("/emby/Items/102/Download?api_key=T-alice",
+                    headers={"User-Agent": "Dalvik/2.1.0"})
+    assert r.status == 429
+    await sock.close()
     release.set()

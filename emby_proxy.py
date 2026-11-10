@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.17"
+__version__ = "2.6.18"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -4654,7 +4654,7 @@ class EmbyProxy:
         if limit and item not in cur and len(cur) >= limit:
             if not cur:
                 self.downloads.pop(who, None)
-            return self._download_refused(request, limit)
+            return await self._download_refused(request, limit, tok)
         cur[item] = cur.get(item, 0) + 1
         try:
             return await self._proxy_http(request)
@@ -4665,7 +4665,7 @@ class EmbyProxy:
             if not cur:
                 self.downloads.pop(who, None)
 
-    def _download_refused(self, request, limit):
+    async def _download_refused(self, request, limit, tok=""):
         ip = request[CLIENT_IP]
         why = tr("Trop de téléchargements en même temps (%d au maximum) : "
                  "attends la fin d'un téléchargement.", self.cfg.language) % limit
@@ -4679,6 +4679,24 @@ class EmbyProxy:
         if c is not None:
             self.activity.event(c, "refused", "Refuse : telechargements simultanes, "
                                 "limite de %d atteinte" % limit, merge=60)
+        # Navigateur : un telechargement refuse avec une erreur fait afficher
+        # au navigateur SA page d'erreur ("probleme sur ce site, 429") a la
+        # place d'Emby. Le message est donc affiche dans Emby lui-meme (par sa
+        # connexion en direct) et le navigateur reste ou il est (204).
+        if "Mozilla" in request.headers.get("User-Agent", "") and tok and self.activity:
+            devs = {x.device_id for x in self.activity.clients.values()
+                    if x.token == tok and x.device_id and self.ws_by_device.get(x.device_id)}
+            sent = 0
+            for dev in devs:
+                try:
+                    sent += await self.push_message(dev, "Emby Proxy", why, 12000,
+                                                    route="command")
+                except Exception:
+                    log.exception("message de telechargement refuse")
+            if sent:
+                self._note_request(c, request, 204, time.time(),
+                                   "  [refus du proxy, message affiche dans Emby]")
+                return web.Response(status=204)
         self._note_request(c, request, 429, time.time(), "  [refus du proxy]")
         return web.Response(status=429, text=why, headers={"Retry-After": "60"})
 
