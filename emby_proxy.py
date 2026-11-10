@@ -64,9 +64,36 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector, WSMsgType, web
 from aiohttp import ClientError, WSServerHandshakeError
 
 from emby_proxy_lang import js_table, tr
+
+
+def _accept_duplicate_content_type():
+    """L'appli Emby for Android TV (Shield, TV Sony...) envoie DEUX en-tetes
+    Content-Type identiques sur ses requetes JSON (demande de lecture
+    PlaybackInfo, capacites de l'appareil) : defaut connu de sa bibliotheque
+    reseau. Emby l'accepte ; aiohttp, lui, rejette la requete (400 "Duplicate
+    'Content-Type' header") avant meme qu'elle n'arrive au proxy : ecran noir a
+    la lecture, et rien dans les journaux.
+    Le proxy lit donc les requetes avec l'analyseur Python d'aiohttp, ou
+    Content-Type peut etre repete (un seul est transmis a Emby). Les en-tetes
+    qui servent aux attaques par requetes cachees (Content-Length,
+    Transfer-Encoding, Host) restent refuses en double.
+    -> True si c'est en place."""
+    try:
+        from aiohttp import http_parser, web_protocol
+        single = getattr(http_parser, "SINGLETON_HEADERS", None)
+        if single is None:
+            return True                       # version sans ce controle
+        http_parser.SINGLETON_HEADERS = frozenset(single) - {"content-type"}
+        web_protocol.HttpRequestParser = http_parser.HttpRequestParserPy
+        return True
+    except Exception:                         # aiohttp reorganise : dit au demarrage
+        return False
+
+
+DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.15"
+__version__ = "2.6.16"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3287,6 +3314,35 @@ class _NotifyingStore:
                 log.exception("alerte quota")
 
 
+class _BadRequestLog(logging.Handler):
+    """Requete refusee par le serveur HTTP lui-meme (mal formee) : aucune
+    fiche, aucun journal du proxy ne la verrait. Notee ici."""
+
+    def __init__(self, proxy):
+        super().__init__(logging.WARNING)
+        self.proxy = proxy
+
+    def emit(self, record):
+        try:
+            exc = record.exc_info[1] if record.exc_info else None
+            if exc is None or exc.__class__.__name__ not in (
+                    "BadHttpMessage", "BadStatusLine", "LineTooLong", "InvalidHeader",
+                    "BadHttpMethod", "InvalidURLError", "ContentLengthError",
+                    "TransferEncodingError", "PayloadEncodingError"):
+                return
+            why = _safe(" ".join(str(getattr(exc, "message", exc)).split()), 120)
+            p = self.proxy
+            p.bad_requests += 1
+            p.warnings["badreq"] = (
+                "%d requete(s) mal formee(s) refusee(s) avant le proxy (la derniere : "
+                "%s, %s). Une appli qui n'arrive pas a lire peut en etre la cause."
+                % (p.bad_requests, _safe(record.getMessage(), 60), why))
+            log.warning("requete mal formee refusee (%s) : %s",
+                        _safe(record.getMessage(), 60), why)
+        except Exception:
+            pass
+
+
 # =====================================================================
 #  PROXY
 # =====================================================================
@@ -3459,6 +3515,18 @@ class EmbyProxy:
                 "HTTP sans chiffrement : si le proxy est ouvert sur Internet, les "
                 "mots de passe circulent en clair. Configure tls_cert / tls_key, "
                 "ou place un relais HTTPS devant (et renseigne trusted_proxies).")
+        if not DUP_CONTENT_TYPE_OK:
+            self.warnings["dupct"] = (
+                "Cette version d'aiohttp ne permet plus d'accepter les requetes "
+                "de l'appli Emby for Android TV (deux en-tetes Content-Type) : "
+                "la lecture y restera sur un ecran noir.")
+        # requetes rejetees avant meme d'arriver au proxy (mal formees) :
+        # jamais silencieuses, dites dans le journal et dans la page
+        self.bad_requests = 0
+        srv = logging.getLogger("aiohttp.server")
+        for h in [h for h in srv.handlers if isinstance(h, _BadRequestLog)]:
+            srv.removeHandler(h)
+        srv.addHandler(_BadRequestLog(self))
         if not cfg.status_password:
             cfg.status_password = secrets.token_urlsafe(12)   # jamais sans mot de passe
         self.alerts = Alerts(cfg)
