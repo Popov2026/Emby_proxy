@@ -158,3 +158,80 @@ async def test_navigateur_message_dans_emby_sans_page_d_erreur(env):
     assert r.status == 429
     await sock.close()
     release.set()
+
+
+async def test_quota_en_nombre_par_periode(env):
+    """2 films par periode : le 3e est refuse ; un film deja telecharge peut
+    etre repris ; un autre compte a son propre compteur ; garde sur disque."""
+    p, c, release = env
+    release.set()                                            # telechargements courts
+    p.cfg.max_downloads, p.cfg.dl_count, p.cfg.dl_period = 0, 2, "weekly"
+    for item in ("101", "102"):
+        r = await c.get("/emby/Items/%s/Download?api_key=T-alice" % item)
+        assert r.status == 200 and len(await r.read()) == 1000
+    r = await c.get("/emby/Items/103/Download?api_key=T-alice")
+    assert r.status == 429 and "2 film(s) par semaine" in await r.text()
+    r = await c.get("/emby/Items/101/Download?api_key=T-alice")   # reprise : pas compte
+    assert r.status == 200
+    await r.read()
+    r = await c.get("/emby/Items/103/Download?api_key=T-bob")
+    assert r.status == 200
+    await r.read()
+    snap = p.dlquota.snapshot(p.cfg, {"a" * 32: "alice", "b" * 32: "bob"})
+    rows = {u["user"]: u for u in snap["users"]}
+    assert rows["alice"]["count"] == 2 and rows["alice"]["over"]
+    assert rows["alice"]["bytes"] == 3000 and rows["bob"]["count"] == 1
+    assert not rows["bob"]["over"]
+    # redemarrage : compteurs relus
+    q2 = ep.DownloadQuota(p.dlquota.path)
+    assert q2.refusal(p.cfg, "a" * 32, "104") == ("count", 2)
+    # nouvelle periode : zero
+    assert q2.refusal(p.cfg, "a" * 32, "104", now=__import__("time").time() + 8 * 86400) is None
+    assert any("Quota de telechargement atteint" in e.get("detail", "")
+               for e in p.seclog.events)
+
+
+async def test_quota_en_go_et_page(env):
+    p, c, release = env
+    release.set()
+    p.cfg.max_downloads, p.cfg.dl_count = 0, 0
+    p.cfg.dl_gb, p.cfg.dl_period = 2.5e-6, "daily"            # 2500 octets
+    for item in ("101", "102", "103"):                       # 3 x 1000 octets
+        r = await c.get("/emby/Items/%s/Download?api_key=T-alice" % item)
+        assert r.status == 200
+        await r.read()
+    r = await c.get("/emby/Items/104/Download?api_key=T-alice")
+    assert r.status == 429 and "par jour" in await r.text()
+    r = await c.get("/emby/Videos/104/stream.mkv?api_key=T-alice")   # lecture : libre
+    assert r.status == 200
+    await r.read()
+    assert p.dlquota.users["a" * 32]["bytes"] == 3000          # la lecture ne compte pas
+    await login(c, p)
+    d = await (await c.get("/__proxy/security.json")).json()
+    assert d["downloads"]["period"] == "daily"
+    assert d["downloads"]["users"][0]["count"] == 3 and d["downloads"]["users"][0]["over"]
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    r = await c.post("/__proxy/settings", headers=own, json={
+        "password": p.cfg.status_password,
+        "values": {"security.download_quota_period": "MONTHLY",
+                   "security.download_quota_count": "30",
+                   "security.download_quota_gb": "100.5"}})
+    assert (await r.json())["ok"], await r.text()
+    assert (p.cfg.dl_period, p.cfg.dl_count, p.cfg.dl_gb) == ("monthly", 30, 100.5)
+    r = await c.post("/__proxy/settings", headers=own, json={
+        "password": p.cfg.status_password,
+        "values": {"security.download_quota_period": "yearly"}})
+    assert r.status == 400
+    html = await (await c.get("/__proxy/")).text()
+    assert "Téléchargements de la période" in html
+    assert "Quota : volume en Go par période" in html
+
+
+def test_cles_de_periode():
+    import time
+    t = time.mktime((2026, 11, 10, 12, 0, 0, 0, 0, -1))       # mardi 10/11/2026
+    k = ep.DownloadQuota.period_key
+    assert k("daily", t) == "2026-11-10" and k("monthly", t) == "2026-11"
+    assert k("weekly", t) == "2026-W46"
+    assert k("weekly", t + 5 * 86400) == "2026-W46"          # dimanche : meme semaine
+    assert k("weekly", t + 6 * 86400) == "2026-W47"          # lundi : semaine suivante

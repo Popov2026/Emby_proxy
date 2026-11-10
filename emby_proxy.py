@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.18"
+__version__ = "2.6.19"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -144,6 +144,9 @@ DEFAULTS = {
         "rate_per_second": "100",
         "rate_burst": "400",
         "max_downloads_per_user": "2",
+        "download_quota_period": "MONTHLY",
+        "download_quota_count": "0",
+        "download_quota_gb": "0",
         "trusted_proxies": "",
         "require_relay": "true",
     },
@@ -552,6 +555,10 @@ class Settings:
         self.rate = s.getfloat("rate_per_second")
         self.burst = s.getfloat("rate_burst")
         self.max_downloads = max(0, s.getint("max_downloads_per_user"))
+        per = s.get("download_quota_period").strip().lower()
+        self.dl_period = per if per in ("daily", "weekly", "monthly") else "monthly"
+        self.dl_count = max(0, s.getint("download_quota_count"))
+        self.dl_gb = max(0.0, s.getfloat("download_quota_gb"))
         self.trusted = _nets(s.get("trusted_proxies"))
         self.require_relay = s.getboolean("require_relay")
         # listes d'adresses a bloquer : nom -> adresse de la liste
@@ -723,6 +730,12 @@ rate_burst = 400
 # Films qu'un meme compte peut telecharger en meme temps (0 = sans limite).
 # La lecture n'est pas concernee.
 max_downloads_per_user = 2
+# Quota de telechargement par compte, sur une periode : DAILY (jour), WEEKLY
+# (semaine) ou MONTHLY (mois). Nombre de films et/ou volume en Go ; 0 = sans
+# limite. La lecture n'est pas concernee.
+download_quota_period = MONTHLY
+download_quota_count = 0
+download_quota_gb = 0
 # Relais HTTPS (proxy inverse) place devant ce proxy : ses adresses ici.
 # L'adresse reelle du visiteur est alors lue dans X-Forwarded-For.
 # Preconfigure pour un relais installe sur la meme machine (127.0.0.1).
@@ -962,6 +975,8 @@ CONFIG_SCHEMA = [
          "help": "Une page d'accueil Emby charge facilement 100 vignettes d'un coup."},
         {"sec": "security", "key": "rate_burst", "type": "float", "min": 1,
          "max": 100000, "live": True, "label": "Pointe autorisée (requêtes)", "help": ""},
+    ]},
+    {"id": "downloads", "title": "Téléchargements", "fields": [
         {"sec": "security", "key": "max_downloads_per_user", "type": "int", "min": 0,
          "max": 1000, "live": True,
          "label": "Téléchargements simultanés par compte (0 = sans limite)",
@@ -969,6 +984,24 @@ CONFIG_SCHEMA = [
                  "(bouton Télécharger d'Emby, téléchargements des applis). Au-delà, "
                  "le téléchargement suivant est refusé jusqu'à la fin d'un autre. "
                  "La lecture n'est pas concernée."},
+        {"sec": "security", "key": "download_quota_period", "type": "choice",
+         "choices": ["DAILY", "WEEKLY", "MONTHLY"], "live": True,
+         "choice_labels": ["par jour", "par semaine (du lundi au dimanche)",
+                           "par mois"],
+         "label": "Quota de téléchargement : période",
+         "help": "Le compteur de chaque compte repart de zéro au début de chaque "
+                 "période. Suivi : onglet Sécurité, « Téléchargements de la période »."},
+        {"sec": "security", "key": "download_quota_count", "type": "int", "min": 0,
+         "max": 100000, "live": True,
+         "label": "Quota : nombre de films par période (0 = sans limite)",
+         "help": "Un film téléchargé plusieurs fois, ou repris après une coupure, "
+                 "ne compte qu'une fois dans la période."},
+        {"sec": "security", "key": "download_quota_gb", "type": "float", "min": 0,
+         "max": 1000000, "live": True,
+         "label": "Quota : volume en Go par période (0 = sans limite)",
+         "help": "Volume réellement envoyé. Une fois le volume atteint, les "
+                 "téléchargements suivants sont refusés ; celui qui est en cours "
+                 "se termine. Les deux quotas peuvent être utilisés ensemble."},
     ]},
     {"id": "activity", "title": "Activité et journaux", "fields": [
         {"sec": "activity", "key": "enabled", "type": "bool", "live": False,
@@ -1059,7 +1092,7 @@ SCHEMA_FIELDS = {"%s.%s" % (f["sec"], f["key"]): f
 LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "ttl_untagged", "serve_stale", "allowed", "denied", "local",
               "block_admin", "admin_mode", "login_max", "login_window", "ban_seconds", "rate",
-              "burst", "max_downloads", "trusted", "require_relay", "activity_idle_minutes",
+              "burst", "max_downloads", "dl_period", "dl_count", "dl_gb", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
               "language", "forward_ip", "landing_page", "quota_delivery",
@@ -3326,6 +3359,83 @@ class _NotifyingStore:
                 log.exception("alerte quota")
 
 
+class DownloadQuota:
+    """Telechargements de chaque compte sur la periode en cours (jour, semaine
+    ou mois) : films differents et octets envoyes. Garde sur disque."""
+
+    def __init__(self, path):
+        self.path = Path(path) if path else None
+        self.key = ""                 # periode en cours ("2026-11", "2026-W46"...)
+        self.users = {}               # compte -> {"items": [..], "bytes": n, "name": ""}
+        self._dirty = False
+        if self.path is not None:
+            try:
+                d = json.loads(self.path.read_text(encoding="utf-8"))
+                self.key = str(d.get("key", ""))
+                for who, u in (d.get("users") or {}).items():
+                    self.users[str(who)] = {"items": [str(x) for x in u.get("items", [])],
+                                            "bytes": int(u.get("bytes", 0)),
+                                            "name": str(u.get("name", ""))}
+            except (OSError, ValueError, TypeError, AttributeError):
+                self.key, self.users = "", {}
+
+    @staticmethod
+    def period_key(period, now=None):
+        t = time.localtime(now if now is not None else time.time())
+        return time.strftime({"daily": "%Y-%m-%d", "weekly": "%G-W%V"}.get(
+            period, "%Y-%m"), t)
+
+    def _roll(self, period, now=None):
+        k = period + ":" + self.period_key(period, now)
+        if k != self.key:             # nouvelle periode (ou periode changee) : zero
+            self.key, self.users, self._dirty = k, {}, True
+
+    def refusal(self, cfg, who, item, now=None):
+        """-> ("count" | "gb", limite) si le quota est atteint, sinon None."""
+        self._roll(cfg.dl_period, now)
+        u = self.users.get(who)
+        if u is None:
+            return None
+        if cfg.dl_gb and u["bytes"] >= cfg.dl_gb * 1e9:
+            return ("gb", cfg.dl_gb)
+        if cfg.dl_count and item not in u["items"] and len(u["items"]) >= cfg.dl_count:
+            return ("count", cfg.dl_count)
+        return None
+
+    def start(self, cfg, who, item, name="", now=None):
+        self._roll(cfg.dl_period, now)
+        u = self.users.setdefault(who, {"items": [], "bytes": 0, "name": ""})
+        if name:
+            u["name"] = name
+        if item not in u["items"]:
+            u["items"].append(item)
+            self._dirty = True
+        return u
+
+    def flush(self):
+        if not self._dirty or self.path is None:
+            return
+        self._dirty = False
+        try:
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"key": self.key, "users": self.users}),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            log.warning("quota de telechargement non enregistre : %s", exc)
+
+    def snapshot(self, cfg, names=None):
+        self._roll(cfg.dl_period)
+        rows = [{"user": (names or {}).get(who) or u["name"] or who[:12],
+                 "count": len(u["items"]), "bytes": u["bytes"],
+                 "over": bool((cfg.dl_gb and u["bytes"] >= cfg.dl_gb * 1e9) or
+                              (cfg.dl_count and len(u["items"]) >= cfg.dl_count))}
+                for who, u in self.users.items()]
+        rows.sort(key=lambda r: -r["bytes"])
+        return {"period": cfg.dl_period, "max_count": cfg.dl_count,
+                "max_gb": cfg.dl_gb, "users": rows}
+
+
 class _BadRequestLog(logging.Handler):
     """Requete refusee par le serveur HTTP lui-meme (mal formee) : aucune
     fiche, aucun journal du proxy ne la verrait. Notee ici."""
@@ -3548,6 +3658,7 @@ class EmbyProxy:
         self.quota.stopper = self._quota_stopper
         self.ws_by_device = {}          # appareil -> connexions WebSocket ouvertes
         self.downloads = {}             # compte -> {film: connexions en cours}
+        self.dlquota = DownloadQuota(Path(cfg.path).parent / "emby_downloads.json")
         self.auth_ips = {}              # adresse -> fin de validite (utilisateur connecte)
         self.admin_cache = {}           # utilisateur -> (administrateur ?, fin)
         self.anon_hits = {}             # adresse -> requetes refusees sans connexion
@@ -4654,31 +4765,54 @@ class EmbyProxy:
         if limit and item not in cur and len(cur) >= limit:
             if not cur:
                 self.downloads.pop(who, None)
-            return await self._download_refused(request, limit, tok)
+            return await self._download_refused(request, tok, tr(
+                "Trop de téléchargements en même temps (%d au maximum) : "
+                "attends la fin d'un téléchargement.", self.cfg.language) % limit,
+                "Telechargements simultanes : limite de %d atteinte" % limit)
+        over = self.dlquota.refusal(self.cfg, who, item)
+        if over:
+            if not cur:
+                self.downloads.pop(who, None)
+            per = tr({"daily": "par jour", "weekly": "par semaine",
+                      "monthly": "par mois"}[self.cfg.dl_period], self.cfg.language)
+            if over[0] == "gb":
+                why = tr("Quota de téléchargement atteint : %s Go %s.",
+                         self.cfg.language) % ("%g" % over[1], per)
+            else:
+                why = tr("Quota de téléchargement atteint : %d film(s) %s.",
+                         self.cfg.language) % (over[1], per)
+            return await self._download_refused(
+                request, tok, why, "Quota de telechargement atteint (%s %s, %s)" % (
+                    "%g" % over[1], "Go" if over[0] == "gb" else "films",
+                    self.cfg.dl_period))
+        name = self.activity.info.users.get(uid, "") if self.activity and uid else ""
+        use = self.dlquota.start(self.cfg, who, item, name)
+        acc = request["dl_acc"] = [0]
         cur[item] = cur.get(item, 0) + 1
         try:
             return await self._proxy_http(request)
         finally:
+            if acc[0]:
+                use["bytes"] += acc[0]
+                self.dlquota._dirty = True
+            self.dlquota.flush()
             cur[item] -= 1
             if cur[item] <= 0:
                 cur.pop(item, None)
             if not cur:
                 self.downloads.pop(who, None)
 
-    async def _download_refused(self, request, limit, tok=""):
+    async def _download_refused(self, request, tok, why, detail):
         ip = request[CLIENT_IP]
-        why = tr("Trop de téléchargements en même temps (%d au maximum) : "
-                 "attends la fin d'un téléchargement.", self.cfg.language) % limit
         self.guard.blocked += 1
         f = Activity._auth_fields(request)
         c = self._device_card(request)
         self.seclog.add("refused", ip, self.guard.is_local(ip),
                         user=c.user_name if c is not None else "",
                         client=f.get("client", ""), device=f.get("device", ""),
-                        detail="Telechargements simultanes : limite de %d atteinte" % limit)
+                        detail=detail)
         if c is not None:
-            self.activity.event(c, "refused", "Refuse : telechargements simultanes, "
-                                "limite de %d atteinte" % limit, merge=60)
+            self.activity.event(c, "refused", "Refuse : " + detail, merge=60)
         # Navigateur : un telechargement refuse avec une erreur fait afficher
         # au navigateur SA page d'erreur ("probleme sur ce site, 429") a la
         # place d'Emby. Le message est donc affiche dans Emby lui-meme (par sa
@@ -4794,10 +4928,13 @@ class EmbyProxy:
             buf = bytearray() if tee and up.status == 200 and "json" in \
                 up.headers.get("Content-Type", "") else None
             if request.method != "HEAD":
+                dl = request.get("dl_acc") if up.status in (200, 206) else None
                 async for chunk in up.content.iter_chunked(CHUNK):
                     await resp.write(chunk)
                     if c is not None:
                         c.bytes_out += len(chunk)
+                    if dl is not None:
+                        dl[0] += len(chunk)     # quota de telechargement en Go
                     if buf is not None and len(buf) < 8_000_000:
                         buf.extend(chunk)
             await resp.write_eof()
@@ -6069,6 +6206,8 @@ class EmbyProxy:
     async def security_json(self, request):
         snap = self.seclog.snapshot(self.guard)
         snap["blocklists"] = self.blocklists.snapshot()
+        snap["downloads"] = self.dlquota.snapshot(
+            self.cfg, self.activity.info.users if self.activity else {})
         return web.json_response(snap)
 
     async def blocklists_refresh(self, request):
@@ -6394,6 +6533,9 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   <div class="sub">Listes publiques d'adresses d'attaquants et d'hébergeurs, mises à jour toutes les 6 h. Choix des listes et exceptions : onglet Configuration, partie Sécurité.</div>
   <div class="bar2"><button class="ghost" id="blRefresh">Mettre à jour maintenant</button></div>
   <div class="tw"><table><thead><tr><th>Liste</th><th>Réseaux</th><th>Mise à jour</th><th>État</th></tr></thead><tbody id="bls"></tbody></table></div>
+  <h2>Téléchargements de la période</h2>
+  <div class="sub" id="dlSum"></div>
+  <div class="tw"><table><thead><tr><th>Compte</th><th>Films téléchargés</th><th>Volume envoyé</th><th>État</th></tr></thead><tbody id="dls"></tbody></table></div>
   <h2 id="devH">Appareils enregistrés dans Emby</h2>
   <div class="sub">Chaque appareil qui s'est connecté à Emby, avec le compte et la dernière activité. Supprimer un appareil annule sa connexion : il devra retaper le mot de passe.</div>
   <div class="bar2"><select id="dUser"><option value="">Tous les comptes</option></select>
@@ -6719,6 +6861,13 @@ function renderSec(d){
     tr.append(el('td',null,T(b.label)),el('td',null,String(b.count)),el('td',null,b.updated?day(b.updated):'-'),
       el('td',b.error?'sub':'',b.error?ko(b.error):(b.count?T('✔ chargée'):T('en attente du téléchargement'))));return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune liste choisie.');td.colSpan=4;tr.append(td);return tr})()]));
+  const dq=d.downloads||{users:[]},go=b=>(b/1e9).toFixed(b<1e10?2:1)+' Go';
+  $('dlSum').textContent=T({daily:'Période : la journée',weekly:'Période : la semaine',monthly:'Période : le mois'}[dq.period]||'')+' · '+
+    (dq.max_count?TF('quota : {0} film(s)',dq.max_count):T('pas de quota en nombre'))+' · '+(dq.max_gb?TF('quota : {0} Go',dq.max_gb):T('pas de quota en Go'));
+  $('dls').replaceChildren(...(dq.users.length?dq.users.map(u=>{const tr=el('tr');
+    tr.append(el('td',null,u.user),el('td',null,u.count+(dq.max_count?' / '+dq.max_count:'')),el('td',null,go(u.bytes)+(dq.max_gb?' / '+dq.max_gb+' Go':'')),
+      el('td',u.over?'':'sub',u.over?T('⛔ quota atteint'):T('dans le quota')));return tr})
+    :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun téléchargement sur la période.');td.colSpan=4;tr.append(td);return tr})()]));
   $('topfail').textContent=d.top_fail_ips.length?d.top_fail_ips.map(([ip,c])=>ip+' : '+c).join('   ·   '):T('aucune');
   renderSecFeed()}
 function renderSecFeed(){
