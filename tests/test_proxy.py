@@ -244,7 +244,9 @@ async def test_api_body_entetes_et_ip(env):
     r = await c.post("/emby/Sessions/Playing", data=b"payload")
     assert r.status == 201 and await r.read() == b"payload"
     assert r.headers["X-Echo"] == "1"
-    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    # reponse de l'API : telle qu'Emby l'envoie, aucun en-tete ajoute
+    for k in ("X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy"):
+        assert k not in r.headers
 
 
 async def test_video_range(env):

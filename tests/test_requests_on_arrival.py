@@ -38,6 +38,16 @@ async def env(aiohttp_server, tmp_path):
     app = web.Application()
     app.router.add_post("/emby/Users/AuthenticateByName", auth)
     app.router.add_post("/emby/Items/{id}/PlaybackInfo", hang)
+    app.router.add_get("/emby/Videos/{id}/stream.mkv", hang)
+
+    async def m3u8(request):
+        return web.Response(text="#EXTM3U\nmain.m3u8?api_key=GOOD\n",
+                            content_type="application/x-mpegURL")
+
+    async def page(request):
+        return web.Response(text="<html></html>", content_type="text/html")
+    app.router.add_get("/emby/videos/{id}/master.m3u8", m3u8)
+    app.router.add_get("/web/index.html", page)
     app.router.add_route("*", "/{tail:.*}", ok)
     srv = await aiohttp_server(app)
     cfg = ep.Settings(tmp_path / "absent.ini", overrides={
@@ -118,3 +128,35 @@ async def test_cle_refusee_jamais_dans_la_fiche_d_un_autre(env):
     r = await c.get("/emby/Users/%s/Items?Pirate=1" % UID, headers=bad)
     assert r.status == 401
     assert lines(p, "Pirate") == []
+
+
+async def test_flux_demande_par_le_lecteur_sans_s_annoncer(env):
+    """Le lecteur video d'une appli demande le flux sans cle ni nom d'appareil :
+    visible tout de suite dans la fiche des appareils de cette adresse."""
+    p, c, h, release = env
+    hp = {"X-Forwarded-For": FRIEND, "X-Forwarded-Proto": "https",
+          "User-Agent": "ExoPlayerLib/2.19"}
+    t = asyncio.ensure_future(c.get("/emby/Videos/9/stream.mkv?Static=true", headers=hp))
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if lines(p, "stream.mkv"):
+            break
+    rq = lines(p, "stream.mkv")
+    assert len(rq) == 1 and rq[0]["s"] is None and "hors fiche : ExoPlayerLib" in rq[0]["p"]
+    release.set()
+    await t
+    assert len(lines(p, "stream.mkv")) <= 1                    # jamais en double
+
+
+async def test_flux_et_api_sans_en_tete_ajoute(env):
+    """Playlists HLS, video, API : exactement les en-tetes d'Emby (un lecteur
+    video ne doit voir aucune difference) ; pages : protections du navigateur."""
+    p, c, h, _ = env
+    added = ("X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy")
+    r = await c.get("/emby/videos/9/master.m3u8?api_key=GOOD", headers=h)
+    assert r.status == 200 and r.headers["Content-Type"].startswith("application/x-mpegURL")
+    assert not [k for k in added if k in r.headers]
+    r = await c.get("/emby/Users/%s/Items" % UID, headers=h)
+    assert not [k for k in added if k in r.headers]
+    r = await c.get("/web/index.html", headers=h)
+    assert all(k in r.headers for k in added)

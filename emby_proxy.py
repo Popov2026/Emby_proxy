@@ -66,7 +66,7 @@ from aiohttp import ClientError, WSServerHandshakeError
 from emby_proxy_lang import js_table, tr
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.14"
+__version__ = "2.6.15"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2131,6 +2131,7 @@ class Activity:
         self.clients = {}
         self.feed = deque(maxlen=3000)
         self.token_user = {}        # jeton -> uid
+        self.ip_recent = {}         # adresse -> requetes arrivees hors fiche
         self.log_path = cfg.activity_log
         self._log_lock = threading.Lock()
         self.on_delete = None
@@ -2631,7 +2632,10 @@ class Activity:
                             "text": self.render(e["text"], e["item"])}
                            for e in list(c.events)[-limit_events:]][::-1],
                 "recent": [{"t": round(r[0], 1), "m": r[1], "p": r[2], "s": r[3],
-                            "ms": r[4]} for r in list(c.recent)][::-1]})
+                            "ms": r[4]} for r in sorted(
+                    list(c.recent) + list(self.ip_recent.get(
+                        self.guard.key(c.ip), ()) if c.ip else ()),
+                    key=lambda r: r[0])][::-1][:140]})
         feed = []
         for e in list(self.feed)[-300:][::-1]:
             c = self.clients.get(e["client"])
@@ -3959,12 +3963,24 @@ class EmbyProxy:
         else:
             ok = self.auth_ips.get(self.guard.key(ip), 0) > time.time() \
                 or self.guard.is_local(ip)
-        card = self.activity.peek(request) if ok else None
-        if card is None:
+        if not ok:
             return
+        card = self.activity.peek(request)
         entry = [time.time(), _safe(request.method, 10),
                  redact(request.path_qs)[:160], None, None]
-        card.recent.append(entry)
+        if card is not None:
+            card.recent.append(entry)
+        else:
+            # pas (encore) de fiche : lecteur video d'une appli, qui demande le
+            # flux sans s'annoncer. Garde par adresse, montre dans les fiches
+            # de cette adresse (sinon invisible tant que le flux n'est pas fini)
+            entry[2] += "  [hors fiche : %s]" % _safe(
+                request.headers.get("User-Agent", "") or "sans nom", 50)
+            off = self.activity.ip_recent.setdefault(self.guard.key(ip), deque(maxlen=60))
+            off.append(entry)
+            request["rq_off"] = off
+            if len(self.activity.ip_recent) > 500:
+                self.activity.ip_recent.pop(next(iter(self.activity.ip_recent)))
         request["rq_entry"], request["rq_base"] = entry, entry[2]
 
     def _rq_end(self, request, status, why=""):
@@ -4153,9 +4169,16 @@ class EmbyProxy:
 
     async def add_security_headers(self, request, response):
         h = response.headers
-        h.setdefault("X-Content-Type-Options", "nosniff")
-        h.setdefault("Referrer-Policy", "same-origin")
-        h.setdefault("X-Frame-Options", "SAMEORIGIN")
+        # Protections du navigateur : sur les pages, scripts et styles
+        # seulement. Les reponses de l'API et les flux (playlists HLS, video,
+        # images) partent telles qu'Emby les envoie : un lecteur video
+        # (Xbox, Android TV...) ne doit voir aucune difference avec Emby.
+        ct = h.get("Content-Type", "").split(";")[0].strip().lower()
+        if ct in ("text/html", "text/css", "text/javascript", "application/javascript",
+                  "application/x-javascript", "text/plain", ""):
+            h.setdefault("X-Content-Type-Options", "nosniff")
+            h.setdefault("Referrer-Policy", "same-origin")
+            h.setdefault("X-Frame-Options", "SAMEORIGIN")
         h.pop("Server", None)
         h.pop("X-Powered-By", None)
         if self.cfg.tls_cert:
@@ -4504,8 +4527,20 @@ class EmbyProxy:
             return
         entry = request.get("rq_entry")
         if entry is not None:            # ligne deja notee a l'arrivee
+            off = request.get("rq_off")
+            if off is not None:          # notee hors fiche : la fiche est connue
+                request["rq_off"] = None
+                try:
+                    off.remove(entry)
+                except ValueError:
+                    pass
+                base = entry[2].split("  [hors fiche : ")[0]
+                entry[2] = base + entry[2][len(request["rq_base"]):]
+                request["rq_base"] = base
+                c.recent.append(entry)
             if "WebSocket" in note:      # etat du WebSocket : sur la meme ligne
                 entry[2] = request["rq_base"] + note
+                entry[3], entry[4] = status, int((time.time() - t0) * 1000)
             else:
                 request["rq_note"] = request.get("rq_note", "") + note
             return
