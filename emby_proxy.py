@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.16"
+__version__ = "2.6.17"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -143,6 +143,7 @@ DEFAULTS = {
         "ban_minutes": "60",
         "rate_per_second": "100",
         "rate_burst": "400",
+        "max_downloads_per_user": "2",
         "trusted_proxies": "",
         "require_relay": "true",
     },
@@ -550,6 +551,7 @@ class Settings:
         self.ban_seconds = s.getfloat("ban_minutes") * 60
         self.rate = s.getfloat("rate_per_second")
         self.burst = s.getfloat("rate_burst")
+        self.max_downloads = max(0, s.getint("max_downloads_per_user"))
         self.trusted = _nets(s.get("trusted_proxies"))
         self.require_relay = s.getboolean("require_relay")
         # listes d'adresses a bloquer : nom -> adresse de la liste
@@ -718,6 +720,9 @@ ban_minutes = 60
 # facilement 100 vignettes d'un coup : garder une marge large).
 rate_per_second = 100
 rate_burst = 400
+# Films qu'un meme compte peut telecharger en meme temps (0 = sans limite).
+# La lecture n'est pas concernee.
+max_downloads_per_user = 2
 # Relais HTTPS (proxy inverse) place devant ce proxy : ses adresses ici.
 # L'adresse reelle du visiteur est alors lue dans X-Forwarded-For.
 # Preconfigure pour un relais installe sur la meme machine (127.0.0.1).
@@ -957,6 +962,13 @@ CONFIG_SCHEMA = [
          "help": "Une page d'accueil Emby charge facilement 100 vignettes d'un coup."},
         {"sec": "security", "key": "rate_burst", "type": "float", "min": 1,
          "max": 100000, "live": True, "label": "Pointe autorisée (requêtes)", "help": ""},
+        {"sec": "security", "key": "max_downloads_per_user", "type": "int", "min": 0,
+         "max": 1000, "live": True,
+         "label": "Téléchargements simultanés par compte (0 = sans limite)",
+         "help": "Nombre de films qu'un même compte peut télécharger en même temps "
+                 "(bouton Télécharger d'Emby, téléchargements des applis). Au-delà, "
+                 "le téléchargement suivant est refusé jusqu'à la fin d'un autre. "
+                 "La lecture n'est pas concernée."},
     ]},
     {"id": "activity", "title": "Activité et journaux", "fields": [
         {"sec": "activity", "key": "enabled", "type": "bool", "live": False,
@@ -1047,7 +1059,7 @@ SCHEMA_FIELDS = {"%s.%s" % (f["sec"], f["key"]): f
 LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "ttl_untagged", "serve_stale", "allowed", "denied", "local",
               "block_admin", "admin_mode", "login_max", "login_window", "ban_seconds", "rate",
-              "burst", "trusted", "require_relay", "activity_idle_minutes",
+              "burst", "max_downloads", "trusted", "require_relay", "activity_idle_minutes",
               "activity_keep_hours", "log_days", "record_searches",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
               "language", "forward_ip", "landing_page", "quota_delivery",
@@ -3535,6 +3547,7 @@ class EmbyProxy:
         self.quota.pusher = self._quota_pusher
         self.quota.stopper = self._quota_stopper
         self.ws_by_device = {}          # appareil -> connexions WebSocket ouvertes
+        self.downloads = {}             # compte -> {film: connexions en cours}
         self.auth_ips = {}              # adresse -> fin de validite (utilisateur connecte)
         self.admin_cache = {}           # utilisateur -> (administrateur ?, fin)
         self.anon_hits = {}             # adresse -> requetes refusees sans connexion
@@ -4627,6 +4640,49 @@ class EmbyProxy:
         c.recent.append(line)
 
     async def proxy_http(self, request):
+        """Telechargements : pas plus de max_downloads films a la fois par
+        compte (plusieurs connexions pour le meme film comptent pour un)."""
+        m = request.method == "GET" and RE_DOWNLOAD.match(npath(request))
+        if not m:
+            return await self._proxy_http(request)
+        tok = Activity._auth_fields(request).get("token", "")
+        uid = self.activity.token_user.get(tok, "") if self.activity and tok else ""
+        who = uid or "ip:" + self.guard.key(request[CLIENT_IP])
+        item = m.group("item")
+        cur = self.downloads.setdefault(who, {})
+        limit = getattr(self.cfg, "max_downloads", 0)
+        if limit and item not in cur and len(cur) >= limit:
+            if not cur:
+                self.downloads.pop(who, None)
+            return self._download_refused(request, limit)
+        cur[item] = cur.get(item, 0) + 1
+        try:
+            return await self._proxy_http(request)
+        finally:
+            cur[item] -= 1
+            if cur[item] <= 0:
+                cur.pop(item, None)
+            if not cur:
+                self.downloads.pop(who, None)
+
+    def _download_refused(self, request, limit):
+        ip = request[CLIENT_IP]
+        why = tr("Trop de téléchargements en même temps (%d au maximum) : "
+                 "attends la fin d'un téléchargement.", self.cfg.language) % limit
+        self.guard.blocked += 1
+        f = Activity._auth_fields(request)
+        c = self._device_card(request)
+        self.seclog.add("refused", ip, self.guard.is_local(ip),
+                        user=c.user_name if c is not None else "",
+                        client=f.get("client", ""), device=f.get("device", ""),
+                        detail="Telechargements simultanes : limite de %d atteinte" % limit)
+        if c is not None:
+            self.activity.event(c, "refused", "Refuse : telechargements simultanes, "
+                                "limite de %d atteinte" % limit, merge=60)
+        self._note_request(c, request, 429, time.time(), "  [refus du proxy]")
+        return web.Response(status=429, text=why, headers={"Retry-After": "60"})
+
+    async def _proxy_http(self, request):
         t_start = time.time()
         url = self.cfg.upstream + request.raw_path
         data = request.content if request.body_exists else None

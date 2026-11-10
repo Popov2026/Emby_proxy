@@ -397,6 +397,9 @@ EN = {
     "Bloquer l'administration d'Emby depuis Internet":
         "Block Emby administration from the Internet",
     "Mots de passe faux avant bannissement": "Wrong passwords before a ban",
+    "Téléchargements simultanés par compte (0 = sans limite)": "Simultaneous downloads per account (0 = no limit)",
+    "Nombre de films qu'un même compte peut télécharger en même temps (bouton Télécharger d'Emby, téléchargements des applis). Au-delà, le téléchargement suivant est refusé jusqu'à la fin d'un autre. La lecture n'est pas concernée.": "Number of films one account can download at the same time (Emby's Download button, app downloads). Beyond it, the next download is refused until another one ends. Playback is not affected.",
+    "Trop de téléchargements en même temps (%d au maximum) : attends la fin d'un téléchargement.": "Too many downloads at the same time (%d at most): wait for one to finish.",
     "… sur une durée de (minutes)": "… within (minutes)",
     "Durée du bannissement (minutes)": "Ban duration (minutes)",
     "Requêtes par seconde par adresse (0 = sans limite)":
