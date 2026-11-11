@@ -325,6 +325,41 @@ quotas, translation, log clearing, what the Android TV and iPhone apps send
 (form login, compression, server addresses, CORS, playback request), and the
 emby_quota engine itself.
 
+### Code signing policy
+
+Windows releases are built from this repository by GitHub Actions
+(`.github/workflows/release.yml`), on GitHub-hosted runners, and nowhere else.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).
+
+- Committers and reviewers: [Popov2026](https://github.com/Popov2026)
+- Approvers: [Popov2026](https://github.com/Popov2026)
+
+Only `emby_proxy.exe`, compiled from the source code of this repository, is
+signed. The service wrapper shipped in the archive (`EmbyProxy-service.exe`)
+is the unmodified [WinSW](https://github.com/winsw/winsw) release, published
+by its own authors.
+
+### Privacy policy
+
+This program will not transfer any information to other networked systems
+unless specifically requested by the user or the person installing or
+operating it.
+
+What it connects to, all of it set by the person operating it:
+- the Emby server it protects (address given in the settings);
+- the public lists of addresses to block (downloaded from GitHub), if they
+  are left enabled in the settings;
+- the mail server given in the settings, if e-mail alerts are enabled.
+
+It has no telemetry, no update check and no account. Activity, security and
+quota records stay in files on the machine where it runs.
+
+### License
+
+[MIT](LICENSE).
+
 ---
 
 ## Français
@@ -668,3 +703,42 @@ activité, configuration, alertes par mail (faux serveur SMTP), quotas,
 traduction, effacement des journaux, ce qu'envoient les applis Android TV et
 iPhone (connexion en formulaire, compression, adresses du serveur, CORS,
 demande de lecture), et le moteur emby_quota lui-même.
+
+### Politique de signature du code
+
+Les versions Windows sont compilées à partir de ce dépôt par GitHub Actions
+(`.github/workflows/release.yml`), sur les machines de GitHub, et nulle part
+ailleurs.
+
+Signature de code gratuite fournie par [SignPath.io](https://about.signpath.io),
+certificat de la [SignPath Foundation](https://signpath.org).
+
+- Auteurs et relecteurs : [Popov2026](https://github.com/Popov2026)
+- Approbateurs : [Popov2026](https://github.com/Popov2026)
+
+Seul `emby_proxy.exe`, compilé à partir du code source de ce dépôt, est
+signé. Le lanceur de service fourni dans l'archive (`EmbyProxy-service.exe`)
+est la version d'origine de [WinSW](https://github.com/winsw/winsw), publiée
+par ses propres auteurs.
+
+### Confidentialité
+
+Ce programme ne transmet aucune information à d'autres systèmes en réseau,
+sauf demande expresse de l'utilisateur ou de la personne qui l'installe ou
+l'exploite.
+
+Ce à quoi il se connecte, toujours selon les réglages de la personne qui
+l'exploite :
+- le serveur Emby qu'il protège (adresse donnée dans les réglages) ;
+- les listes publiques d'adresses à bloquer (téléchargées depuis GitHub), si
+  elles restent activées dans les réglages ;
+- le serveur de messagerie donné dans les réglages, si les alertes par mail
+  sont activées.
+
+Aucune télémétrie, aucune recherche de mise à jour, aucun compte. Les
+journaux d'activité, de sécurité et de quotas restent dans des fichiers sur
+la machine où il tourne.
+
+### Licence
+
+[MIT](LICENSE).

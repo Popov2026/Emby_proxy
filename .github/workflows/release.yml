@@ -39,6 +39,13 @@ jobs:
     runs-on: windows-latest
     env:
       WINSW_URL: https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe
+      # Signature du code (SignPath Foundation) : faite seulement pour une vraie
+      # version et une fois le secret SIGNPATH_API_TOKEN et la variable
+      # SIGNPATH_ORGANIZATION_ID renseignes dans le depot (Settings > Secrets
+      # and variables > Actions). Sans eux, la version sort non signee.
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      RELEASE: ${{ github.ref_type == 'tag' || github.event.inputs.version != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -53,6 +60,39 @@ jobs:
           pyinstaller --onefile --console --name emby_proxy
           --hidden-import emby_quota --hidden-import emby_quota_i18n --hidden-import emby_proxy_lang
           emby_proxy.py
+
+      # --- signature : l'exe compile ici est envoye a SignPath, qui verifie
+      # qu'il vient bien de cette compilation, puis le rend signe ---
+      - name: Signature - exe a signer
+        id: unsigned
+        if: env.RELEASE == 'true' && env.SIGNPATH_API_TOKEN != '' && env.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: emby_proxy-unsigned
+          path: dist/emby_proxy.exe
+          if-no-files-found: error
+
+      - name: Signature - demande a SignPath (attend l'approbation)
+        if: steps.unsigned.outcome == 'success'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'emby-proxy' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+
+      - name: Signature - exe signe a la place de l'autre, verifie
+        if: steps.unsigned.outcome == 'success'
+        shell: pwsh
+        run: |
+          Copy-Item signed\emby_proxy.exe dist\emby_proxy.exe -Force
+          $sig = Get-AuthenticodeSignature dist\emby_proxy.exe
+          Write-Host "Signature : $($sig.Status) - $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne "Valid") { throw "exe non signe ou signature invalide" }
 
       - name: Assemblage du dossier
         shell: pwsh
