@@ -17,6 +17,16 @@ INSTALLATION (once)
 The service then starts by itself with Windows, even when nobody is logged
 in, and restarts by itself after a crash.
 
+WINDOWS SHOWS A WARNING: THIS IS EXPECTED
+  The program is free and not signed with a paid certificate, so Windows
+  does not know its publisher. It is an "unknown publisher" warning, not a
+  virus detection. The source code is public and this file was built by
+  GitHub from it.
+  - "Windows protected your PC" (blue window): click "More info", then
+    "Run anyway".
+  - To avoid it on each file: BEFORE unzipping, right-click the zip >
+    Properties > tick "Unblock" > OK.
+
 ADDRESSES
   Users (Emby apps)  : http://THIS-PC-ADDRESS:8097
   Admin page         : http://THIS-PC-ADDRESS:8098/  (home network only)
@@ -71,6 +81,16 @@ INSTALLATION (une seule fois)
 
 Le service demarre ensuite tout seul avec Windows, meme sans session
 ouverte, et redemarre de lui-meme en cas de plantage.
+
+WINDOWS AFFICHE UN AVERTISSEMENT : C'EST NORMAL
+  Le programme est gratuit et n'est pas signe avec un certificat payant :
+  Windows ne connait donc pas son editeur. C'est un avertissement "editeur
+  inconnu", pas une detection de virus. Le code source est public et ce
+  fichier a ete compile par GitHub a partir de ce code.
+  - "Windows a protege votre ordinateur" (fenetre bleue) : clique sur
+    "Informations complementaires", puis "Executer quand meme".
+  - Pour l'eviter sur chaque fichier : AVANT de decompresser, clic droit sur
+    le zip > Proprietes > coche "Debloquer" > OK.
 
 ADRESSES
   Utilisateurs (applis Emby)  : http://ADRESSE-DE-CE-PC:8097

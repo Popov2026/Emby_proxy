@@ -207,6 +207,16 @@ version into the same folder (the zip only holds the program: settings,
 quotas, bans `emby_bans.json`, attempts, logs and cache are kept), install
 again; then close and reopen the Emby apps.
 
+**Windows shows a warning: this is expected.** The program is free and not
+signed with a paid certificate, so Windows does not know its publisher. It is
+a warning about an *unknown publisher*, not a virus detection.
+- "Windows protected your PC" (SmartScreen, blue window): click **More info**,
+  then **Run anyway**.
+- If the browser holds the download back: **Keep** (Edge: "…" → Keep → Show
+  more → Keep anyway).
+- To avoid the warning on each file: before unzipping, right-click the zip →
+  **Properties** → tick **Unblock** → OK.
+
 The compiled version is built and tested on a real Windows by GitHub
 (`.github/workflows/release.yml`): DPAPI encryption, installation, start,
 real login to the admin page, restart and removal of the service. To build it
@@ -325,21 +335,18 @@ quotas, translation, log clearing, what the Android TV and iPhone apps send
 (form login, compression, server addresses, CORS, playback request), and the
 emby_quota engine itself.
 
-### Code signing policy
+### Where the Windows version comes from
 
 Windows releases are built from this repository by GitHub Actions
 (`.github/workflows/release.yml`), on GitHub-hosted runners, and nowhere else.
+The source code of every release is public; the release page shows the
+SHA-256 of the zip.
 
-Free code signing provided by [SignPath.io](https://about.signpath.io),
-certificate by [SignPath Foundation](https://signpath.org).
-
-- Committers and reviewers: [Popov2026](https://github.com/Popov2026)
-- Approvers: [Popov2026](https://github.com/Popov2026)
-
-Only `emby_proxy.exe`, compiled from the source code of this repository, is
-signed. The service wrapper shipped in the archive (`EmbyProxy-service.exe`)
-is the unmodified [WinSW](https://github.com/winsw/winsw) release, published
-by its own authors.
+`emby_proxy.exe` is **not signed**: a code signing certificate that Windows
+trusts has to be bought, with an identity check (see "Windows shows a
+warning" in Installation). The service wrapper shipped in the archive
+(`EmbyProxy-service.exe`) is the unmodified
+[WinSW](https://github.com/winsw/winsw) release, published by its own authors.
 
 ### Privacy policy
 
@@ -577,6 +584,17 @@ contient que le programme : réglages, quotas, bannissements `emby_bans.json`,
 tentatives, journaux et cache sont gardés), réinstaller ; puis fermer et
 rouvrir les applis Emby.
 
+**Windows affiche un avertissement : c'est normal.** Le programme est gratuit
+et n'est pas signé avec un certificat payant, Windows ne connaît donc pas son
+éditeur. C'est un avertissement « éditeur inconnu », pas une détection de
+virus.
+- « Windows a protégé votre ordinateur » (SmartScreen, fenêtre bleue) : clique
+  sur **Informations complémentaires**, puis **Exécuter quand même**.
+- Si le navigateur retient le téléchargement : **Conserver** (Edge : « … » →
+  Conserver → Afficher plus → Conserver quand même).
+- Pour éviter l'avertissement sur chaque fichier : avant de décompresser, clic
+  droit sur le zip → **Propriétés** → coche **Débloquer** → OK.
+
 La version compilée est construite et testée sur un vrai Windows par GitHub
 (`.github/workflows/release.yml`) : chiffrement DPAPI, installation,
 démarrage, vraie connexion à la page d'administration, redémarrage et
@@ -704,22 +722,18 @@ traduction, effacement des journaux, ce qu'envoient les applis Android TV et
 iPhone (connexion en formulaire, compression, adresses du serveur, CORS,
 demande de lecture), et le moteur emby_quota lui-même.
 
-### Politique de signature du code
+### D'où vient la version Windows
 
 Les versions Windows sont compilées à partir de ce dépôt par GitHub Actions
 (`.github/workflows/release.yml`), sur les machines de GitHub, et nulle part
-ailleurs.
+ailleurs. Le code source de chaque version est public ; la page de la version
+affiche l'empreinte SHA-256 du zip.
 
-Signature de code gratuite fournie par [SignPath.io](https://about.signpath.io),
-certificat de la [SignPath Foundation](https://signpath.org).
-
-- Auteurs et relecteurs : [Popov2026](https://github.com/Popov2026)
-- Approbateurs : [Popov2026](https://github.com/Popov2026)
-
-Seul `emby_proxy.exe`, compilé à partir du code source de ce dépôt, est
-signé. Le lanceur de service fourni dans l'archive (`EmbyProxy-service.exe`)
-est la version d'origine de [WinSW](https://github.com/winsw/winsw), publiée
-par ses propres auteurs.
+`emby_proxy.exe` n'est **pas signé** : un certificat de signature reconnu par
+Windows s'achète, avec vérification d'identité (voir « Windows affiche un
+avertissement » dans Installation). Le lanceur de service fourni dans
+l'archive (`EmbyProxy-service.exe`) est la version d'origine de
+[WinSW](https://github.com/winsw/winsw), publiée par ses propres auteurs.
 
 ### Confidentialité
 
