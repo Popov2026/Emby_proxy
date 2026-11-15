@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.19"
+__version__ = "2.6.20"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -161,6 +161,7 @@ DEFAULTS = {
         "password": "",
         "allow_internet": "false",
         "session_hours": "12",
+        "totp_secret": "",
         "port": "8098",
         "host": "",
         "language": "fr",
@@ -292,6 +293,46 @@ def unprotect(stored, cfg_dir):
             raise ValueError("cle emby_proxy_secret.key absente")
         return _fernet(cfg_dir).decrypt(data.encode()).decode("utf-8")
     raise ValueError("format de chiffrement inconnu")
+
+
+# -- double authentification (TOTP, RFC 6238 : 6 chiffres, 30 s, SHA-1) -----
+def totp_code(secret_b32, counter):
+    key = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    mac = hmac.new(key, int(counter).to_bytes(8, "big"), hashlib.sha1).digest()
+    o = mac[-1] & 15
+    return "%06d" % ((int.from_bytes(mac[o:o + 4], "big") & 0x7FFFFFFF) % 1000000)
+
+
+def totp_verify(secret_b32, code, now=None, after=-1):
+    """-> compteur du code accepte (a retenir : un code ne sert qu'une fois),
+    ou None. Tolere une periode d'ecart d'horloge de chaque cote."""
+    code = re.sub(r"\s", "", str(code or ""))
+    if not secret_b32 or not re.fullmatch(r"\d{6}", code):
+        return None
+    t = int((now if now is not None else time.time()) // 30)
+    for c in (t, t - 1, t + 1):
+        try:
+            good = totp_code(secret_b32, c)
+        except (ValueError, TypeError):
+            return None
+        if c > after and hmac.compare_digest(good, code):
+            return c
+    return None
+
+
+def totp_qr_svg(uri):
+    """QR code a scanner (SVG) ; "" si la bibliotheque n'est pas la : la cle
+    reste alors a taper a la main dans l'appli."""
+    try:
+        import io
+        import segno
+        buf = io.BytesIO()
+        segno.make(uri, error="m").save(buf, kind="svg", scale=5, border=3,
+                                        xmldecl=False, svgns=True, nl=False,
+                                        dark="#000", light="#fff")
+        return buf.getvalue().decode("utf-8")
+    except Exception:
+        return ""
 
 
 def write_secret(path, section, key, plain):
@@ -601,6 +642,7 @@ class Settings:
         self.status_password = self._secret(cp, "status", "password")
         self.status_internet = st.getboolean("allow_internet")
         self.session_hours = st.getfloat("session_hours")
+        self.totp_secret = self._secret(cp, "status", "totp_secret").strip().upper()
         self.language = lang_normalize(st.get("language"))
         self.status_port = st.getint("port")
         self.status_host = st.get("host", "").strip() or self.listen_host
@@ -765,6 +807,10 @@ password =
 allow_internet = false
 # Duree d'une connexion a la page d'etat.
 session_hours = 12
+# Double authentification de la page d'etat (code a 6 chiffres d'une appli
+# comme Google Authenticator) : s'active dans la page, onglet Configuration.
+# Telephone perdu : vider cette ligne et redemarrer le proxy la desactive.
+totp_secret =
 # Port de la page d'etat, SEPARE de celui des utilisateurs : une faille dans
 # l'interface web d'Emby ne peut pas atteindre la page d'administration.
 # Ne jamais rediriger ce port vers Internet. 0 = meme port que le proxy
@@ -3630,6 +3676,8 @@ class EmbyProxy:
                     and not self.guard.is_local((a.get("ips") or [key])[-1]):
                 self.guard.banned[key] = PERMANENT_BAN
         self.sessions = {}          # jeton de la page d'etat -> expiration
+        self.mfa_pending = {}       # session -> (cle proposee, expiration)
+        self.totp_last = -1         # dernier code accepte (jamais deux fois)
         self.warnings = {}
         if not cfg.tls_cert and not cfg.trusted and \
                 cfg.listen_host not in ("127.0.0.1", "::1", "localhost"):
@@ -4107,6 +4155,10 @@ class EmbyProxy:
         app.router.add_get("/__proxy/settings.json", self.settings_json)
         app.router.add_post("/__proxy/settings", self.settings_save)
         app.router.add_post("/__proxy/password", self.password_save)
+        app.router.add_get("/__proxy/mfa.json", self.mfa_json)
+        app.router.add_post("/__proxy/mfa/setup", self.mfa_setup)
+        app.router.add_post("/__proxy/mfa/enable", self.mfa_enable)
+        app.router.add_post("/__proxy/mfa/disable", self.mfa_disable)
         app.router.add_post("/__proxy/restart", self.restart_post)
         app.router.add_post("/__proxy/alerts/test", self.alerts_test)
         app.router.add_get("/__proxy/quotas.json", self.quotas_json)
@@ -5871,6 +5923,106 @@ class EmbyProxy:
         log.warning("mot de passe de la page d'etat change par %s", ip)
         return web.json_response({"ok": True})
 
+    # -- double authentification de la page (code a 6 chiffres) ------------
+    def _totp_ok(self, code):
+        c = totp_verify(self.cfg.totp_secret, code, after=self.totp_last)
+        if c is None:
+            return False
+        self.totp_last = c
+        return True
+
+    def _mfa_local(self, request):
+        if self.guard.is_local(request[CLIENT_IP]):
+            return None
+        return web.json_response({"ok": False, "error": "Modification possible "
+                                  "uniquement depuis le reseau local."}, status=403)
+
+    async def mfa_json(self, request):
+        return web.json_response({"enabled": bool(self.cfg.totp_secret)})
+
+    async def mfa_setup(self, request):
+        """Etape 1 : mot de passe, puis une cle et son QR code a scanner. Rien
+        n'est active tant qu'un code de l'appli n'a pas ete verifie."""
+        bad = self._mfa_local(request)
+        if bad:
+            return bad
+        data = await request.json()
+        bad = self._confirm(request, data.get("password"))
+        if bad:
+            return bad
+        if self.cfg.totp_secret:
+            return web.json_response({"ok": False, "error": "Deja activee : "
+                                      "desactive-la d'abord."}, status=400)
+        secret = base64.b32encode(secrets.token_bytes(20)).decode()
+        now = time.time()
+        for k in [k for k, v in self.mfa_pending.items() if v[1] < now]:
+            del self.mfa_pending[k]
+        self.mfa_pending[request.cookies.get("epx_session", "")] = (secret, now + 900)
+        uri = "otpauth://totp/Emby%20Proxy:admin?" + urlencode({
+            "secret": secret, "issuer": "Emby Proxy", "algorithm": "SHA1",
+            "digits": 6, "period": 30})
+        return web.json_response({"ok": True, "secret": secret, "uri": uri,
+                                  "svg": totp_qr_svg(uri)},
+                                 headers={"Cache-Control": "no-store"})
+
+    async def mfa_enable(self, request):
+        bad = self._mfa_local(request)
+        if bad:
+            return bad
+        ip = request[CLIENT_IP]
+        data = await request.json()
+        mine = request.cookies.get("epx_session", "")
+        secret, exp = self.mfa_pending.get(mine, ("", 0))
+        if not secret or exp < time.time():
+            return web.json_response({"ok": False, "error": "Demande expiree : "
+                                      "recommence l'activation."}, status=400)
+        c = totp_verify(secret, data.get("code"))
+        if c is None:
+            return web.json_response({"ok": False, "error": "Code incorrect : verifie "
+                                      "l'heure du telephone et retape le code affiche."},
+                                     status=400)
+        try:
+            write_secret(self.cfg.path, "status", "totp_secret", secret)
+            if Settings(self.cfg.path).totp_secret != secret:
+                raise OSError("relu different")
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": "Fichier %s non modifie : %s"
+                                      % (self.cfg.path, exc)}, status=500)
+        self.cfg.totp_secret, self.totp_last = secret, c
+        self.mfa_pending.pop(mine, None)
+        for tok in [t for t in self.sessions if t != mine]:
+            del self.sessions[tok]               # les autres sont deconnectes
+        self.seclog.add("config", ip, True, detail="double authentification activee")
+        log.warning("double authentification de la page activee par %s", ip)
+        return web.json_response({"ok": True})
+
+    async def mfa_disable(self, request):
+        bad = self._mfa_local(request)
+        if bad:
+            return bad
+        ip = request[CLIENT_IP]
+        data = await request.json()
+        bad = self._confirm(request, data.get("password"))
+        if bad:
+            return bad
+        if not self.cfg.totp_secret:
+            return web.json_response({"ok": True})
+        if not self._totp_ok(data.get("code")):
+            self.seclog.add("config_fail", ip, True, detail="double authentification : "
+                            "code faux")
+            self.guard.login_result(ip, False)
+            return web.json_response({"ok": False, "error": "Code incorrect."},
+                                     status=403)
+        try:
+            update_ini(self.cfg.path, "status", "totp_secret", "")
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": "Fichier %s non modifie : %s"
+                                      % (self.cfg.path, exc)}, status=500)
+        self.cfg.totp_secret = ""
+        self.seclog.add("config", ip, True, detail="double authentification desactivee")
+        log.warning("double authentification de la page desactivee par %s", ip)
+        return web.json_response({"ok": True})
+
     async def alerts_test(self, request):
         """Mail de test avec les valeurs du formulaire (mot de passe enregistre
         si le champ est laisse vide)."""
@@ -6220,8 +6372,12 @@ class EmbyProxy:
     async def attempts_json(self, request):
         snap = self.attempts.snapshot(self.guard)
         names = self.activity.info.users if self.activity else {}
+        labels = {n: lbl for n, _k, lbl, _u in BUILTIN_BLOCKLISTS}
         for a in snap["attempts"]:
             a["accounts"] = [{"id": u, "name": names.get(u, "")} for u in a["uids"]]
+            # adresse d'une liste : bloquee d'office, avant toute tentative
+            lst = "" if a["local"] else self.blocklists.match(a["ip"])
+            a["listed"] = labels.get(lst, lst) if lst else ""
         return web.json_response(snap)
 
     # -- appareils enregistres dans Emby (onglet Securite) ----------------
@@ -6323,6 +6479,10 @@ class EmbyProxy:
                 .replace("@@VER@@", _html_escape(__version__))
                 .replace("@@PH@@", t("Mot de passe"))
                 .replace("@@BTN@@", t("Se connecter"))
+                .replace("@@OTP@@", (
+                    '<input name="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="7" '
+                    'autocomplete="one-time-code" placeholder="%s" style="margin-top:8px">'
+                    % t("Code à 6 chiffres de l'appli")) if self.cfg.totp_secret else "")
                 .replace("@@SUB@@", t("Mot de passe : section [status] du fichier "
                                       "emby_proxy.ini, ou bouton « Copier le mot "
                                       "de passe » de la fenetre du proxy."))
@@ -6339,17 +6499,25 @@ class EmbyProxy:
         given = str(data.get("password", ""))
         ok = hmac.compare_digest(given.encode("utf-8"),
                                  self.cfg.status_password.encode("utf-8"))
+        mfa = bool(self.cfg.totp_secret)
+        code_ok = True
+        if mfa:                          # le code n'est essaye qu'avec le bon mot de passe
+            code_ok = ok and self._totp_ok(data.get("code"))
         local = self.guard.is_local(ip)
-        if not ok:
+        if not (ok and code_ok):
             self._attempt(request, ip, "admin_password",
-                          what="page d'administration du proxy : mot de passe faux")
+                          what="page d'administration du proxy : %s" % (
+                              "mot de passe faux" if not ok else
+                              "code de double authentification faux"))
             self.seclog.add("status_fail", ip, local,
                             client=request.headers.get("User-Agent", "")[:60])
             if self.guard.login_result(ip, False):
                 self.seclog.add("ban", ip, local, detail="page d'etat : %d mots de "
                                 "passe faux" % self.cfg.login_max,
                                 ban_key=self.guard.key(ip))
-            return await self.login_page(request, "Mot de passe incorrect.")
+            return await self.login_page(
+                request, "Mot de passe ou code incorrect." if mfa else
+                "Mot de passe incorrect.")
         self.guard.login_result(ip, True)
         self.seclog.add("status_ok", ip, local,
                         client=request.headers.get("User-Agent", "")[:60])
@@ -6431,6 +6599,7 @@ padding:9px;border:0;border-radius:6px;background:#e94560;color:#fff;font:inheri
 .lg{float:right;color:#9aa0aa;font-size:12px;text-decoration:none;border:1px solid #2e323d;border-radius:5px;padding:2px 7px}</style>
 </head><body><form method="post" action="/__proxy/login"><a class="lg" href="?lang=@@OTHER@@">@@OTHERLBL@@</a><h1>Emby Proxy <small style="font-size:12px;font-weight:400;opacity:.7">v@@VER@@</small></h1>
 <input type="password" name="password" placeholder="@@PH@@" autofocus autocomplete="current-password">
+@@OTP@@
 <button type="submit">@@BTN@@</button><div class="err">@@ERR@@</div>
 <div class="sub">@@SUB@@</div></form></body></html>"""
 
@@ -6528,6 +6697,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
 <section id="sec" hidden>
   <div class="g" id="secg"></div>
   <h2>Adresses bannies</h2>
+  <div class="sub" id="blPre"></div>
   <div class="tw"><table><thead><tr><th>Adresse IP</th><th>Encore</th><th></th></tr></thead><tbody id="bans"></tbody></table></div>
   <h2>Listes d'adresses bloquées</h2>
   <div class="sub">Listes publiques d'adresses d'attaquants et d'hébergeurs, mises à jour toutes les 6 h. Choix des listes et exceptions : onglet Configuration, partie Sécurité.</div>
@@ -6585,6 +6755,30 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
     <label for="pNew2">Nouveau mot de passe, encore</label><input id="pNew2" type="password" autocomplete="new-password">
     <div class="row"><button class="red" id="pDo">Changer le mot de passe</button></div>
     <div id="pOut"></div>
+  </div>
+  <h2>Double authentification de cette page</h2>
+  <div class="c form">
+    <div class="sub">En plus du mot de passe, un code à 6 chiffres donné par une application du téléphone (Google Authenticator, Microsoft Authenticator, Aegis, 2FAS…) est demandé à chaque connexion à cette page. Les comptes Emby ne sont pas concernés.</div>
+    <div id="mState" style="margin:8px 0"></div>
+    <div id="mOff" hidden>
+      <label for="mPwd">Mot de passe de cette page</label><input id="mPwd" type="password" autocomplete="current-password">
+      <div class="row"><button class="red" id="mSetup">Activer : afficher le QR code</button></div>
+    </div>
+    <div id="mScan" hidden>
+      <div>1. Dans l'application du téléphone, ajoute un compte en scannant ce QR code :</div>
+      <div id="mQr" style="background:#fff;display:inline-block;padding:6px;border-radius:8px;margin:8px 0"></div>
+      <div class="sub">Sans appareil photo : tape cette clé dans l'application.</div>
+      <div><code id="mKey" style="user-select:all;word-break:break-all"></code></div>
+      <label for="mCode" style="margin-top:10px">2. Tape le code à 6 chiffres affiché par l'application</label><input id="mCode" inputmode="numeric" maxlength="7" autocomplete="one-time-code">
+      <div class="row"><button class="red" id="mEnable">Vérifier le code et activer</button><button class="small" id="mCancel">Annuler</button></div>
+    </div>
+    <div id="mOn" hidden>
+      <label for="mPwd2">Mot de passe de cette page</label><input id="mPwd2" type="password" autocomplete="current-password">
+      <label for="mCode2">Code à 6 chiffres de l'application</label><input id="mCode2" inputmode="numeric" maxlength="7" autocomplete="one-time-code">
+      <div class="row"><button class="red" id="mDisable">Désactiver la double authentification</button></div>
+      <div class="sub">Téléphone perdu : sur la machine du proxy, vide la ligne totp_secret du fichier emby_proxy.ini (section [status]) puis redémarre le proxy.</div>
+    </div>
+    <div id="mOut"></div>
   </div>
 </section>
 
@@ -6775,6 +6969,7 @@ function attCard(a,full){
     if(u.name){const b=el('button','small','Voir ses appareils');b.onclick=()=>showDevicesOf(u.name);box.append(b)}
     c.append(box)});
   if(a.agents.length)c.append(el('div','sub',TF('Appareil / logiciel : {0}',a.agents.join(' | '))));
+  if(a.listed)c.append(el('div','st ban',TF('⛔ Bloquée d\'office par la liste « {0} » : refusée dès sa première requête, sans limite de durée',T(a.listed))));
   if(a.banned_s){const st=el('div','st ban',(a.banned_s>PERM?T('⛔ Bannie définitivement'):TF('⛔ Bannie encore {0}',banLeft(a.banned_s)))+(a.ban?' — '+a.ban:''));
     const bt=el('button','small','Débannir');bt.style.marginLeft='8px';
     bt.onclick=()=>{if(confirm(TF('Débannir {0} ?',a.ip)))fetch('unban',{method:'POST',body:new URLSearchParams({ip:a.key.includes('/')?a.key:a.ip})}).then(tick)};
@@ -6795,9 +6990,9 @@ function attCard(a,full){
 function renderAtt(d){
   if(d)lastAtt=d;if(!lastAtt)return;
   const k=$('aCat').value.split(',').filter(Boolean),nt=$('aNet').value,bn=$('aBan').value,q=$('aText').value.toLowerCase();
-  const all=lastAtt.attempts,rows=all.filter(a=>(!k.length||k.some(x=>a.cats[x]))&&(!nt||(nt==='local')===a.local)&&(!bn||a.banned_s>0)&&
+  const all=lastAtt.attempts,rows=all.filter(a=>(!k.length||k.some(x=>a.cats[x]))&&(!nt||(nt==='local')===a.local)&&(!bn||a.banned_s>0||a.listed)&&
     (!q||[a.ip,a.ips.join(' '),a.users.join(' '),a.agents.join(' '),a.ban,a.ok_user,a.tried.map(x=>x.what).join(' ')].join(' ').toLowerCase().includes(q)));
-  $('aSum').textContent=TF('{0} adresse(s) · {1} bannie(s) en ce moment · {2} tentative(s) au total',all.length,all.filter(a=>a.banned_s>0).length,all.reduce((n,a)=>n+a.total,0));
+  $('aSum').textContent=TF('{0} adresse(s) · {1} bannie(s) en ce moment · {2} tentative(s) au total',all.length,all.filter(a=>a.banned_s>0||a.listed).length,all.reduce((n,a)=>n+a.total,0));
   $('attempts').replaceChildren(...(rows.length?rows.slice(0,150).map(a=>attCard(a)):[el('div','empty','Aucune tentative suspecte.')]))}
 ['aCat','aNet','aBan'].forEach(i=>$(i).onchange=()=>renderAtt());$('aText').oninput=()=>renderAtt();
 
@@ -6857,6 +7052,8 @@ function renderSec(d){
     const td=el('td');td.append(bt);tr.append(el('td',null,b.ip),el('td',null,banLeft(b.remaining_s)),td);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucune adresse bannie.');td.colSpan=3;tr.append(td);return tr})()]));
   const bl=d.blocklists||[];
+  {const n=bl.reduce((x,b)=>x+(b.count||0),0);
+   $('blPre').textContent=n?TF('En plus des adresses ci-dessous, {0} réseaux des listes de blocage sont bloqués d\'office, avant toute tentative : chacune de leurs requêtes est refusée, sans limite de durée. Ils n\'apparaissent dans « Tentatives suspectes » que s\'ils essaient quelque chose.',n.toLocaleString(LOC)):''}
   $('bls').replaceChildren(...(bl.length?bl.map(b=>{const tr=el('tr');
     tr.append(el('td',null,T(b.label)),el('td',null,String(b.count)),el('td',null,b.updated?day(b.updated):'-'),
       el('td',b.error?'sub':'',b.error?ko(b.error):(b.count?T('✔ chargée'):T('en attente du téléchargement'))));return tr})
@@ -6967,6 +7164,23 @@ function restart(){if(!confirm(T('Redémarrer le proxy ? Les lectures en cours s
     $('gTop').replaceChildren(el('div','res ok','Redémarrage en cours…'));let n=0;
     const t=setInterval(()=>{n++;fetch(url.replace(/\/__proxy\/$/,'')+'/__proxy/settings.json',{credentials:'include'}).then(x=>{if(x.ok||x.status===401){clearInterval(t);location.href=url}}).catch(()=>{});
       if(n>40){clearInterval(t);$('gTop').replaceChildren(el('div','res bad',TF('Le proxy ne revient pas : regarde la console. Adresse attendue : {0}',url)))}},1000)})}
+// ---- double authentification (QR code)
+function mfaShow(on,scan){$('mOff').hidden=on||scan;$('mScan').hidden=!scan;$('mOn').hidden=!on||scan;
+  const st=el('div','res '+(on?'ok':'bad'),on?'✔ Double authentification activée':'Double authentification désactivée');$('mState').replaceChildren(st)}
+function mfaLoad(){fetch('mfa.json').then(r=>r.json()).then(d=>mfaShow(d.enabled,false)).catch(()=>{})}
+function mfaMsg(r,okText){$('mOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?okText:ko(r.error)))}
+$('mSetup').onclick=()=>{post('mfa/setup',{password:$('mPwd').value}).then(r=>{
+  if(!r.ok){mfaMsg(r,'');return}
+  $('mOut').replaceChildren();$('mPwd').value='';$('mKey').textContent=r.secret.replace(/(.{4})/g,'$1 ').trim();
+  if(r.svg){const d=new DOMParser().parseFromString(r.svg,'image/svg+xml');$('mQr').replaceChildren(document.importNode(d.documentElement,true));$('mQr').hidden=false}
+  else{$('mQr').replaceChildren();$('mQr').hidden=true}
+  mfaShow(false,true);$('mCode').value='';$('mCode').focus()})};
+$('mCancel').onclick=()=>{$('mOut').replaceChildren();mfaShow(false,false)};
+$('mEnable').onclick=()=>{post('mfa/enable',{code:$('mCode').value}).then(r=>{
+  mfaMsg(r,'✔ Double authentification activée. Les autres connexions à cette page ont été fermées.');if(r.ok){$('mQr').replaceChildren();$('mKey').textContent='';mfaShow(true,false)}})};
+$('mDisable').onclick=()=>{post('mfa/disable',{password:$('mPwd2').value,code:$('mCode2').value}).then(r=>{
+  mfaMsg(r,'✔ Double authentification désactivée.');if(r.ok){$('mPwd2').value='';$('mCode2').value='';mfaShow(false,false)}})};
+mfaLoad();
 $('pDo').onclick=()=>{post('password',{old:$('pOld').value,new:$('pNew').value,new2:$('pNew2').value}).then(r=>{
   $('pOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?'✔ Mot de passe changé. Les autres connexions à cette page ont été fermées.':ko(r.error)));
   if(r.ok)['pOld','pNew','pNew2'].forEach(i=>$(i).value='')})};

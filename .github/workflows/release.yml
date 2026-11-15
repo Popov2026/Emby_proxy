@@ -58,7 +58,7 @@ jobs:
       - name: Compilation de emby_proxy.exe
         run: >
           pyinstaller --onefile --console --name emby_proxy
-          --hidden-import emby_quota --hidden-import emby_quota_i18n --hidden-import emby_proxy_lang
+          --hidden-import emby_quota --hidden-import emby_quota_i18n --hidden-import emby_proxy_lang --hidden-import segno
           emby_proxy.py
 
       # --- signature : l'exe compile ici est envoye a SignPath, qui verifie

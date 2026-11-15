@@ -217,3 +217,20 @@ async def test_liste_compressee_comme_sur_github(aiohttp_server, tmp_path):
         await b.refresh(s)
     assert b.status["gz"]["count"] == 2 and b.match("64.227.35.235") == "gz"
     assert "64.227.0.0/16" in (b._file("gz")).read_text(encoding="utf-8")
+
+
+async def test_adresse_d_une_liste_affichee_bloquee_d_office(env):
+    """La fiche d'une adresse d'une liste dit qu'elle est bloquee d'office
+    (elle n'a jamais rien obtenu), et non qu'elle a seulement "tente"."""
+    make, reached, lists, _ = env
+    p, c = await make()
+    p.blocklists._install(next(iter(p.blocklists.sel)), LIST, time.time(), "")
+    r = await c.get("/emby/System/Info/Public", headers=via(CLOUD_BOT))
+    assert r.status == 403
+    await c.get("/emby/Users/%s/Views" % ("a" * 32), headers=via(HOME))   # hors liste
+    await login(c, p)
+    d = await (await c.get("/__proxy/attempts.json")).json()
+    cards = {a["ip"]: a for a in d["attempts"]}
+    assert cards[CLOUD_BOT]["listed"] and cards[HOME]["listed"] == ""
+    html = await (await c.get("/__proxy/")).text()
+    assert "Bloquée d\\'office par la liste" in html and 'id="blPre"' in html

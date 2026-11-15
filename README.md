@@ -269,6 +269,12 @@ From the local network only: **`http://192.168.1.123:8098/`** (separate port,
 Tabs: Activity, Security, Quotas, Cache, Settings, Logs. JSON after login:
 `/__proxy/activity.json`, `/__proxy/security.json`, `/__proxy/stats.json`.
 
+**Two-factor authentication** (optional): Settings tab, "Two-factor
+authentication of this page". Scan the QR code with a phone app (Google
+Authenticator, Microsoft Authenticator, Aegis, 2FAS…); a 6-digit code is then
+asked at each login, on top of the password. Phone lost: empty the
+`totp_secret` line of `emby_proxy.ini` (`[status]`) and restart the proxy.
+
 ### Security: on your side
 - **HTTPS** if the proxy is open to the Internet (relay or certificate).
 - **Declare the relay** in front of the proxy (Trusted HTTPS relays).
@@ -650,6 +656,13 @@ part, `[status] port`). Elle n'existe ni sur le port des utilisateurs, ni
 depuis Internet. Onglets : Activité, Sécurité, Quotas, Cache, Configuration,
 Journaux. JSON après connexion : `/__proxy/activity.json`,
 `/__proxy/security.json`, `/__proxy/stats.json`.
+
+**Double authentification** (facultative) : onglet Configuration, « Double
+authentification de cette page ». Scanne le QR code avec une application du
+téléphone (Google Authenticator, Microsoft Authenticator, Aegis, 2FAS…) ; un
+code à 6 chiffres est ensuite demandé à chaque connexion, en plus du mot de
+passe. Téléphone perdu : vider la ligne `totp_secret` de `emby_proxy.ini`
+(`[status]`) et redémarrer le proxy.
 
 ### Sécurité : à faire de ton côté
 - **HTTPS** si le proxy est ouvert sur Internet (relais ou certificat).

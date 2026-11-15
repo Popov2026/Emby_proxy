@@ -421,6 +421,9 @@ async def main():
                   and "GET /emby/Users/Public -> 200" in phone, phone[:900])
             await p.click("button[data-t=sec]")
             await p.wait_for_timeout(3500)
+            pre = await p.inner_text("#blPre")
+            check("onglet Securite : reseaux des listes annonces bloques d'office",
+                  "bloqués d'office" in pre, pre[:200])
             await p.click("#sec button.copy >> nth=0")
             cp = await p.evaluate("window.__cp")
             check("bouton Copier le journal de securite (une ligne par evenement)",
@@ -439,6 +442,32 @@ async def main():
             check("bouton Voir ses appareils : liste des appareils du compte (onglet Securite)",
                   "Chrome" in devs and "paul" in devs and "Emby Web" in devs, devs[:300])
             check("aucune erreur JavaScript (appareils)", not errs, errs[:3])
+            # double authentification : mot de passe -> QR code et cle a scanner
+            await p.click("button[data-t=conf]")
+            await p.fill("#mPwd", "MotDePasseAdmin42")
+            await p.click("#mSetup")
+            await p.wait_for_selector("#mQr svg", timeout=5000)
+            key = (await p.inner_text("#mKey")).replace(" ", "")
+            box = await p.locator("#mQr svg").bounding_box()
+            check("double authentification : QR code affiche avec sa cle",
+                  len(key) == 32 and box and box["width"] > 120, [key, box])
+            if os.environ.get("FUNC_SHOT_MFA"):
+                await p.locator("#mScan").scroll_into_view_if_needed()
+                await p.screenshot(path=os.environ["FUNC_SHOT_MFA"])
+            import emby_proxy as _ep
+            await p.fill("#mCode", _ep.totp_code(key, int(time.time() // 30)))
+            await p.click("#mEnable")
+            await p.wait_for_timeout(600)
+            st = await p.inner_text("#mState")
+            check("double authentification : activee apres verification du code",
+                  "activée" in st and await p.is_visible("#mDisable"), st)
+            await p.fill("#mPwd2", "MotDePasseAdmin42")
+            await p.fill("#mCode2", _ep.totp_code(key, int(time.time() // 30) + 1))
+            await p.click("#mDisable")
+            await p.wait_for_timeout(600)
+            check("double authentification : desactivee (mot de passe + code)",
+                  "désactivée" in await p.inner_text("#mState"), await p.inner_text("#mOut"))
+            check("aucune erreur JavaScript (double authentification)", not errs, errs[:3])
             await p.click("button[data-t=act]")
             await p.wait_for_timeout(500)
             await p.select_option("#aCat", "robot")
