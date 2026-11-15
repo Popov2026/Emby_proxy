@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.21"
+__version__ = "2.6.22"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -141,6 +141,7 @@ DEFAULTS = {
         "device_validation": "false",
         "device_self_enroll": "false",
         "device_validation_local": "false",
+        "device_validation_days": "180",
         "login_max_failures": "5",
         "login_window_minutes": "15",
         "ban_minutes": "60",
@@ -596,6 +597,7 @@ class Settings:
         self.device_validation = s.getboolean("device_validation")
         self.device_self_enroll = s.getboolean("device_self_enroll")
         self.device_validation_local = s.getboolean("device_validation_local")
+        self.device_validation_days = max(1, s.getint("device_validation_days"))
         self.login_max = s.getint("login_max_failures")
         self.login_window = s.getfloat("login_window_minutes") * 60
         self.ban_seconds = s.getfloat("ban_minutes") * 60
@@ -767,15 +769,14 @@ blocklist_exceptions =
 # Depuis Internet, refuser toute requete d'un visiteur non connecte a Emby
 # (sauf ce qui sert a se connecter : page de connexion, interface web...).
 require_login = true
-# Validation des nouveaux appareils (double authentification des comptes
-# Emby) : un compte qui se connecte depuis un appareil inconnu doit le valider
-# sur la page /__device du proxy, avec un code a 6 chiffres de son telephone.
-# device_self_enroll : l'utilisateur cree lui-meme son premier QR code (sinon
-# l'administrateur l'autorise depuis la page). device_validation_local :
-# exiger aussi la validation sur le reseau local.
+# Double authentification des comptes Emby. A la premiere connexion, la page
+# du proxy affiche un QR code a scanner avec Google Authenticator. Ensuite, un
+# appareil inconnu doit donner le code a 6 chiffres ; un appareil valide n'est
+# plus interroge pendant device_validation_days jours (180 = 6 mois).
+# device_validation_local : l'exiger aussi sur le reseau local.
 device_validation = false
-device_self_enroll = false
 device_validation_local = false
+device_validation_days = 180
 # Mots de passe faux : bannissement de l'adresse IP.
 login_max_failures = 5
 login_window_minutes = 15
@@ -1037,24 +1038,24 @@ CONFIG_SCHEMA = [
         {"sec": "security", "key": "rate_burst", "type": "float", "min": 1,
          "max": 100000, "live": True, "label": "Pointe autorisée (requêtes)", "help": ""},
     ]},
-    {"id": "devtrust", "title": "Validation des nouveaux appareils", "fields": [
+    {"id": "devtrust", "title": "Double authentification des comptes Emby", "fields": [
         {"sec": "security", "key": "device_validation", "type": "bool", "live": True,
-         "label": "Exiger la validation des nouveaux appareils (code à 6 chiffres)",
-         "help": "Double authentification des comptes Emby. Un compte qui se connecte "
-                 "depuis un appareil inconnu est refusé tant que l'utilisateur ne l'a "
-                 "pas validé sur la page /__device du proxy, avec son mot de passe Emby "
-                 "et le code à 6 chiffres de son téléphone. Les appareils déjà "
-                 "enregistrés dans Emby au moment de l'activation restent autorisés. "
-                 "Nécessite la clé API Emby. Suivi : onglet Sécurité."},
-        {"sec": "security", "key": "device_self_enroll", "type": "bool", "live": True,
-         "label": "L'utilisateur crée lui-même son premier QR code",
-         "help": "Décoché (plus sûr) : tu autorises le premier QR code de chaque "
-                 "compte depuis l'onglet Sécurité. Coché : le mot de passe Emby "
-                 "suffit pour créer son QR code."},
+         "label": "Exiger un code à 6 chiffres depuis un appareil inconnu",
+         "help": "À sa première connexion, l'utilisateur voit sur la page du proxy un QR "
+                 "code à scanner avec Google Authenticator. Ensuite, depuis un appareil "
+                 "inconnu, le code à 6 chiffres est exigé : sur la page du proxy dans un "
+                 "navigateur, ou collé à la fin du mot de passe dans une appli (télé, "
+                 "téléphone). Les appareils déjà enregistrés dans Emby au moment de "
+                 "l'activation restent autorisés. Nécessite la clé API Emby. Suivi : "
+                 "onglet Sécurité."},
+        {"sec": "security", "key": "device_validation_days", "type": "int", "min": 1,
+         "max": 3650, "live": True,
+         "label": "Un appareil validé n'est plus interrogé pendant (jours)",
+         "help": "180 = 6 mois. Passé ce délai, le code est redemandé une fois."},
         {"sec": "security", "key": "device_validation_local", "type": "bool",
-         "live": True, "label": "Exiger aussi la validation sur le réseau local",
+         "live": True, "label": "Exiger aussi le code sur le réseau local",
          "help": "Décoché : un appareil qui se connecte depuis le réseau de la maison "
-                 "est autorisé d'office."},
+                 "est validé d'office."},
     ]},
     {"id": "downloads", "title": "Téléchargements", "fields": [
         {"sec": "security", "key": "max_downloads_per_user", "type": "int", "min": 0,
@@ -1177,7 +1178,7 @@ LIVE_ATTRS = ("upstream", "api_key", "cache_max", "item_max", "ttl_tagged",
               "status_internet", "session_hours", "alerts", "quotas_enabled",
               "language", "forward_ip", "landing_page", "quota_delivery",
               "ban_scanners", "require_login", "device_validation",
-              "device_self_enroll", "device_validation_local", "blocklist_sel", "blocklist_exceptions")
+              "device_validation_days", "device_validation_local", "blocklist_sel", "blocklist_exceptions")
 RESTART_ATTRS = ("listen_port", "listen_host", "tls_cert", "tls_key", "cache_dir",
                  "activity_enabled", "activity_log", "security_log", "status_port",
                  "status_host", "log_file", "log_level", "quotas_file", "quotas_db")
@@ -1488,7 +1489,7 @@ PUBLIC_RE = re.compile(
     r"|Users/Public/?$|Users/AuthenticateByName/?$|Users/[^/]+/Authenticate/?$"
     r"|Users/ForgotPassword(?:/Pin)?/?$"
     r"|Users/[^/]+/Images/[A-Za-z]+(?:/\d+)?/?$"       # avatars de la page de connexion
-    r"|__device/?$"                                     # validation d'un appareil
+    r"|__gate/?$"                                       # double authentification
     r"|Branding/(?:Configuration|Css(?:\.css)?)/?$)", re.I)
 # dans les parametres : API REST de WordPress par l'adresse racine
 SCANNER_QS_RE = re.compile(r"(?:^|&)rest_route=", re.I)
@@ -3531,10 +3532,12 @@ class DeviceTrust:
         self.trusted = {}         # deviceId -> {"users": [uid | "*"], "name", "app", "t"}
         self.pending = {}         # (uid, deviceId) -> {"name", "app", "ip", "t"}
         self.last = {}            # uid -> dernier code accepte
+        self.key = ""             # signature du temoin des navigateurs valides
         if self.path is not None:
             try:
                 d = json.loads(self.path.read_text(encoding="utf-8"))
                 self.imported = bool(d.get("imported"))
+                self.key = str(d.get("key") or "")
                 self.users = {str(k): dict(v) for k, v in (d.get("users") or {}).items()}
                 self.trusted = {str(k): dict(v) for k, v in
                                 (d.get("trusted") or {}).items()}
@@ -3546,16 +3549,40 @@ class DeviceTrust:
             return
         try:
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps({"imported": self.imported, "users": self.users,
-                                       "trusted": self.trusted}), encoding="utf-8")
+            tmp.write_text(json.dumps({"imported": self.imported, "key": self.key,
+                                       "users": self.users, "trusted": self.trusted}),
+                           encoding="utf-8")
             os.replace(tmp, self.path)
         except OSError as exc:
             log.warning("appareils autorises non enregistres : %s", exc)
 
     # -- appareils ------------------------------------------------------
-    def is_trusted(self, uid, dev):
+    def is_trusted(self, uid, dev, days=180):
+        """Valide pour ce compte, depuis moins de `days` jours."""
         t = self.trusted.get(dev)
-        return bool(t) and (uid in t["users"] or self.ANY in t["users"])
+        return bool(t) and (uid in t["users"] or self.ANY in t["users"]) \
+            and time.time() - t.get("t", 0) < days * 86400
+
+    # temoin d'un navigateur valide : compte.fin.signature
+    def cookie(self, uid, days):
+        if not self.key:
+            self.key = secrets.token_hex(32)
+            self.save()
+        exp = int(time.time() + days * 86400)
+        sig = hmac.new(bytes.fromhex(self.key), ("%s.%d" % (uid, exp)).encode(),
+                       hashlib.sha256).hexdigest()
+        return "%s.%d.%s" % (uid, exp, sig)
+
+    def cookie_uid(self, value):
+        try:
+            uid, exp, sig = str(value or "").split(".")
+            good = hmac.new(bytes.fromhex(self.key), ("%s.%s" % (uid, exp)).encode(),
+                            hashlib.sha256).hexdigest()
+            if self.key and hmac.compare_digest(good, sig) and int(exp) > time.time():
+                return uid
+        except (ValueError, TypeError):
+            pass
+        return ""
 
     def trust(self, uid, dev, name="", app="", save=True):
         t = self.trusted.setdefault(dev, {"users": [], "name": "", "app": "", "t": 0})
@@ -3601,17 +3628,7 @@ class DeviceTrust:
         u = self.users.setdefault(uid, {})
         u["name"] = name or u.get("name", "")
         u["secret"] = protect(secret, cfg_dir) if secret else ""
-        u.pop("enroll", None)
         self.last.pop(uid, None)
-        self.save()
-
-    def may_enroll(self, uid):
-        return (self.users.get(uid) or {}).get("enroll", 0) > time.time()
-
-    def grant(self, uid, name, hours=24):
-        u = self.users.setdefault(uid, {})
-        u["name"] = name or u.get("name", "")
-        u["enroll"] = int(time.time() + hours * 3600)
         self.save()
 
     def check_code(self, uid, code, cfg_dir):
@@ -3621,23 +3638,22 @@ class DeviceTrust:
         self.last[uid] = c
         return True
 
-    def snapshot(self, names):
+    def snapshot(self, names, days=180):
         now = time.time()
         users = {}
         for uid, name in (names or {}).items():
-            users[uid] = {"id": uid, "name": name, "qr": False, "enroll_s": 0,
+            users[uid] = {"id": uid, "name": name, "qr": False,
                           "devices": [], "pending": []}
         for uid, u in self.users.items():
             r = users.setdefault(uid, {"id": uid, "name": u.get("name") or uid[:8],
-                                       "qr": False, "enroll_s": 0, "devices": [],
-                                       "pending": []})
+                                       "qr": False, "devices": [], "pending": []})
             r["name"] = r["name"] or u.get("name") or uid[:8]
             r["qr"] = bool(u.get("secret"))
-            r["enroll_s"] = max(0, int(u.get("enroll", 0) - now))
         shared = []
         for dev, t in self.trusted.items():
             row = {"dev": dev, "name": t.get("name", ""), "app": t.get("app", ""),
-                   "t": t.get("t", 0)}
+                   "t": t.get("t", 0), "until": int(t.get("t", 0) + days * 86400),
+                   "expired": now - t.get("t", 0) >= days * 86400}
             if self.ANY in t["users"]:
                 shared.append(row)
             for uid in t["users"]:
@@ -3646,7 +3662,7 @@ class DeviceTrust:
         for (uid, dev), v in self.pending.items():
             if now - v["t"] <= self.PENDING_S:
                 users.setdefault(uid, {"id": uid, "name": uid[:8], "qr": False,
-                                       "enroll_s": 0, "devices": [], "pending": []})
+                                       "devices": [], "pending": []})
                 users[uid]["pending"].append(dict(v, dev=dev))
         return {"imported": self.imported,
                 "users": sorted(users.values(), key=lambda r: r["name"].lower()),
@@ -4294,8 +4310,7 @@ class EmbyProxy:
         app.on_response_prepare.append(self.add_security_headers)
         if not self.cfg.status_port:
             self._admin_routes(app)
-        app.router.add_get("/__device", self.device_page)
-        app.router.add_post("/__device", self.device_post)
+        app.router.add_post("/__gate", self.gate_post)
         app.router.add_route("*", "/{tail:.*}", self.handle)
         return app
 
@@ -4862,6 +4877,8 @@ class EmbyProxy:
         return web.Response(status=404, text="Not found")
 
     async def handle(self, request):
+        if self._gate_needed(request):
+            return self._gate_form(request)
         if request.method == "GET" and request.path in ("/", "/emby", "/emby/") \
                 and getattr(self.cfg, "landing_page", True) \
                 and "text/html" in request.headers.get("Accept", "") \
@@ -5120,6 +5137,12 @@ class EmbyProxy:
             log.warning("Emby injoignable (%s %s) : %s", _safe(request.method, 10),
                         _safe(request.path), exc)
             return self._emby_down(request)
+        if is_login and up.status in (401, 403) and isinstance(body_json, dict) \
+                and self._devgate_on():
+            up2 = await self._login_code_retry(request, url, headers, body_json)
+            if up2 is not None:               # vrai mot de passe + code a 6 chiffres
+                up.release()
+                up = up2
         if act:
             # L'activite n'est attribuee a un utilisateur qu'une fois la
             # requete acceptee par Emby : sinon n'importe qui pourrait, sans
@@ -5232,18 +5255,21 @@ class EmbyProxy:
         return bool(getattr(self.cfg, "device_validation", False)
                     and self.devtrust.imported)
 
-    def _device_url(self, request):
-        return "%s://%s/__device" % self._public_origin(request)
+    def _gate_exempt(self, ip):
+        return self.guard.is_local(ip) and not self.cfg.device_validation_local
 
     def _device_notice(self, request):
-        """Texte ajoute a l'ecran de connexion d'Emby, depuis Internet."""
+        """Texte ajoute a l'ecran de connexion d'Emby (applis, navigateur)."""
         ip = request.get(CLIENT_IP, "")
-        if not self._devgate_on() or not ip or (
-                self.guard.is_local(ip) and not self.cfg.device_validation_local):
+        if not self._devgate_on() or not ip or self._gate_exempt(ip):
             return ""
-        return tr("Nouvel appareil : après une première connexion refusée, "
-                  "valide-le sur %s puis reconnecte-toi.", self.cfg.language) \
-            % self._device_url(request)
+        return tr("Nouvel appareil : dans le champ du mot de passe, tape ton mot de "
+                  "passe suivi du code à 6 chiffres de Google Authenticator (exemple : "
+                  "motdepasse123456). Pas encore de QR code ? Ouvre %s dans un "
+                  "navigateur.", self.cfg.language) % ("%s://%s" % self._public_origin(request))
+
+    def _gate_cookie_uid(self, request):
+        return self.devtrust.cookie_uid(request.cookies.get("epx_dev", ""))
 
     async def _emby_logout(self, token):
         try:
@@ -5254,10 +5280,39 @@ class EmbyProxy:
         except (ClientError, asyncio.TimeoutError, OSError):
             pass
 
+    async def _login_code_retry(self, request, url, headers, body):
+        """Connexion refusee par Emby et mot de passe termine par 6 chiffres :
+        l'utilisateur a peut-etre colle son code a 6 chiffres a la fin (seule
+        facon de le donner dans une appli). Nouvel essai sans ces chiffres.
+        -> reponse d'Emby (200) si le vrai mot de passe est bon, sinon None."""
+        key = next((k for k in body if str(k).lower() == "pw"), None)
+        m = re.fullmatch(r"(.*?)[ ]?(\d{6})", str(body.get(key) or ""), re.S) if key else None
+        if not m:
+            return None
+        new = dict(body)
+        new[key] = m.group(1)
+        h = {k: v for k, v in headers.items()
+             if k.lower() not in ("content-length", "content-type")}
+        if "json" in request.headers.get("Content-Type", "").lower():
+            payload, h["Content-Type"] = json.dumps(new).encode("utf-8"), "application/json"
+        else:
+            payload = urlencode(new).encode("utf-8")
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+        try:
+            up2 = await self.session.request("POST", url, headers=h, data=payload,
+                                             allow_redirects=False)
+        except (ClientError, asyncio.TimeoutError, OSError):
+            return None
+        if up2.status != 200:
+            up2.release()
+            return None
+        request["dev_code"] = m.group(2)
+        return up2
+
     async def _device_gate(self, request, raw, up):
-        """Connexion reussie aupres d'Emby. -> None si l'appareil est autorise
-        pour ce compte, sinon la reponse de refus (et la session ouverte chez
-        Emby est refermee)."""
+        """Connexion reussie aupres d'Emby. -> None si l'appareil est valide
+        pour ce compte (deja connu, ou code a 6 chiffres donne), sinon la
+        reponse de refus (et la session ouverte chez Emby est refermee)."""
         try:
             data = json.loads(_decode(raw, up.headers.get("Content-Encoding")))
             uid = str(data["User"]["Id"]).lower()
@@ -5269,14 +5324,30 @@ class EmbyProxy:
         f = Activity._auth_fields(request)
         dev = f.get("deviceid", "")
         dname, app = _safe(f.get("device", ""), 60), _safe(f.get("client", ""), 60)
-        st = self.devtrust
-        if self.guard.is_local(ip) and not self.cfg.device_validation_local:
-            if dev and not st.is_trusted(uid, dev):
-                st.trust(uid, dev, dname, app)     # a la maison : autorise d'office
+        st, days = self.devtrust, self.cfg.device_validation_days
+        code = request.get("dev_code")
+        why = ""
+        if code is not None:                  # mot de passe + code a 6 chiffres
+            if st.check_code(uid, code, self.cfg.path.parent):
+                if dev:
+                    st.trust(uid, dev, dname, app)
+                self.seclog.add("config", ip, self.guard.is_local(ip), user=name,
+                                client=app, device=dname,
+                                detail="double authentification : appareil valide par "
+                                       "son code (%d jours)" % days)
+                return None
+            why = "code a 6 chiffres faux"
+            self._device_fail(request, "code faux pour « %s »" % _safe(name, 40))
+        elif self._gate_exempt(ip):
+            if dev and not st.is_trusted(uid, dev, days):
+                st.trust(uid, dev, dname, app)     # a la maison : valide d'office
             return None
-        if dev and st.is_trusted(uid, dev):
+        elif dev and st.is_trusted(uid, dev, days):
             return None
-        if dev:
+        elif dev and self._gate_cookie_uid(request) == uid:
+            st.trust(uid, dev, dname, app)         # navigateur valide sur la page du proxy
+            return None
+        if dev and not why:
             st.ask(uid, dev, dname, app, ip)
             st.users.setdefault(uid, {})["name"] = name
         if token:
@@ -5284,13 +5355,13 @@ class EmbyProxy:
         self.guard.blocked += 1
         self.seclog.add("refused", ip, self.guard.is_local(ip), user=name,
                         client=app, device=dname,
-                        detail="Nouvel appareil a valider : connexion refusee")
-        log.info("nouvel appareil a valider : %s (%s, %s) depuis %s", _safe(name, 40),
-                 dname, app, ip)
-        why = tr("Nouvel appareil : valide-le sur %s (mot de passe Emby et code à 6 "
-                 "chiffres du téléphone), puis reconnecte-toi.", self.cfg.language) \
-            % self._device_url(request)
-        return web.Response(status=401, text=why,
+                        detail="Double authentification : connexion refusee (%s)" % (
+                            why or "appareil inconnu, code a 6 chiffres attendu"))
+        log.info("double authentification : %s refuse (%s, %s) depuis %s",
+                 _safe(name, 40), dname, app, ip)
+        text = self._device_notice(request) or tr(
+            "Nouvel appareil : code à 6 chiffres exigé.", self.cfg.language)
+        return web.Response(status=401, text=text,
                             headers={"X-Application-Error-Code": "DeviceNotValidated"})
 
     async def devtrust_import(self):
@@ -5330,15 +5401,16 @@ class EmbyProxy:
     async def devtrust_json(self, request):
         if self.cfg.device_validation and not self.devtrust.imported:
             await self.devtrust_import()      # activee : reprise des appareils d'Emby
-        snap = self.devtrust.snapshot(self.activity.info.users if self.activity else {})
+        snap = self.devtrust.snapshot(self.activity.info.users if self.activity else {},
+                                      self.cfg.device_validation_days)
         snap.update(enabled=bool(self.cfg.device_validation),
-                    self_enroll=bool(self.cfg.device_self_enroll),
+                    days=self.cfg.device_validation_days,
                     api_key=bool(self.cfg.api_key))
         return web.json_response(snap)
 
     async def devtrust_action(self, request):
-        """approve / revoke (appareil), grant / reset (QR code d'un compte),
-        import (appareils d'Emby)."""
+        """approve / revoke (appareil), reset (QR code d'un compte), import
+        (appareils d'Emby)."""
         ip = request[CLIENT_IP]
         if not self.guard.is_local(ip):
             return web.json_response({"ok": False, "error": "Modification possible "
@@ -5358,9 +5430,6 @@ class EmbyProxy:
         elif act == "revoke" and dev:
             st.untrust(dev, uid)
             what = "appareil retire : %s" % dev[:12]
-        elif act == "grant" and uid:
-            st.grant(uid, name)
-            what = "premier QR code autorise pour %s (24 h)" % (name or uid[:8])
         elif act == "reset" and uid:
             st.set_secret(uid, name, "", self.cfg.path.parent)
             what = "QR code de %s reinitialise" % (name or uid[:8])
@@ -5369,80 +5438,122 @@ class EmbyProxy:
         self.seclog.add("config", ip, True, detail="validation des appareils : " + what)
         return web.json_response({"ok": True})
 
-    # page publique /__device : l'utilisateur valide son nouvel appareil
-    def _device_html(self, request, body, error="", status=200):
+    # -- page de connexion du proxy (navigateur) : QR code, code a 6 chiffres --
+    GATE_PATHS = ("/", "/emby", "/emby/", "/web", "/web/", "/web/index.html",
+                  "/emby/web", "/emby/web/", "/emby/web/index.html")
+
+    def _gate_needed(self, request):
+        """Navigateur qui ouvre Emby sans avoir ete valide : page du proxy."""
+        return (request.method == "GET" and request.path in self.GATE_PATHS
+                and self._devgate_on()
+                and "text/html" in request.headers.get("Accept", "")
+                and "Mozilla" in request.headers.get("User-Agent", "")
+                and not self._gate_exempt(request[CLIENT_IP])
+                and not self._gate_cookie_uid(request))
+
+    def _gate_html(self, request, body, error="", status=200):
         lang = self.cfg.language
         t = lambda x: _html_escape(tr(x, lang))      # noqa: E731
         html = (DEVICE_HTML.replace("@@LANG@@", lang)
-                .replace("@@TITLE@@", t("Valider un nouvel appareil"))
+                .replace("@@TITLE@@", t("Connexion à Emby"))
                 .replace("@@ERR@@", t(error) if error else "")
                 .replace("@@BODY@@", body))
         return web.Response(text=html, content_type="text/html", status=status,
                             headers={"Cache-Control": "no-store"})
 
-    def _device_form(self, request, error="", status=200):
+    def _gate_form(self, request, error="", status=200):
         t = lambda x: _html_escape(tr(x, self.cfg.language))      # noqa: E731
         body = ('<div class="sub">%s</div>'
                 '<input name="user" placeholder="%s" autocomplete="username" autofocus>'
                 '<input name="pw" type="password" placeholder="%s" '
                 'autocomplete="current-password">'
-                '<input name="code" inputmode="numeric" maxlength="7" '
-                'autocomplete="one-time-code" placeholder="%s">'
                 '<input type="hidden" name="step" value="login">'
                 '<button type="submit">%s</button>' % (
-                    t("Connecte-toi d'abord dans l'appli Emby du nouvel appareil (la "
-                      "connexion est refusée), puis valide-le ici."),
-                    t("Nom du compte Emby"), t("Mot de passe Emby"),
-                    t("Code à 6 chiffres (vide si tu n'as pas encore de QR code)"),
-                    t("Continuer")))
-        return self._device_html(request, body, error, status)
-
-    async def device_page(self, request):
-        if not self._devgate_on():
-            raise web.HTTPNotFound()
-        return self._device_form(request)
+                    t("Cet appareil n'est pas encore reconnu. Connecte-toi avec ton "
+                      "compte Emby : une double authentification (Google Authenticator) "
+                      "est demandée, puis plus pendant 6 mois sur cet appareil."),
+                    t("Nom du compte Emby"), t("Mot de passe Emby"), t("Continuer")))
+        return self._gate_html(request, body, error, status)
 
     def _device_fail(self, request, why):
         """Mot de passe ou code faux : compte comme une connexion ratee."""
         ip = request[CLIENT_IP]
         local = self.guard.is_local(ip)
-        self._attempt(request, ip, "password", what="validation d'un appareil : " + why)
-        self.seclog.add("login_fail", ip, local, detail="validation d'un appareil : " + why)
+        self._attempt(request, ip, "password", what="double authentification : " + why)
+        self.seclog.add("login_fail", ip, local, detail="double authentification : " + why)
         if self.guard.login_result(ip, False):
-            self.seclog.add("ban", ip, local, detail="validation d'un appareil : %d essais "
+            self.seclog.add("ban", ip, local, detail="double authentification : %d essais "
                             "faux" % self.cfg.login_max, ban_key=self.guard.key(ip))
 
-    def _device_list(self, request, ticket, uid, note=""):
+    def _gate_code(self, request, ticket, error=""):
         t = lambda x: _html_escape(tr(x, self.cfg.language))      # noqa: E731
-        rows = self.devtrust.waiting(uid)
-        if not rows:
-            body = '<div class="ok">%s</div><div class="sub">%s</div>' % (
-                _html_escape(note), t("Aucun appareil en attente. Connecte-toi dans "
-                                      "l'appli Emby du nouvel appareil (la connexion sera "
-                                      "refusée), puis reviens ici dans l'heure."))
-            return self._device_html(request, body)
-        items = "".join(
-            '<label class="dv"><input type="checkbox" name="dev" value="%s"> '
-            '<span><b>%s</b> · %s<br><small>%s · %s</small></span></label>' % (
-                _html_escape(r["dev"]), _html_escape(r["name"] or "?"),
-                _html_escape(r["app"] or "?"), _html_escape(r["ip"]),
-                time.strftime("%d/%m %H:%M", time.localtime(r["t"]))) for r in rows)
-        body = ('<div class="ok">%s</div><div class="sub">%s</div>%s'
-                '<input type="hidden" name="step" value="approve">'
+        body = ('<div class="sub">%s</div>'
+                '<input name="code" inputmode="numeric" maxlength="7" autofocus '
+                'autocomplete="one-time-code" placeholder="%s">'
+                '<input type="hidden" name="step" value="code">'
                 '<input type="hidden" name="ticket" value="%s">'
                 '<button type="submit">%s</button>' % (
-                    _html_escape(note),
-                    t("Coche seulement les appareils que tu reconnais :"), items,
-                    _html_escape(ticket), t("Autoriser les appareils cochés")))
-        return self._device_html(request, body)
+                    t("Ouvre Google Authenticator sur ton téléphone et tape le code à 6 "
+                      "chiffres du compte Emby."),
+                    t("Code à 6 chiffres"), _html_escape(ticket), t("Valider")))
+        return self._gate_html(request, body, error, 401 if error else 200)
 
-    async def device_post(self, request):
+    def _gate_enroll(self, request, ticket, error=""):
+        t = lambda x: _html_escape(tr(x, self.cfg.language))      # noqa: E731
+        tk = self.dev_tickets[ticket]
+        uri = "otpauth://totp/Emby:%s?" % quote(tk["name"]) + urlencode({
+            "secret": tk["secret"], "issuer": "Emby", "algorithm": "SHA1",
+            "digits": 6, "period": 30})
+        svg = totp_qr_svg(uri)
+        body = ('<div class="sub">%s</div><div class="sub">%s</div>%s'
+                '<div class="sub">%s</div><code>%s</code>'
+                '<input name="code" inputmode="numeric" maxlength="7" autofocus '
+                'autocomplete="one-time-code" placeholder="%s">'
+                '<input type="hidden" name="step" value="enroll">'
+                '<input type="hidden" name="ticket" value="%s">'
+                '<button type="submit">%s</button>' % (
+                    t("Première connexion : mise en place de la double authentification."),
+                    t("1. Installe Google Authenticator sur ton téléphone (App Store ou "
+                      "Google Play), ouvre-le, touche « + » puis « Scanner un code QR » "
+                      "et vise ce QR code :"),
+                    '<div class="qr">%s</div>' % svg if svg else "",
+                    t("Sans appareil photo : tape cette clé dans l'application."),
+                    " ".join(tk["secret"][i:i + 4] for i in range(0, 32, 4)),
+                    t("2. Code à 6 chiffres affiché par l'application"),
+                    _html_escape(ticket), t("Vérifier le code")))
+        return self._gate_html(request, body, error, 401 if error else 200)
+
+    def _gate_done(self, request, uid, name):
+        """Navigateur valide : temoin pour N jours, puis Emby."""
+        days = self.cfg.device_validation_days
+        t = lambda x: _html_escape(tr(x, self.cfg.language))      # noqa: E731
+        body = ('<div class="ok">%s</div><div class="sub">%s</div>'
+                '<meta http-equiv="refresh" content="2;url=/web/index.html">'
+                '<a class="go" href="/web/index.html">%s</a>' % (
+                    t("✔ Appareil validé."),
+                    t("Le code ne sera plus demandé sur cet appareil pendant 6 mois. "
+                      "Emby s'ouvre : connecte-toi avec ton compte.")
+                    if days == 180 else
+                    _html_escape(tr("Le code ne sera plus demandé sur cet appareil pendant "
+                                    "%d jours. Emby s'ouvre : connecte-toi avec ton compte.",
+                                    self.cfg.language) % days),
+                    t("Ouvrir Emby")))
+        resp = self._gate_html(request, body)
+        proto, _host = self._public_origin(request)
+        resp.set_cookie("epx_dev", self.devtrust.cookie(uid, days), path="/",
+                        httponly=True, samesite="Lax", secure=proto == "https",
+                        max_age=days * 86400)
+        self.seclog.add("config", request[CLIENT_IP], self.guard.is_local(request[CLIENT_IP]),
+                        user=name, detail="double authentification : navigateur valide "
+                                          "pour %s (%d jours)" % (name, days))
+        return resp
+
+    async def gate_post(self, request):
         if not self._devgate_on():
             raise web.HTTPNotFound()
         if not self._same_origin(request):
             return web.Response(status=403, text="Origine refusee.")
         ip = request[CLIENT_IP]
-        lang = self.cfg.language
         data = await request.post()
         step = str(data.get("step", "login"))
         st, cfg_dir, now = self.devtrust, self.cfg.path.parent, time.time()
@@ -5467,94 +5578,43 @@ class EmbyProxy:
                         name, token = str(d["User"].get("Name") or user), d.get("AccessToken", "")
             except (ClientError, asyncio.TimeoutError, OSError, ValueError, KeyError,
                     TypeError):
-                return self._device_form(request, "Serveur Emby injoignable.", 502)
+                return self._gate_form(request, "Serveur Emby injoignable.", 502)
             if token:
                 await self._emby_logout(token)
             if not uid:
                 self._device_fail(request, "mot de passe faux pour « %s »" % _safe(user, 40))
-                return self._device_form(request, "Nom ou mot de passe incorrect.", 401)
+                return self._gate_form(request, "Nom ou mot de passe incorrect.", 401)
             if self.activity:
                 self.activity.info.users[uid] = name
             ticket = secrets.token_urlsafe(24)
+            tk = self.dev_tickets[ticket] = {"uid": uid, "name": name, "exp": now + 900}
             if st.secret(uid, cfg_dir):
-                if not st.check_code(uid, data.get("code"), cfg_dir):
-                    self._device_fail(request, "code faux pour « %s »" % _safe(name, 40))
-                    return self._device_form(request, "Code à 6 chiffres incorrect.", 401)
-                self.guard.login_result(ip, True)
-                self.dev_tickets[ticket] = {"uid": uid, "name": name, "exp": now + 600}
-                return self._device_list(request, ticket, uid,
-                                         tr("Bonjour %s.", lang) % name)
-            # pas encore de QR code pour ce compte
-            if not (self.cfg.device_self_enroll or st.may_enroll(uid)):
-                st.users.setdefault(uid, {})["name"] = name
-                st.save()
-                return self._device_form(
-                    request, "Ton compte n'a pas encore de QR code : demande à "
-                    "l'administrateur d'autoriser ton premier QR code.", 403)
-            secret = base64.b32encode(secrets.token_bytes(20)).decode()
-            self.dev_tickets[ticket] = {"uid": uid, "name": name, "exp": now + 900,
-                                        "secret": secret}
-            return self._device_enroll(request, ticket)
-        tk = self.dev_tickets.get(str(data.get("ticket", "")))
+                return self._gate_code(request, ticket)
+            # premiere connexion de ce compte : QR code a scanner
+            tk["secret"] = base64.b32encode(secrets.token_bytes(20)).decode()
+            return self._gate_enroll(request, ticket)
+        ticket = str(data.get("ticket", ""))
+        tk = self.dev_tickets.get(ticket)
         if not tk:
-            return self._device_form(request, "Demande expirée : recommence.", 400)
+            return self._gate_form(request, "Demande expirée : recommence.", 400)
         uid, name = tk["uid"], tk["name"]
         if step == "enroll" and tk.get("secret"):
-            if totp_verify(tk["secret"], data.get("code")) is None:
-                return self._device_enroll(request, str(data.get("ticket")),
-                                           "Code à 6 chiffres incorrect.")
+            used = totp_verify(tk["secret"], data.get("code"))
+            if used is None:
+                return self._gate_enroll(request, ticket, "Code à 6 chiffres incorrect.")
             st.set_secret(uid, name, tk["secret"], cfg_dir)
-            st.last[uid] = int(now // 30) + 1      # ce code ne resservira pas
-            tk.pop("secret")
-            tk["exp"] = now + 600
+            st.last[uid] = used                    # ce code ne resservira pas
             self.seclog.add("config", ip, self.guard.is_local(ip), user=name,
-                            detail="validation des appareils : QR code cree par " + name)
-            return self._device_list(request, str(data.get("ticket")), uid,
-                                     tr("QR code enregistré.", lang))
-        if step == "approve" and not tk.get("secret"):
-            waiting = {r["dev"]: r for r in st.waiting(uid)}
-            done = []
-            for dev in data.getall("dev", []):
-                r = waiting.get(str(dev))
-                if r:
-                    st.trust(uid, r["dev"], r["name"], r["app"])
-                    done.append(r["name"] or r["dev"][:12])
-            self.dev_tickets.pop(str(data.get("ticket")), None)
-            if not done:
-                return self._device_form(request, "Aucun appareil coché.", 400)
-            self.seclog.add("config", ip, self.guard.is_local(ip), user=name,
-                            detail="validation des appareils : %s a autorise %s" % (
-                                name, ", ".join(done))[:300])
-            body = '<div class="ok">%s</div><div class="sub">%s</div>' % (
-                _html_escape(tr("Appareil(s) autorisé(s) : %s.", lang) % ", ".join(done)),
-                _html_escape(tr("Reconnecte-toi maintenant dans l'appli Emby de "
-                                "l'appareil.", lang)))
-            return self._device_html(request, body)
-        return self._device_form(request, "Demande expirée : recommence.", 400)
-
-    def _device_enroll(self, request, ticket, error=""):
-        t = lambda x: _html_escape(tr(x, self.cfg.language))      # noqa: E731
-        tk = self.dev_tickets[ticket]
-        uri = "otpauth://totp/Emby:%s?" % quote(tk["name"]) + urlencode({
-            "secret": tk["secret"], "issuer": "Emby", "algorithm": "SHA1",
-            "digits": 6, "period": 30})
-        svg = totp_qr_svg(uri)
-        body = ('<div class="sub">%s</div>%s<div class="sub">%s</div>'
-                '<code>%s</code>'
-                '<input name="code" inputmode="numeric" maxlength="7" autofocus '
-                'autocomplete="one-time-code" placeholder="%s">'
-                '<input type="hidden" name="step" value="enroll">'
-                '<input type="hidden" name="ticket" value="%s">'
-                '<button type="submit">%s</button>' % (
-                    t("1. Dans une application de codes du téléphone (Google "
-                      "Authenticator, Microsoft Authenticator, Aegis, 2FAS…), ajoute un "
-                      "compte en scannant ce QR code :"),
-                    '<div class="qr">%s</div>' % svg if svg else "",
-                    t("Sans appareil photo : tape cette clé dans l'application."),
-                    " ".join(tk["secret"][i:i + 4] for i in range(0, 32, 4)),
-                    t("2. Code à 6 chiffres affiché par l'application"),
-                    _html_escape(ticket), t("Vérifier le code")))
-        return self._device_html(request, body, error, 401 if error else 200)
+                            detail="double authentification : QR code cree par " + name)
+        elif step == "code" and not tk.get("secret"):
+            if not st.check_code(uid, data.get("code"), cfg_dir):
+                self._device_fail(request, "code faux pour « %s »" % _safe(name, 40))
+                return self._gate_code(request, ticket, "Code à 6 chiffres incorrect.")
+            self.guard.login_result(ip, True)
+        else:
+            return self._gate_form(request, "Demande expirée : recommence.", 400)
+        self.dev_tickets.pop(ticket, None)
+        return self._gate_done(request, uid, name)
 
     async def _branding(self, request, up):
         """Ecran de connexion d'Emby : la mention de l'administration limitee
@@ -7125,8 +7185,8 @@ border:1px solid #2e323d;background:#16181f;color:#e4e6ec;font:inherit;margin-to
 padding:9px;border:0;border-radius:6px;background:#e94560;color:#fff;font:inherit;cursor:pointer}
 .err{color:#e05555;margin-top:10px;min-height:1em}.sub{color:#9aa0aa;font-size:13px;margin:8px 0}.ok{color:#2ecc71;margin-bottom:8px}
 .qr{background:#fff;display:inline-block;padding:6px;border-radius:8px;margin:6px 0}code{display:block;word-break:break-all;user-select:all;margin-bottom:6px}
-.dv{display:flex;gap:10px;align-items:flex-start;border:1px solid #2e323d;border-radius:8px;padding:10px;margin-top:8px;cursor:pointer}small{color:#9aa0aa}</style>
-</head><body><form method="post" action="/__device"><h1>@@TITLE@@</h1>@@BODY@@<div class="err">@@ERR@@</div></form></body></html>"""
+.go{display:block;text-align:center;margin-top:12px;color:#5aaaeb}.dv{display:flex;gap:10px;align-items:flex-start;border:1px solid #2e323d;border-radius:8px;padding:10px;margin-top:8px;cursor:pointer}small{color:#9aa0aa}</style>
+</head><body><form method="post" action="/__gate"><h1>@@TITLE@@</h1>@@BODY@@<div class="err">@@ERR@@</div></form></body></html>"""
 
 LOGIN_HTML = """<!doctype html><html lang="@@LANG@@"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy</title><link rel="icon" href="data:,">
@@ -7244,11 +7304,11 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   <div class="sub">Listes publiques d'adresses d'attaquants et d'hébergeurs, mises à jour toutes les 6 h. Choix des listes et exceptions : onglet Configuration, partie Sécurité.</div>
   <div class="bar2"><button class="ghost" id="blRefresh">Mettre à jour maintenant</button></div>
   <div class="tw"><table><thead><tr><th>Liste</th><th>Réseaux</th><th>Mise à jour</th><th>État</th></tr></thead><tbody id="bls"></tbody></table></div>
-  <h2>Validation des nouveaux appareils</h2>
+  <h2>Double authentification des comptes Emby</h2>
   <div class="sub" id="dtSum"></div>
   <div class="bar2"><button class="ghost" id="dtImport">Reprendre les appareils enregistrés dans Emby</button></div>
   <div id="dtOut"></div>
-  <div class="tw"><table><thead><tr><th>Compte</th><th>QR code</th><th>Appareils autorisés</th><th>En attente de validation</th></tr></thead><tbody id="dts"></tbody></table></div>
+  <div class="tw"><table><thead><tr><th>Compte</th><th>QR code</th><th>Appareils validés</th><th>Refusés récemment (appareil inconnu)</th></tr></thead><tbody id="dts"></tbody></table></div>
   <div class="sub" id="dtShared"></div>
   <h2>Téléchargements de la période</h2>
   <div class="sub" id="dlSum"></div>
@@ -7832,15 +7892,13 @@ function dtAct(body,ask){if(ask&&!confirm(ask))return;post('devtrust/action',bod
   $('dtOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),r.ok?(r.info||'✔ Fait.'):ko(r.error)));loadDt()})}
 function dtDev(x){return (x.name||'?')+(x.app?' · '+x.app:'')}
 function renderDt(d){
-  $('dtSum').textContent=!d.enabled?T('Désactivée. Pour l\'activer : onglet Configuration, partie « Validation des nouveaux appareils ».')
+  $('dtSum').textContent=!d.enabled?T('Désactivée. Pour l\'activer : onglet Configuration, partie « Double authentification des comptes Emby ».')
     :!d.imported?T('Activée, mais pas encore appliquée : les appareils déjà enregistrés dans Emby doivent d\'abord être repris (clé API Emby nécessaire).')
-    :T('Activée : un compte qui se connecte depuis un appareil inconnu doit le valider sur la page /__device avec son code à 6 chiffres.')+' '+
-      T(d.self_enroll?'Chaque utilisateur crée lui-même son premier QR code.':'Le premier QR code de chaque compte doit être autorisé ici.');
+    :TF('Activée : QR code à la première connexion, puis code à 6 chiffres depuis un appareil inconnu ; un appareil validé n\'est plus interrogé pendant {0} jours.',d.days);
   $('dts').replaceChildren(...(d.users.length?d.users.map(u=>{const tr=el('tr'),q=el('td'),a=el('td'),w=el('td');
-    q.append(el('div',u.qr?'':'sub',u.qr?T('✔ créé'):u.enroll_s?TF('autorisé encore {0}',dur(u.enroll_s)):T('pas encore')));
+    q.append(el('div',u.qr?'':'sub',u.qr?T('✔ créé'):T('pas encore (à sa prochaine connexion)')));
     if(u.qr){const b=el('button','small','Réinitialiser');b.onclick=()=>dtAct({action:'reset',uid:u.id},TF('Réinitialiser le QR code de {0} ? Il devra en scanner un nouveau.',u.name));q.append(b)}
-    else if(!d.self_enroll){const b=el('button','small','Autoriser le premier QR code (24 h)');b.onclick=()=>dtAct({action:'grant',uid:u.id});q.append(b)}
-    u.devices.forEach(x=>{const r=el('div');r.append(document.createTextNode(dtDev(x)+' '));
+    u.devices.forEach(x=>{const r=el('div');if(x.expired)r.style.color='var(--mut)';r.append(document.createTextNode(dtDev(x)+' · '+(x.expired?T('délai dépassé'):TF('jusqu\'au {0}',day(x.until).split(' ')[0]))+' '));
       const b=el('button','small','Retirer');b.onclick=()=>dtAct({action:'revoke',uid:u.id,dev:x.dev},TF('Retirer {0} ? Il devra être validé de nouveau.',dtDev(x)));r.append(b);a.append(r)});
     if(!u.devices.length)a.append(el('span','sub','-'));
     u.pending.forEach(x=>{const r=el('div');r.style.color='var(--warn)';r.append(document.createTextNode(dtDev(x)+' · '+x.ip+' · '+hm(x.t)+' '));
@@ -7848,7 +7906,7 @@ function renderDt(d){
     if(!u.pending.length)w.append(el('span','sub','-'));
     tr.append(el('td',null,u.name),q,a,w);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty','Aucun compte connu pour l\'instant.');td.colSpan=4;tr.append(td);return tr})()]));
-  $('dtShared').textContent=d.shared.length?TF('{0} appareil(s) déjà enregistrés dans Emby à l\'activation, autorisés pour tous les comptes.',d.shared.length):''}
+  $('dtShared').textContent=d.shared.length?TF('{0} appareil(s) déjà enregistrés dans Emby à l\'activation, validés pour tous les comptes.',d.shared.length):''}
 function loadDt(){fetch('devtrust.json').then(r=>r.json()).then(renderDt).catch(()=>{})}
 $('dtImport').onclick=()=>dtAct({action:'import'});
 function tick(){

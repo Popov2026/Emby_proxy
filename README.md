@@ -275,13 +275,14 @@ Authenticator, Microsoft Authenticator, Aegis, 2FAS…); a 6-digit code is then
 asked at each login, on top of the password. Phone lost: empty the
 `totp_secret` line of `emby_proxy.ini` (`[status]`) and restart the proxy.
 
-**Validation of new devices** (optional, two-factor authentication of Emby
-accounts): Settings tab, "Validation of new devices". An account logging in
-from an unknown device is refused until the user validates it on the proxy's
-`/__device` page (Emby password + 6-digit code from a phone app, QR code
-scanned once). Devices already registered in Emby when it is enabled, and by
-default those logging in from the home network, stay allowed. Follow-up,
-approval and removal of devices: Security tab. Needs the Emby API key.
+**Two-factor authentication of Emby accounts** (optional): Settings tab.
+At the first login in a browser, the proxy's page shows a QR code to scan with
+Google Authenticator. Afterwards, from an unknown device, the 6-digit code is
+required: on the proxy's page in a browser, or typed right after the password
+(`password123456`) in an app (TV, phone). A validated device is not asked again
+for 6 months (adjustable). Devices already registered in Emby when it is
+enabled, and by default those on the home network, stay allowed. Follow-up:
+Security tab. Needs the Emby API key.
 
 ### Security: on your side
 - **HTTPS** if the proxy is open to the Internet (relay or certificate).
@@ -672,15 +673,15 @@ code à 6 chiffres est ensuite demandé à chaque connexion, en plus du mot de
 passe. Téléphone perdu : vider la ligne `totp_secret` de `emby_proxy.ini`
 (`[status]`) et redémarrer le proxy.
 
-**Validation des nouveaux appareils** (facultative, double authentification
-des comptes Emby) : onglet Configuration, « Validation des nouveaux
-appareils ». Un compte qui se connecte depuis un appareil inconnu est refusé
-tant que l'utilisateur ne l'a pas validé sur la page `/__device` du proxy (mot
-de passe Emby + code à 6 chiffres d'une application du téléphone, QR code
-scanné une seule fois). Les appareils déjà enregistrés dans Emby à
-l'activation, et par défaut ceux qui se connectent depuis le réseau de la
-maison, restent autorisés. Suivi, approbation et retrait des appareils :
-onglet Sécurité. Nécessite la clé API Emby.
+**Double authentification des comptes Emby** (facultative) : onglet
+Configuration. À la première connexion dans un navigateur, la page du proxy
+affiche un QR code à scanner avec Google Authenticator. Ensuite, depuis un
+appareil inconnu, le code à 6 chiffres est exigé : sur la page du proxy dans
+un navigateur, ou tapé juste après le mot de passe (`motdepasse123456`) dans
+une appli (télé, téléphone). Un appareil validé n'est plus interrogé pendant
+6 mois (réglable). Les appareils déjà enregistrés dans Emby à l'activation,
+et par défaut ceux du réseau de la maison, restent autorisés. Suivi : onglet
+Sécurité. Nécessite la clé API Emby.
 
 ### Sécurité : à faire de ton côté
 - **HTTPS** si le proxy est ouvert sur Internet (relais ou certificat).

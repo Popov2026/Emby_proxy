@@ -424,7 +424,7 @@ async def main():
             await p.evaluate("loadDt()")
             await p.wait_for_timeout(500)
             dt = await p.inner_text("#dtSum")
-            check("onglet Securite : validation des nouveaux appareils (etat affiche)",
+            check("onglet Securite : double authentification des comptes (etat affiche)",
                   "Désactivée" in dt and await p.locator("#dts tr").count() >= 1, dt[:120])
             pre = await p.inner_text("#blPre")
             check("onglet Securite : reseaux des listes annonces bloques d'office",
