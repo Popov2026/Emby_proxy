@@ -421,6 +421,11 @@ async def main():
                   and "GET /emby/Users/Public -> 200" in phone, phone[:900])
             await p.click("button[data-t=sec]")
             await p.wait_for_timeout(3500)
+            await p.evaluate("loadDt()")
+            await p.wait_for_timeout(500)
+            dt = await p.inner_text("#dtSum")
+            check("onglet Securite : validation des nouveaux appareils (etat affiche)",
+                  "Désactivée" in dt and await p.locator("#dts tr").count() >= 1, dt[:120])
             pre = await p.inner_text("#blPre")
             check("onglet Securite : reseaux des listes annonces bloques d'office",
                   "bloqués d'office" in pre, pre[:200])
