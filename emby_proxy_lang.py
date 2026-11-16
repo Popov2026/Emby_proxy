@@ -397,6 +397,8 @@ EN = {
     "Bloquer l'administration d'Emby depuis Internet":
         "Block Emby administration from the Internet",
     "Mots de passe faux avant bannissement": "Wrong passwords before a ban",
+    "Masquer les robots": "Hide the bots",
+    "Afficher les robots ({0})": "Show the bots ({0})",
     "Double authentification des comptes Emby": "Two-factor authentication of Emby accounts",
     "Exiger un code à 6 chiffres depuis un appareil inconnu": "Require a 6-digit code from an unknown device",
     "À sa première connexion, l'utilisateur voit sur la page du proxy un QR code à scanner avec Google Authenticator. Ensuite, depuis un appareil inconnu, le code à 6 chiffres est exigé : sur la page du proxy dans un navigateur, ou collé à la fin du mot de passe dans une appli (télé, téléphone). Les appareils déjà enregistrés dans Emby au moment de l'activation restent autorisés. Nécessite la clé API Emby. Suivi : onglet Sécurité.": "At the first login, the user sees on the proxy's page a QR code to scan with Google Authenticator. Afterwards, from an unknown device, the 6-digit code is required: on the proxy's page in a browser, or added at the end of the password in an app (TV, phone). Devices already registered in Emby when this is enabled stay allowed. Needs the Emby API key. Follow-up: Security tab.",

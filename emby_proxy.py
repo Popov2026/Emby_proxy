@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.22"
+__version__ = "2.6.23"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -7230,7 +7230,10 @@ details.rq{margin-top:6px}details.rq summary{cursor:pointer;color:var(--mut);fon
 .k-browse{color:var(--fg)}.k-search{color:var(--info)}.k-play,.k-pause,.k-stop{color:var(--ok)}.k-delete,.k-badpass,.k-refused{color:var(--bad)}.k-fav,.k-played,.k-download,.k-login,.k-logout,.k-quota{color:var(--warn)}
 table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}
 td,th{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:top}th{color:var(--mut);font-weight:500}
-.tw{overflow-x:auto}select,input{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
+.tw{overflow:auto;max-height:340px;border:1px solid var(--line);border-radius:8px}
+.tw thead th{position:sticky;top:0;background:var(--card);z-index:1}
+#attempts{max-height:640px;overflow-y:auto;padding-right:4px}
+select,input{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
 .bar2{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
 button.red{margin-top:16px;background:var(--acc);color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer}
 pre{background:var(--card);padding:10px;border-radius:8px;white-space:pre-wrap}.empty{color:var(--mut);padding:10px}
@@ -7279,6 +7282,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
     <select id="aNet"><option value="">Internet et réseau local</option><option value="net">Internet seulement</option><option value="local">Réseau local seulement</option></select>
     <select id="aBan"><option value="">Bannies ou non</option><option value="1">Bannies en ce moment</option></select>
     <input id="aText" placeholder="Filtrer (adresse, compte, adresse demandée...)">
+    <button class="ghost" id="aBots">Masquer les robots</button>
   </div>
   <div class="sub" id="aSum" style="margin-top:6px"></div>
   <div class="users" id="attempts" style="margin-top:10px"></div>
@@ -7594,13 +7598,19 @@ function attCard(a,full){
       b.onclick=()=>{open?attOpen.delete(a.key):attOpen.add(a.key);renderAtt()};box.append(b)}
     c.append(box)}
   return c}
+// robots : recherche de failles, ou adresse d'une liste de blocage (jamais un compte connecte)
+let hideBots=false;try{hideBots=localStorage.getItem('epxHideBots')==='1'}catch(e){}
+function isBot(a){return !!(a.cats.robot||a.cats.blocklist||a.listed)&&!a.ok_user}
 function renderAtt(d){
   if(d)lastAtt=d;if(!lastAtt)return;
   const k=$('aCat').value.split(',').filter(Boolean),nt=$('aNet').value,bn=$('aBan').value,q=$('aText').value.toLowerCase();
-  const all=lastAtt.attempts,rows=all.filter(a=>(!k.length||k.some(x=>a.cats[x]))&&(!nt||(nt==='local')===a.local)&&(!bn||a.banned_s>0||a.listed)&&
+  const bots=all0=>all0.filter(isBot).length;
+  $('aBots').textContent=hideBots?TF('Afficher les robots ({0})',bots(lastAtt.attempts)):T('Masquer les robots');
+  const all=lastAtt.attempts,rows=all.filter(a=>!(hideBots&&isBot(a))).filter(a=>(!k.length||k.some(x=>a.cats[x]))&&(!nt||(nt==='local')===a.local)&&(!bn||a.banned_s>0||a.listed)&&
     (!q||[a.ip,a.ips.join(' '),a.users.join(' '),a.agents.join(' '),a.ban,a.ok_user,a.tried.map(x=>x.what).join(' ')].join(' ').toLowerCase().includes(q)));
   $('aSum').textContent=TF('{0} adresse(s) · {1} bannie(s) en ce moment · {2} tentative(s) au total',all.length,all.filter(a=>a.banned_s>0||a.listed).length,all.reduce((n,a)=>n+a.total,0));
   $('attempts').replaceChildren(...(rows.length?rows.slice(0,150).map(a=>attCard(a)):[el('div','empty','Aucune tentative suspecte.')]))}
+$('aBots').onclick=()=>{hideBots=!hideBots;try{localStorage.setItem('epxHideBots',hideBots?'1':'0')}catch(e){}renderAtt()};
 ['aCat','aNet','aBan'].forEach(i=>$(i).onchange=()=>renderAtt());$('aText').oninput=()=>renderAtt();
 
 let last=null;

@@ -414,6 +414,18 @@ async def main():
             check("Tentatives suspectes : mot de passe faux de paul puis connexion reussie",
                   "connexion Emby refusee pour « paul »" in att and "ensuite connecté" in att,
                   att[:600])
+            await p.click("#aBots")
+            await p.wait_for_timeout(300)
+            hid = await p.inner_text("#attempts")
+            lbl = await p.inner_text("#aBots")
+            await p.click("#aBots")
+            await p.wait_for_timeout(300)
+            check("bouton Masquer les robots : robots caches, les autres tentatives restent",
+                  "198.51.100.7" not in hid and "92.184.104.7" in hid
+                  and "Afficher les robots" in lbl
+                  and "198.51.100.7" in await p.inner_text("#attempts"), [lbl, hid[:200]])
+            box = await p.evaluate("getComputedStyle(document.querySelector('.tw')).maxHeight")
+            check("tableaux longs : hauteur limitee, avec ascenseur", box == "340px", box)
             phone = await p.inner_text("#attempts")
             check("fiche de l'iPhone inconnu : compte vise, ses appareils, ce qu'il a obtenu",
                   "92.184.104.7" in phone and "Compte Emby visé : paul" in phone
@@ -426,6 +438,9 @@ async def main():
             dt = await p.inner_text("#dtSum")
             check("onglet Securite : double authentification des comptes (etat affiche)",
                   "Désactivée" in dt and await p.locator("#dts tr").count() >= 1, dt[:120])
+            if os.environ.get("FUNC_SHOT_SEC"):
+                await p.set_viewport_size({"width": 1200, "height": 900})
+                await p.screenshot(path=os.environ["FUNC_SHOT_SEC"], full_page=True)
             pre = await p.inner_text("#blPre")
             check("onglet Securite : reseaux des listes annonces bloques d'office",
                   "bloqués d'office" in pre, pre[:200])
