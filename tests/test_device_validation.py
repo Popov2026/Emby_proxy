@@ -289,3 +289,21 @@ async def test_essais_bannis_et_formulaire_d_un_site_piege_refuse(env):
     assert last.status in (401, 403, 429)
     r = await c.get("/", headers=nav("203.0.113.50"))
     assert r.status == 403 and "bannie" in (await r.text()).lower()
+
+
+async def test_tableau_de_bord_qui_utilise_la_double_authentification(env):
+    """Onglet Activite : comptes avec / sans QR code, appareil valide ou non."""
+    make, seen, ini = env
+    p, c = await make()
+    p.activity.info.users["c" * 32] = "alice"
+    p.devtrust.set_secret(UID, "bob", KEY, ini.parent)
+    assert (await emby_login(c, "shield", pw="secret" + code())).status == 200
+    await c.get("/emby/Users/%s/Views" % UID, headers=dict(app_hdr("shield"),
+                **{"X-Emby-Token": "TOK1"}))
+    await login(c, p)
+    d = await (await c.get("/__proxy/activity.json")).json()
+    m = {u["name"]: u["qr"] for u in d["mfa"]["users"]}
+    assert d["mfa"]["enabled"] and m["bob"] is True and m["alice"] is False
+    cards = [x for x in d["clients"] if x.get("mfa")]
+    assert cards and cards[0]["mfa"]["qr"] and cards[0]["mfa"]["dev"]
+    assert all("uid" not in x and "dev_id" not in x for x in d["clients"])

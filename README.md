@@ -683,6 +683,23 @@ une appli (télé, téléphone). Un appareil validé n'est plus interrogé penda
 et par défaut ceux du réseau de la maison, restent autorisés. Suivi : onglet
 Sécurité. Nécessite la clé API Emby.
 
+Sur l'**application Emby d'un smartphone** (ou d'une télé) : l'appli n'a pas
+de case pour un code, il se tape donc collé au mot de passe.
+1. Premier QR code : ouvrir une fois l'adresse du serveur dans le navigateur
+   du téléphone (Chrome, Safari), se connecter, scanner le QR code avec
+   Google Authenticator. Si Google Authenticator est sur ce même téléphone :
+   « Ajouter un code » → « Saisir une clé de configuration » et recopier la
+   clé affichée sous le QR code.
+2. Dans l'appli Emby, champ mot de passe : `motdepasse` suivi des 6 chiffres
+   affichés par Google Authenticator, sans espace (`motdepasse123456`).
+3. Les fois suivantes, sur ce téléphone : le mot de passe seul, pendant
+   6 mois. La marche à suivre est rappelée dans le texte d'avertissement
+   de l'écran de connexion d'Emby, pour les applis qui l'affichent.
+
+Tableau de bord (onglet Activité) : quels comptes utilisent la double
+authentification et lesquels pas encore, et pour chaque appareil connecté,
+s'il est validé et jusqu'à quand.
+
 ### Sécurité : à faire de ton côté
 - **HTTPS** si le proxy est ouvert sur Internet (relais ou certificat).
 - **Déclare le relais** placé devant le proxy (Relais HTTPS de confiance).

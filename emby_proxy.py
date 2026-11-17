@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.23"
+__version__ = "2.6.24"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -2775,6 +2775,7 @@ class Activity:
             out.append({
                 "key": hashlib.sha256(str(c.key).encode()).hexdigest()[:12],
                 "user": c.user_name or (c.user_id[:8] if c.user_id else "inconnu"),
+                "uid": c.user_id or "", "dev_id": c.device_id or "",
                 "client": c.client, "device": c.device, "version": c.version,
                 "ip": c.ip, "local": c.local, "user_agent": c.user_agent,
                 "first_seen": int(c.first_seen), "last_seen": int(c.last_seen),
@@ -6131,7 +6132,36 @@ class EmbyProxy:
     async def activity_json(self, request):
         if not self.activity:
             return web.json_response({"clients": [], "feed": [], "disabled": True})
-        return web.json_response(self.activity.snapshot())
+        snap = self.activity.snapshot()
+        snap["mfa"] = self._mfa_overview(snap["clients"])
+        return web.json_response(snap)
+
+    def _mfa_overview(self, clients):
+        """Tableau de bord : quel compte utilise la double authentification
+        (QR code scanne) et lequel pas encore ; appareil valide ou non."""
+        st, days = self.devtrust, self.cfg.device_validation_days
+        on = bool(self.cfg.device_validation)
+        names = dict(self.activity.info.users) if self.activity else {}
+        users = []
+        for uid, name in names.items():
+            u = st.users.get(uid) or {}
+            users.append({"name": name or u.get("name") or uid[:8],
+                          "qr": bool(u.get("secret"))})
+        for uid, u in st.users.items():
+            if uid not in names and u.get("secret"):
+                users.append({"name": u.get("name") or uid[:8], "qr": True})
+        for c in clients:
+            uid, dev = c.pop("uid", ""), c.pop("dev_id", "")
+            if not on or not uid:
+                continue
+            t = st.trusted.get(dev) if dev else None
+            c["mfa"] = {"qr": bool((st.users.get(uid) or {}).get("secret")),
+                        "dev": bool(dev) and st.is_trusted(uid, dev, days),
+                        "emby": bool(t) and st.ANY in t["users"] and uid not in t["users"],
+                        "until": int(t.get("t", 0) + days * 86400) if t else 0}
+        users.sort(key=lambda r: r["name"].lower())
+        return {"enabled": on, "local": bool(self.cfg.device_validation_local),
+                "days": days, "users": users}
 
     # -- configuration du serveur Emby (onglet Configuration) -------------
     def _file_values(self):
@@ -7247,6 +7277,7 @@ button.small{background:var(--card);border:1px solid var(--line);color:var(--fg)
 .confirm{margin-top:12px;padding:10px;border:1px solid var(--warn);border-radius:8px;background:#2a2316;display:flex;flex-direction:column;gap:8px}
 .res{margin-top:12px;padding:10px;border-radius:8px;border:1px solid var(--line)}.res.ok{border-color:var(--ok)}.res.bad{border-color:var(--bad)}
 .lock{color:var(--warn)}
+.mfa{margin:6px 0;font-size:13px}
 .qbar{height:6px;background:#3a3f4d;border-radius:3px;margin-top:3px;min-width:90px}.qbar>i{display:block;height:100%;border-radius:3px}
 .qact button{margin:2px}textarea{width:100%;min-height:58px;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}.fld{margin-top:6px}.fld .err{color:var(--bad);font-size:12px}
 .fld label{display:block}.fld input:not([type=checkbox]),.fld select{width:100%;margin-top:3px}
@@ -7264,6 +7295,7 @@ button.adm.on{border:1px solid var(--warn);color:var(--warn)}button.adm.off{bord
   <div class="sub" id="summary"></div>
   <h2>Utilisateurs</h2>
   <label class="sub"><input type="checkbox" id="showIdle"> afficher aussi les inactifs</label>
+  <div class="mfa" id="mfaSum"></div>
   <div class="users" id="users" style="margin-top:10px"></div>
   <h2>Tentatives suspectes</h2>
   <div class="sub">Robots, mots de passe faux, clés de session inventées, accès sans connexion, refus : une fiche par adresse, avec tout ce qui a été tenté.</div>
@@ -7512,7 +7544,10 @@ function userCard(u){
   const top=el('div');const dot=el('span','dot');dot.style.background=u.playing?'var(--ok)':u.active?'var(--info)':'#555';
   top.append(dot,el('span','name',u.user));
   const t=el('span','tag',u.local?'réseau local':'Internet');t.style.color=u.local?'var(--mut)':'var(--warn)';top.append(t);
+  if(u.mfa){const m=el('span','tag',u.mfa.qr?T('🔐 double authentification'):T('sans double authentification'));m.style.color=u.mfa.qr?'var(--ok)':'var(--warn)';top.append(m)}
   c.append(top);
+  if(u.mfa)c.append(el('div','sub',u.mfa.dev?(u.mfa.emby?T('Appareil déjà enregistré dans Emby à l\'activation : pas de code demandé'):TF('Appareil validé jusqu\'au {0}',day(u.mfa.until).split(' ')[0]))
+    :T('Appareil pas encore validé : code à 6 chiffres demandé à sa prochaine connexion')));
   c.append(el('div','sub',[u.client,u.device,u.version&&('v'+u.version)].filter(Boolean).join(' · ')||u.user_agent||T('application inconnue')));
   c.append(el('div','sub','IP '+u.ip+' · '+T('connecté depuis')+' '+day(u.first_seen)+' · '+T('dernière action')+' '+ago(u.idle_s)));
   c.append(el('div','sub',TF('{0} requêtes · {1} reçus',u.requests,mo(u.bytes_out))));
@@ -7619,11 +7654,21 @@ function renderAct(d){
   const list=d.clients.filter(u=>showIdle||u.active||u.playing);
   const playing=d.clients.filter(u=>u.playing).length,active=d.clients.filter(u=>u.active).length;
   $('summary').textContent=TF('{0} connecté(s) · {1} en lecture · {2} vu(s) ces dernières heures',active,playing,d.clients.length);
+  renderMfaSum(d.mfa);
   const box=$('users');box.replaceChildren(...(list.length?list.map(userCard):[el('div','empty',"Personne n'est connecté en ce moment.")]));
   const sel=$('fUser'),cur=sel.value,names=[...new Set(d.feed.map(f=>f.user))].sort();
   sel.replaceChildren(el('option',null,'Tous les utilisateurs'),...names.map(n=>{const o=el('option',null,n);o.value=n;return o}));
   sel.firstChild.value='';sel.value=names.includes(cur)?cur:'';
   renderFeed()}
+function renderMfaSum(m){
+  const box=$('mfaSum');if(!m){box.replaceChildren();return}
+  if(!m.enabled){box.replaceChildren(el('div','sub',T('Double authentification des comptes Emby : désactivée (onglet Configuration).')));return}
+  const yes=m.users.filter(u=>u.qr),no=m.users.filter(u=>!u.qr);
+  const a=el('div');a.append(el('b',null,T('Double authentification des comptes Emby :')+' '));
+  const y=el('span',null,TF('✔ {0} compte(s) l\'utilisent',yes.length)+(yes.length?' ('+yes.map(u=>u.name).join(', ')+')':''));y.style.color='var(--ok)';
+  const n=el('span',null,TF('✖ {0} pas encore',no.length)+(no.length?' ('+no.map(u=>u.name).join(', ')+')':''));n.style.color=no.length?'var(--warn)':'var(--mut)';
+  a.append(y,document.createTextNode(' · '),n);
+  box.replaceChildren(a,el('div','sub',m.local?T('Demandée aussi à la maison (réseau local).'):T('Pas demandée à la maison (réseau local) : un compte qui ne se connecte que de chez vous n\'a jamais à scanner le QR code.')))}
 function renderFeed(){
   if(!last)return;const u=$('fUser').value,k=$('fKind').value.split(',').filter(Boolean),q=$('fText').value.toLowerCase();
   const rows=last.feed.filter(f=>(!u||f.user===u)&&(!k.length||k.includes(f.kind))&&(!q||f.text.toLowerCase().includes(q)));

@@ -424,6 +424,18 @@ async def main():
                   "198.51.100.7" not in hid and "92.184.104.7" in hid
                   and "Afficher les robots" in lbl
                   and "198.51.100.7" in await p.inner_text("#attempts"), [lbl, hid[:200]])
+            off = await p.inner_text("#mfaSum")
+            on = await p.evaluate("""() => {renderMfaSum({enabled:true,local:false,days:180,
+                users:[{name:'bob',qr:true},{name:'alice',qr:false}]});
+                const t=document.querySelector('#mfaSum').innerText;
+                const c=userCard({user:'bob',client:'Emby',device:'iPhone',ip:'1.2.3.4',
+                  first_seen:0,idle_s:1,requests:1,bytes_out:0,events:[],recent:[],
+                  mfa:{qr:true,dev:true,emby:false,until:2000000000}}).innerText;
+                renderMfaSum(last&&last.mfa);return t+'|'+c}""")
+            check("tableau de bord : comptes avec / sans double authentification",
+                  "désactivée" in off and "1 compte(s) l'utilisent (bob)" in on
+                  and "1 pas encore (alice)" in on and "🔐 double authentification" in on
+                  and "Appareil validé jusqu'au" in on, [off, on[:300]])
             box = await p.evaluate("getComputedStyle(document.querySelector('.tw')).maxHeight")
             check("tableaux longs : hauteur limitee, avec ascenseur", box == "340px", box)
             phone = await p.inner_text("#attempts")
