@@ -397,6 +397,9 @@ EN = {
     "Bloquer l'administration d'Emby depuis Internet":
         "Block Emby administration from the Internet",
     "Mots de passe faux avant bannissement": "Wrong passwords before a ban",
+    "Ne plus exempter": "Stop exempting",
+    "{0} sera de nouveau limité par les quotas. Continuer ?": "{0} will be limited by the quotas again. Continue?",
+    "Exempter {0} des quotas ? Son temps ne sera plus compté ni limité.": "Exempt {0} from the quotas? Their time will no longer be counted or limited.",
     "dispensé de double authentification": "exempt from two-factor authentication",
     "{0} dispensé(s)": "{0} exempt",
     "dispensé : mot de passe seul": "exempt: password only",

@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.25"
+__version__ = "2.6.26"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3204,6 +3204,9 @@ class QuotaService:
             out["users"].append({
                 "id": u.user_id, "name": u.user_name, "state": u.state,
                 "exempt": u.exempt, "binding": u.binding,
+                "exempt_list": (u.user_name or "").strip().lower() in
+                {n.strip().lower() for n in self.qcfg.exempt_users}
+                or (u.user_id or "").lower() in {n.strip().lower() for n in self.qcfg.exempt_users},
                 "disabled_until": u.disabled_until,
                 "scopes": {s: {"used": round(v.used), "quota": round(v.quota),
                                "bonus": round(v.bonus), "allowed": round(v.allowed),
@@ -3301,6 +3304,25 @@ class QuotaService:
         os.replace(tmp, self.path)
         self.reload()
         return {"ok": True}
+
+    def set_exempt(self, name, flag):
+        """Bouton Exempter / Ne plus exempter du tableau des utilisateurs :
+        ajoute ou retire le nom de la liste « Comptes jamais limites »."""
+        name = str(name or "").strip()
+        if not _NAME_OK.match(name) or "," in name:
+            raise ValueError("nom invalide")
+        cfg = self.qcfg or self._load()
+        names = [n for n in cfg.exempt_users if n.strip().lower() != name.lower()]
+        if flag:
+            names.append(name)
+        f = QUOTA_FIELDS["quota.exempt_users"]
+        val, err = _quota_validate(f, ", ".join(names))
+        if err:
+            raise ValueError(err)
+        tmp, _ = self._apply_to_copy({f["sec"]: {f["key"]: val}})
+        os.replace(tmp, self.path)
+        self.reload()
+        return ", ".join(names)
 
     def preview(self, values):
         """Apercu des messages avec les textes en cours de saisie."""
@@ -6752,9 +6774,22 @@ class EmbyProxy:
         data = await request.json()
         act, uid = data.get("action"), str(data.get("user_id", ""))
         q = self.quota
+        loop = asyncio.get_running_loop()
+        if act in ("exempt", "unexempt"):
+            if not self.guard.is_local(request[CLIENT_IP]):
+                return web.json_response({"ok": False, "error": "reseau local seulement"},
+                                         status=403)
+            name = str(data.get("user", ""))
+            try:
+                lst = await loop.run_in_executor(None, q.set_exempt, name, act == "exempt")
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            msg = ("%s exempte des quotas" if act == "exempt"
+                   else "%s de nouveau soumis aux quotas") % _safe(name, 64)
+            self.seclog.add("config", request[CLIENT_IP], True, detail="quotas : " + msg)
+            return web.json_response({"ok": True, "message": msg, "exempt_users": lst})
         if q.monitor is None or q.store is None:
             return web.json_response({"ok": False, "error": "quotas non demarres"})
-        loop = asyncio.get_running_loop()
         try:
             if act == "grant":
                 minutes = int(data.get("minutes", 0))
@@ -7879,7 +7914,9 @@ $('pDo').onclick=()=>{post('password',{old:$('pOld').value,new:$('pNew').value,n
 // ---- Quotas de lecture
 let Q=null;
 const hms=s=>{s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.round(s%3600/60);return h?h+' h '+String(m).padStart(2,'0'):m+' min'};
-function qPost(body){return post('quotas/action',body).then(r=>{$('qOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),(r.ok?'✔ ':'✖ ')+T(r.message||r.error)));loadQuota(false)})}
+function qPost(body){return post('quotas/action',body).then(r=>{
+  if(r.ok&&r.exempt_users!=null){const i=document.querySelector('#qForm [data-k="quota.exempt_users"]');
+    if(i){i.value=r.exempt_users;i.dataset.orig=r.exempt_users}if(Q&&Q.values)Q.values['quota.exempt_users']=r.exempt_users;qDirty()}$('qOut').replaceChildren(el('div','res '+(r.ok?'ok':'bad'),(r.ok?'✔ ':'✖ ')+T(r.message||r.error)));loadQuota(false)})}
 function qFieldEl(f,vals){
   const k=f.sec+'.'+f.key,v=vals[k]==null?'':vals[k],w=el('div','fld');w.dataset.k=k;let inp;
   if(f.type==='bool'){const lb=el('label');inp=el('input');inp.type='checkbox';inp.checked=(v==='true');lb.append(inp,el('span',null,' '+f.label));w.append(lb)}
@@ -7926,6 +7963,9 @@ function loadQuota(full){return fetch('quotas.json').then(r=>{if(r.status===401)
     [15,30,60].forEach(m=>{const b=el('button','small','+'+m+' min');b.onclick=()=>qPost({action:'grant',user_id:u.id,user:u.name,minutes:m});a.append(b)});
     const r=el('button','small','Remise à zéro');r.onclick=()=>{if(confirm(TF('Remettre à zéro les compteurs de {0} ?',u.name)))qPost({action:'reset',user_id:u.id,user:u.name})};
     const g=el('button','small','Message maintenant');g.onclick=()=>qPost({action:'greet',user:u.name,user_id:u.id});
+    const xb=el('button','small',u.exempt_list?T('Ne plus exempter'):T('Exempter'));
+    xb.onclick=()=>{if(confirm(u.exempt_list?TF('{0} sera de nouveau limité par les quotas. Continuer ?',u.name):TF('Exempter {0} des quotas ? Son temps ne sera plus compté ni limité.',u.name)))qPost({action:u.exempt_list?'unexempt':'exempt',user:u.name,user_id:u.id})};
+    if(!u.exempt||u.exempt_list)a.append(xb);
     a.append(r,g);tr.append(a);return tr})
     :[(()=>{const tr=el('tr'),td=el('td','empty',d.running?'Aucun utilisateur compté pour l\'instant.':'Surveillance arrêtée.');td.colSpan=sc.length+3;tr.append(td);return tr})()]));
   $('qSessions').replaceChildren(...(d.sessions.length?d.sessions.map(x=>{const tr=el('tr');

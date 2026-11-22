@@ -360,3 +360,28 @@ async def test_textes_par_defaut_affiches_avant_activation(proxy_env):
     assert v["quota.reset_time"] == "04:00"
     assert not d.get("error")
     assert not (ini.parent / "emby_quota.ini").exists()   # rien ecrit en lisant
+
+
+async def test_bouton_exempter_des_quotas(quota_env):
+    """Tableau des utilisateurs : bouton Exempter / Ne plus exempter, qui
+    tient la liste « Comptes jamais limites » a jour."""
+    proxy, c, ini, q = quota_env
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+    await asyncio.get_running_loop().run_in_executor(None, _play, q, 2)
+
+    async def act(a, user):
+        return await (await c.post("/__proxy/quotas/action", headers=own, json={
+            "action": a, "user_id": "u-kid", "user": user})).json()
+    r = await act("exempt", "Enfant1")
+    assert r["ok"] and "Enfant1" in r["exempt_users"]
+    d = await (await c.get("/__proxy/quotas.json")).json()
+    kid = [u for u in d["users"] if u["name"] == "Enfant1"][0]
+    assert kid["exempt"] and kid["exempt_list"]
+    assert "Enfant1" in d["values"]["quota.exempt_users"]
+    assert "Enfant1" in open(q.path, encoding="utf-8").read()
+    r = await act("unexempt", "enfant1")                     # majuscules indifferentes
+    assert r["ok"] and r["exempt_users"] == ""
+    d = await (await c.get("/__proxy/quotas.json")).json()
+    kid = [u for u in d["users"] if u["name"] == "Enfant1"][0]
+    assert not kid["exempt"] and not kid["exempt_list"]
+    assert not (await act("exempt", "a=b"))["ok"]

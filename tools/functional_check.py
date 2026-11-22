@@ -379,6 +379,23 @@ async def main():
             prev = await p.inner_text("#qOut")
             check("apercu des messages (variables remplacees)",
                   prev and "%pseudo%" not in prev, prev[:120])
+            qx = await p.evaluate("""async () => {const f0=window.fetch,c0=window.confirm,sent=[];
+                const fake={enabled:true,running:true,api_key_set:true,scopes:[{id:'day',label:'Jour'}],
+                  users:[{id:'k',name:'Enfant1',state:'ok',exempt:'',exempt_list:false,scopes:{day:{used:60,allowed:3600,remaining:3540,percent:2,limited:true}}},
+                         {id:'p',name:'Papa',state:'ok',exempt:'liste',exempt_list:true,scopes:{}}],sessions:[],events:[],values:{}};
+                window.fetch=(u,o)=>{if(String(u).includes('quotas/action')){sent.push(JSON.parse(o.body));
+                  return Promise.resolve(new Response(JSON.stringify({ok:true,message:'ok',exempt_users:'Enfant1, Papa'})))}
+                  if(String(u).includes('quotas.json'))return Promise.resolve(new Response(JSON.stringify(fake)));return f0(u,o)};
+                window.confirm=()=>true;await loadQuota(false);
+                const t=document.querySelector('#qUsers').innerText;
+                [...document.querySelectorAll('#qUsers button')].find(b=>b.textContent==='Exempter').click();
+                await new Promise(r=>setTimeout(r,300));
+                const v=(document.querySelector('#qForm [data-k="quota.exempt_users"]')||{}).value;
+                window.fetch=f0;window.confirm=c0;return [t,JSON.stringify(sent),v]}""")
+            check("onglet Quotas : bouton Exempter / Ne plus exempter par compte",
+                  "Exempter" in qx[0] and "Ne plus exempter" in qx[0]
+                  and '"action":"exempt"' in qx[1] and '"user":"Enfant1"' in qx[1]
+                  and qx[2] == "Enfant1, Papa", qx)
             await p.click("button[data-t=act]")
             await p.wait_for_timeout(3500)
             check("onglet Activite : paul affiche", "paul" in await p.inner_text("body"))
