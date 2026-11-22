@@ -397,6 +397,13 @@ EN = {
     "Bloquer l'administration d'Emby depuis Internet":
         "Block Emby administration from the Internet",
     "Mots de passe faux avant bannissement": "Wrong passwords before a ban",
+    "dispensé de double authentification": "exempt from two-factor authentication",
+    "{0} dispensé(s)": "{0} exempt",
+    "dispensé : mot de passe seul": "exempt: password only",
+    "Exiger": "Require",
+    "Exempter": "Exempt",
+    "Exiger de nouveau la double authentification pour {0} ?": "Require two-factor authentication again for {0}?",
+    "Dispenser {0} de double authentification ? Il se connectera partout avec son seul mot de passe.": "Exempt {0} from two-factor authentication? They will sign in anywhere with their password only.",
     "🔐 double authentification": "🔐 two-factor authentication",
     "sans double authentification": "no two-factor authentication",
     "Appareil déjà enregistré dans Emby à l'activation : pas de code demandé": "Device already registered in Emby when enabled: no code asked",

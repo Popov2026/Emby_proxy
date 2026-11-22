@@ -696,6 +696,10 @@ de case pour un code, il se tape donc collé au mot de passe.
    6 mois. La marche à suivre est rappelée dans le texte d'avertissement
    de l'écran de connexion d'Emby, pour les applis qui l'affichent.
 
+Un compte peut en être dispensé (onglet Sécurité, bouton « Exempter ») : il
+se connecte alors partout avec son seul mot de passe ; « Exiger » rétablit
+la double authentification.
+
 Tableau de bord (onglet Activité) : quels comptes utilisent la double
 authentification et lesquels pas encore, et pour chaque appareil connecté,
 s'il est validé et jusqu'à quand.

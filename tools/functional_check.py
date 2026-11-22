@@ -450,6 +450,12 @@ async def main():
             dt = await p.inner_text("#dtSum")
             check("onglet Securite : double authentification des comptes (etat affiche)",
                   "Désactivée" in dt and await p.locator("#dts tr").count() >= 1, dt[:120])
+            ex = await p.evaluate("""() => {renderDt({enabled:true,imported:true,days:180,shared:[],
+                users:[{id:'a',name:'bob',qr:true,exempt:false,devices:[],pending:[]},
+                       {id:'b',name:'zoe',qr:false,exempt:true,devices:[],pending:[]}]});
+                const t=document.querySelector('#dts').innerText;loadDt();return t}""")
+            check("onglet Securite : bouton Exempter / Exiger par compte",
+                  "Exempter" in ex and "Exiger" in ex and "dispensé : mot de passe seul" in ex, ex[:300])
             if os.environ.get("FUNC_SHOT_SEC"):
                 await p.set_viewport_size({"width": 1200, "height": 900})
                 await p.screenshot(path=os.environ["FUNC_SHOT_SEC"], full_page=True)

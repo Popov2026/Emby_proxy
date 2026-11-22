@@ -93,7 +93,7 @@ def _accept_duplicate_content_type():
 DUP_CONTENT_TYPE_OK = _accept_duplicate_content_type()
 from emby_proxy_lang import normalize as lang_normalize
 
-__version__ = "2.6.24"
+__version__ = "2.6.25"
 
 APP_DIR = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
            else Path(__file__).resolve().parent)
@@ -3632,6 +3632,19 @@ class DeviceTrust:
         self.last.pop(uid, None)
         self.save()
 
+    def is_exempt(self, uid):
+        return bool((self.users.get(uid) or {}).get("exempt"))
+
+    def set_exempt(self, uid, name, flag):
+        """Compte dispense de double authentification (mot de passe seul)."""
+        u = self.users.setdefault(uid, {})
+        u["name"] = name or u.get("name", "")
+        if flag:
+            u["exempt"] = True
+        else:
+            u.pop("exempt", None)
+        self.save()
+
     def check_code(self, uid, code, cfg_dir):
         c = totp_verify(self.secret(uid, cfg_dir), code, after=self.last.get(uid, -1))
         if c is None:
@@ -3643,13 +3656,15 @@ class DeviceTrust:
         now = time.time()
         users = {}
         for uid, name in (names or {}).items():
-            users[uid] = {"id": uid, "name": name, "qr": False,
+            users[uid] = {"id": uid, "name": name, "qr": False, "exempt": False,
                           "devices": [], "pending": []}
         for uid, u in self.users.items():
             r = users.setdefault(uid, {"id": uid, "name": u.get("name") or uid[:8],
-                                       "qr": False, "devices": [], "pending": []})
+                                       "qr": False, "exempt": False,
+                                       "devices": [], "pending": []})
             r["name"] = r["name"] or u.get("name") or uid[:8]
             r["qr"] = bool(u.get("secret"))
+            r["exempt"] = bool(u.get("exempt"))
         shared = []
         for dev, t in self.trusted.items():
             row = {"dev": dev, "name": t.get("name", ""), "app": t.get("app", ""),
@@ -3663,7 +3678,7 @@ class DeviceTrust:
         for (uid, dev), v in self.pending.items():
             if now - v["t"] <= self.PENDING_S:
                 users.setdefault(uid, {"id": uid, "name": uid[:8], "qr": False,
-                                       "devices": [], "pending": []})
+                                       "exempt": False, "devices": [], "pending": []})
                 users[uid]["pending"].append(dict(v, dev=dev))
         return {"imported": self.imported,
                 "users": sorted(users.values(), key=lambda r: r["name"].lower()),
@@ -5328,6 +5343,8 @@ class EmbyProxy:
         st, days = self.devtrust, self.cfg.device_validation_days
         code = request.get("dev_code")
         why = ""
+        if st.is_exempt(uid):
+            return None                       # compte dispense : mot de passe seul
         if code is not None:                  # mot de passe + code a 6 chiffres
             if st.check_code(uid, code, self.cfg.path.parent):
                 if dev:
@@ -5431,6 +5448,12 @@ class EmbyProxy:
         elif act == "revoke" and dev:
             st.untrust(dev, uid)
             what = "appareil retire : %s" % dev[:12]
+        elif act in ("exempt", "require") and uid:
+            st.set_exempt(uid, name, act == "exempt")
+            st.pending = {k: v for k, v in st.pending.items() if k[0] != uid} \
+                if act == "exempt" else st.pending
+            what = ("%s dispense de double authentification" if act == "exempt" else
+                    "double authentification de nouveau exigee pour %s") % (name or uid[:8])
         elif act == "reset" and uid:
             st.set_secret(uid, name, "", self.cfg.path.parent)
             what = "QR code de %s reinitialise" % (name or uid[:8])
@@ -5587,6 +5610,9 @@ class EmbyProxy:
                 return self._gate_form(request, "Nom ou mot de passe incorrect.", 401)
             if self.activity:
                 self.activity.info.users[uid] = name
+            if st.is_exempt(uid):                  # compte dispense : pas de code
+                self.guard.login_result(ip, True)
+                return self._gate_done(request, uid, name)
             ticket = secrets.token_urlsafe(24)
             tk = self.dev_tickets[ticket] = {"uid": uid, "name": name, "exp": now + 900}
             if st.secret(uid, cfg_dir):
@@ -6146,16 +6172,18 @@ class EmbyProxy:
         for uid, name in names.items():
             u = st.users.get(uid) or {}
             users.append({"name": name or u.get("name") or uid[:8],
-                          "qr": bool(u.get("secret"))})
+                          "qr": bool(u.get("secret")), "exempt": bool(u.get("exempt"))})
         for uid, u in st.users.items():
-            if uid not in names and u.get("secret"):
-                users.append({"name": u.get("name") or uid[:8], "qr": True})
+            if uid not in names and (u.get("secret") or u.get("exempt")):
+                users.append({"name": u.get("name") or uid[:8],
+                              "qr": bool(u.get("secret")), "exempt": bool(u.get("exempt"))})
         for c in clients:
             uid, dev = c.pop("uid", ""), c.pop("dev_id", "")
             if not on or not uid:
                 continue
             t = st.trusted.get(dev) if dev else None
             c["mfa"] = {"qr": bool((st.users.get(uid) or {}).get("secret")),
+                        "exempt": st.is_exempt(uid),
                         "dev": bool(dev) and st.is_trusted(uid, dev, days),
                         "emby": bool(t) and st.ANY in t["users"] and uid not in t["users"],
                         "until": int(t.get("t", 0) + days * 86400) if t else 0}
@@ -7544,9 +7572,9 @@ function userCard(u){
   const top=el('div');const dot=el('span','dot');dot.style.background=u.playing?'var(--ok)':u.active?'var(--info)':'#555';
   top.append(dot,el('span','name',u.user));
   const t=el('span','tag',u.local?'réseau local':'Internet');t.style.color=u.local?'var(--mut)':'var(--warn)';top.append(t);
-  if(u.mfa){const m=el('span','tag',u.mfa.qr?T('🔐 double authentification'):T('sans double authentification'));m.style.color=u.mfa.qr?'var(--ok)':'var(--warn)';top.append(m)}
+  if(u.mfa){const m=el('span','tag',u.mfa.exempt?T('dispensé de double authentification'):u.mfa.qr?T('🔐 double authentification'):T('sans double authentification'));m.style.color=u.mfa.exempt?'var(--mut)':u.mfa.qr?'var(--ok)':'var(--warn)';top.append(m)}
   c.append(top);
-  if(u.mfa)c.append(el('div','sub',u.mfa.dev?(u.mfa.emby?T('Appareil déjà enregistré dans Emby à l\'activation : pas de code demandé'):TF('Appareil validé jusqu\'au {0}',day(u.mfa.until).split(' ')[0]))
+  if(u.mfa&&!u.mfa.exempt)c.append(el('div','sub',u.mfa.dev?(u.mfa.emby?T('Appareil déjà enregistré dans Emby à l\'activation : pas de code demandé'):TF('Appareil validé jusqu\'au {0}',day(u.mfa.until).split(' ')[0]))
     :T('Appareil pas encore validé : code à 6 chiffres demandé à sa prochaine connexion')));
   c.append(el('div','sub',[u.client,u.device,u.version&&('v'+u.version)].filter(Boolean).join(' · ')||u.user_agent||T('application inconnue')));
   c.append(el('div','sub','IP '+u.ip+' · '+T('connecté depuis')+' '+day(u.first_seen)+' · '+T('dernière action')+' '+ago(u.idle_s)));
@@ -7663,11 +7691,12 @@ function renderAct(d){
 function renderMfaSum(m){
   const box=$('mfaSum');if(!m){box.replaceChildren();return}
   if(!m.enabled){box.replaceChildren(el('div','sub',T('Double authentification des comptes Emby : désactivée (onglet Configuration).')));return}
-  const yes=m.users.filter(u=>u.qr),no=m.users.filter(u=>!u.qr);
+  const ex=m.users.filter(u=>u.exempt),yes=m.users.filter(u=>u.qr&&!u.exempt),no=m.users.filter(u=>!u.qr&&!u.exempt);
   const a=el('div');a.append(el('b',null,T('Double authentification des comptes Emby :')+' '));
   const y=el('span',null,TF('✔ {0} compte(s) l\'utilisent',yes.length)+(yes.length?' ('+yes.map(u=>u.name).join(', ')+')':''));y.style.color='var(--ok)';
   const n=el('span',null,TF('✖ {0} pas encore',no.length)+(no.length?' ('+no.map(u=>u.name).join(', ')+')':''));n.style.color=no.length?'var(--warn)':'var(--mut)';
   a.append(y,document.createTextNode(' · '),n);
+  if(ex.length){const e=el('span',null,TF('{0} dispensé(s)',ex.length)+' ('+ex.map(u=>u.name).join(', ')+')');e.style.color='var(--mut)';a.append(document.createTextNode(' · '),e)}
   box.replaceChildren(a,el('div','sub',m.local?T('Demandée aussi à la maison (réseau local).'):T('Pas demandée à la maison (réseau local) : un compte qui ne se connecte que de chez vous n\'a jamais à scanner le QR code.')))}
 function renderFeed(){
   if(!last)return;const u=$('fUser').value,k=$('fKind').value.split(',').filter(Boolean),q=$('fText').value.toLowerCase();
@@ -7951,8 +7980,11 @@ function renderDt(d){
     :!d.imported?T('Activée, mais pas encore appliquée : les appareils déjà enregistrés dans Emby doivent d\'abord être repris (clé API Emby nécessaire).')
     :TF('Activée : QR code à la première connexion, puis code à 6 chiffres depuis un appareil inconnu ; un appareil validé n\'est plus interrogé pendant {0} jours.',d.days);
   $('dts').replaceChildren(...(d.users.length?d.users.map(u=>{const tr=el('tr'),q=el('td'),a=el('td'),w=el('td');
-    q.append(el('div',u.qr?'':'sub',u.qr?T('✔ créé'):T('pas encore (à sa prochaine connexion)')));
-    if(u.qr){const b=el('button','small','Réinitialiser');b.onclick=()=>dtAct({action:'reset',uid:u.id},TF('Réinitialiser le QR code de {0} ? Il devra en scanner un nouveau.',u.name));q.append(b)}
+    if(u.exempt){const x=el('div');x.style.color='var(--mut)';x.textContent=T('dispensé : mot de passe seul');q.append(x)}
+    else q.append(el('div',u.qr?'':'sub',u.qr?T('✔ créé'):T('pas encore (à sa prochaine connexion)')));
+    if(u.qr&&!u.exempt){const b=el('button','small','Réinitialiser');b.onclick=()=>dtAct({action:'reset',uid:u.id},TF('Réinitialiser le QR code de {0} ? Il devra en scanner un nouveau.',u.name));q.append(b)}
+    {const b=el('button','small',u.exempt?T('Exiger'):T('Exempter'));b.style.marginLeft='4px';
+     b.onclick=()=>dtAct({action:u.exempt?'require':'exempt',uid:u.id},u.exempt?TF('Exiger de nouveau la double authentification pour {0} ?',u.name):TF('Dispenser {0} de double authentification ? Il se connectera partout avec son seul mot de passe.',u.name));q.append(b)}
     u.devices.forEach(x=>{const r=el('div');if(x.expired)r.style.color='var(--mut)';r.append(document.createTextNode(dtDev(x)+' · '+(x.expired?T('délai dépassé'):TF('jusqu\'au {0}',day(x.until).split(' ')[0]))+' '));
       const b=el('button','small','Retirer');b.onclick=()=>dtAct({action:'revoke',uid:u.id,dev:x.dev},TF('Retirer {0} ? Il devra être validé de nouveau.',dtDev(x)));r.append(b);a.append(r)});
     if(!u.devices.length)a.append(el('span','sub','-'));

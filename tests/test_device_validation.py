@@ -307,3 +307,36 @@ async def test_tableau_de_bord_qui_utilise_la_double_authentification(env):
     cards = [x for x in d["clients"] if x.get("mfa")]
     assert cards and cards[0]["mfa"]["qr"] and cards[0]["mfa"]["dev"]
     assert all("uid" not in x and "dev_id" not in x for x in d["clients"])
+
+
+async def test_compte_exempte_mot_de_passe_seul_partout(env):
+    """Onglet Securite, bouton Exempter : le compte se connecte partout avec
+    son seul mot de passe (appli et navigateur), jusqu'a Exiger."""
+    make, seen, ini = env
+    p, c = await make()
+    assert (await emby_login(c, "iphone")).status == 401
+    await login(c, p)
+    own = {"Origin": str(c.make_url("")).rstrip("/")}
+
+    async def act(**kw):
+        return await c.post("/__proxy/devtrust/action", headers=own, json=kw)
+    assert (await (await act(action="exempt", uid=UID)).json())["ok"]
+    row = [u for u in (await (await c.get("/__proxy/devtrust.json")).json())["users"]
+           if u["id"] == UID][0]
+    assert row["exempt"] and row["pending"] == []
+    assert (await emby_login(c, "iphone")).status == 200          # appli, Internet
+    assert not p.devtrust.is_trusted(UID, "iphone")               # rien de valide
+    r = await c.post("/__gate", headers=nav(), data={"step": "login", "user": "bob",
+                                                     "pw": "secret"})
+    html = await r.text()                                          # navigateur : pas de QR
+    assert r.status == 200 and "<svg" not in html and "epx_dev" in r.cookies
+    d = await (await c.get("/__proxy/activity.json")).json()
+    assert [u for u in d["mfa"]["users"] if u["name"] == "bob"][0]["exempt"]
+    p2, c2 = await make()                                          # apres redemarrage
+    assert (await emby_login(c2, "autre")).status == 200
+    await login(c2, p2)
+    own2 = {"Origin": str(c2.make_url("")).rstrip("/")}
+    r = await c2.post("/__proxy/devtrust/action", headers=own2,
+                      json={"action": "require", "uid": UID})
+    assert (await r.json())["ok"] and not p2.devtrust.is_exempt(UID)
+    assert (await emby_login(c2, "encore-un")).status == 401
